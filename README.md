@@ -21,6 +21,8 @@ reasoning modes, chat encoding, sampling — see [`MODEL_CARD.md`](MODEL_CARD.md
   (`python -m qw35_client`).
 - `qw35-tool/` — Python. Offline utilities: GGUF metadata dumper and
   GF4 sidecar cooker.
+- `qw35-tui/` — Python. `qwowl35`, a Textual terminal coding agent that
+  drives the server in a tool-calling loop (`python -m qwowl35`).
 - `.gguf/` — Model weights and pre-cooked sidecars (kept at the repo
   root so the server's cwd-relative default path resolves).
 
@@ -64,6 +66,30 @@ print(resp.choices[0].message.content)
 
 The bundled REPL (`python -m qw35_client`) and the `qwowl35` Textual TUI agent
 talk to the same server.
+
+## qwowl35: the terminal agent
+
+`qw35-tui/` ships **qwowl35**, a minimal terminal coding agent built on
+[Textual](https://github.com/Textualize/textual) that drives the server in a
+streaming tool-calling loop. It has a safety-aware **bash** tool and
+anchor-backed **file** read/edit tools, gates risky commands behind a keyboard
+approval prompt, and pins an animated owl mascot top-left that mirrors the
+agent's live state (prefill → thinking → inference → bash → edit → done).
+
+<p align="center">
+  <img src="assets/qw35.gif" alt="qwowl35 terminal agent driving qw35-server" width="800">
+</p>
+
+```bash
+pip install -r qw35-tui/requirements.txt   # textual, rich, httpx, xxhash
+cd qw35-tui && python -m qwowl35           # server must listen on 127.0.0.1:8080
+python -m qwowl35 --think on --reasoning-effort high
+```
+
+Configuration is CLI-only (`--base-url`, `--think auto|on|off`,
+`--reasoning-effort`, `--restricted-bash`). See
+[`qw35-tui/qwowl35/README.md`](qw35-tui/qwowl35/README.md) for the design notes,
+key bindings, and the headless debug runners.
 
 ## Context window
 
