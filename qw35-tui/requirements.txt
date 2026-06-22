@@ -1,0 +1,9 @@
+# qwowl35 runtime dependencies
+textual>=0.60        # TUI framework — https://github.com/Textualize/textual
+rich>=13.0           # rendering primitives (pulled in by textual) — https://github.com/Textualize/rich
+httpx>=0.27          # async streaming HTTP client — https://github.com/encode/httpx
+xxhash>=3.4          # hashline-compatible xxh3_64 sidecar/content hashes
+tree-sitter-language-pack>=0.2   # deterministic syntax checks for read/edit/bash + bash AST analysis — https://github.com/Goldziher/tree-sitter-language-pack
+
+# Note: imports of tree-sitter-language-pack stay guarded throughout, so a missing
+# install degrades to a no-op (no syntax warnings) rather than crashing.

@@ -1,0 +1,91 @@
+"""Compatibility surface for the hashline tool-calling adapter.
+
+Moved from the former top-level ``hashline_tools.py`` into the ``tools/files``
+package so each tool lives under ``tools/``. The body is unchanged: it only
+re-exports the vendored hashline library surface plus ``HashlineTools``. The
+fragile edit logic itself stays in the ``hashline`` sub-package alongside this
+adapter (``tools/files/hashline``).
+"""
+
+from __future__ import annotations
+
+from .hashline import (  # noqa: F401
+    Anchor,
+    Document,
+    FileMeta,
+    FileStats,
+    HashlineError,
+    LineRecord,
+    LineView,
+    NewlineStyle,
+    RangeAnchor,
+    RegionPattern,
+    ResolvedLine,
+    SearchDocument,
+    ShortHash,
+    ShortHashIndex,
+    StreamingDocument,
+    build_index_from_counts,
+    build_lines_from_hashes,
+    build_lines_from_hashes_with_meta,
+    byte_len,
+    collect_collision_pairs_sample,
+    collect_warnings,
+    collides,
+    collision_probability,
+    count_short_hashes,
+    delete_line,
+    delete_range,
+    document_format_short_hash,
+    empty_index,
+    estimate_read_tokens,
+    find_line_by_query,
+    format_short_hash,
+    full_hash,
+    full_hash64,
+    full_hash_bytes,
+    full_hash_bytes64,
+    insert_line,
+    is_structure_marker,
+    looks_like_block_anchor,
+    looks_like_range_anchor,
+    move_line,
+    parse_anchor,
+    parse_document_content,
+    parse_document_content_parallel,
+    parse_document_content_sequential,
+    parse_line_offsets,
+    parse_range,
+    read_file_meta,
+    recommend_anchor_mode,
+    recommend_hash_length,
+    recommend_read_mode,
+    recommend_workflow,
+    replace_line,
+    replace_range,
+    replace_range_with_line,
+    resolve,
+    resolve_all,
+    resolve_query_region,
+    resolve_range,
+    resolve_without_index,
+    short_from_full,
+    short_hash,
+    short_hash_value,
+    split_content_lines,
+    swap_lines,
+    stream_replace_line,
+    suggest_context_n,
+    summarize_bucket_counts,
+    try_parse_line_anchor,
+    validate_single_line_content,
+    write_short_hash_bytes,
+    xxh32,
+)
+from .hashline.tool_calling import (  # noqa: F401
+    HashlineTools,
+    TOOL_ATTENTION_MARKER,
+    mark_attention,
+)
+
+HashlineDocument = Document

@@ -1,0 +1,21 @@
+[package]
+name = "qw35-server"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "qw35_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qw35"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tokio-stream = "0.1"

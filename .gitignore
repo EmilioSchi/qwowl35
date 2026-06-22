@@ -1,0 +1,49 @@
+# ── Rust ──────────────────────────────────────────────────────────────
+target/
+# Cargo.lock is intentionally COMMITTED (this workspace builds binaries:
+# qw35-server, qw35-bench) for reproducible builds — do NOT ignore it.
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
+venv/
+.venv/
+env/
+
+# ── Large model weights (12G) — never commit ─────────────────────────
+.gguf/
+*.gguf
+*.gf4.bin
+*.bak
+
+# ── Local agent / editor / OS config ─────────────────────────────────
+.claude/
+.idea/
+.vscode/
+.DS_Store
+
+# ── Benchmark / agent run artifacts (regenerable output) ─────────────
+bench_infill/
+qw35-debug-runs/
+results/
+bench_results/
+transcript.jsonl
+messages.json
+*.log
+*.pid
+*.sock
+*.sqlite
+*.sqlite3
+*.db
+
+# ── Stale local snapshots — should be deleted, ignored as a backstop ─
+qw35-server.backup/
+*.backup/

@@ -1,0 +1,7 @@
+# qw35-cli has no runtime dependencies beyond the standard library.
+#
+# On macOS the stdlib `readline` is actually libedit, which submits a multi-line
+# paste one line per Enter. gnureadline provides real GNU readline, whose
+# bracketed-paste support delivers a whole paste as a single input(). It is only
+# needed on macOS; elsewhere the stdlib readline is already GNU.
+gnureadline; sys_platform == "darwin"
