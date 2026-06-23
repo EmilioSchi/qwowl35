@@ -50,6 +50,15 @@ way turn out to be useful to other programmers.
   names*. Names should be chosen so they're emitted as single tokens — the
   vocabulary already contains many common function names that tokenize to one
   token, and leaning on those keeps tool-calling cheaper and more reliable.
+- **Fine-tunes can quietly break the tool-call format.** I tried other
+  fine-tuned variants of Qwen 3.5 9B, such as Qwopus3.5, but ran into problems.
+  Some of them — especially ones distilled or tuned from larger models — lost
+  the ability to emit tool calls in the exact format Alibaba's team trained the
+  base model on, which in turn breaks their agentic capabilities. Ironically,
+  the extra "tool-calling reinforcement" these tunes applied is what confused
+  the model: instead of strengthening the behavior, it pulled the model away
+  from the predetermined XML output it had already learned to produce. The stock
+  model's adherence to that format turns out to matter a lot.
 - **Different GPU layouts want different thread decompositions.** How work is
   split across threads during inference has to change with the layout; there is
   no single partitioning that's best everywhere.
