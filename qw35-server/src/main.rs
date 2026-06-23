@@ -347,9 +347,9 @@ impl Config {
             return Err("--ctx must be greater than zero".to_string());
         }
 
-        // Resolve defaults: start from the --mode preset (or the agentic-coding
-        // default when no mode is given), then overlay any explicit flags.
-        let mut defaults = mode.map(server::Mode::defaults).unwrap_or_default();
+        // Resolve defaults: start from the --mode preset (or the thinking-coding
+        // preset when no mode is given), then overlay any explicit flags.
+        let mut defaults = mode.unwrap_or(server::Mode::ThinkingCoding).defaults();
         if let Some(v) = ov.max_tokens {
             defaults.max_tokens = v;
         }
@@ -499,7 +499,7 @@ HTTP API:\n\
 \n\
 Mode preset:\n\
   --mode NAME\n\
-      Seed the sampling defaults and the think/no-think default from an official Qwen3.5 profile. Per-request params (and explicit sampling flags below) override individual fields. Omit for the agentic-coding default (temperature 0.8, presence 0.3, repeat 1.1, thinking off). Values:\n\
+      Seed the sampling defaults and the think/no-think default from an official Qwen3.5 profile. Per-request params (and explicit sampling flags below) override individual fields. Default: thinking-coding (thinking on, temperature 0.6, presence 0.0, repeat 1.1). Values:\n\
         thinking-general    thinking on,  temperature 1.0, top_p 0.95, top_k 20, presence 1.5, repeat 1.1\n\
         thinking-coding     thinking on,  temperature 0.6, top_p 0.95, top_k 20, presence 0.0, repeat 1.1\n\
         instruct-general    thinking off, temperature 0.7, top_p 0.80, top_k 20, presence 1.5, repeat 1.0\n\
@@ -507,7 +507,7 @@ Mode preset:\n\
 \n\
 Sampling defaults:\n\
   --temperature F\n\
-      Default request temperature when the client omits one. Use 0 for greedy decoding. Default: 0.8 (agentic-coding profile). Overrides --mode.\n\
+      Default request temperature when the client omits one. Use 0 for greedy decoding. Default: 0.6 (thinking-coding preset). Overrides --mode.\n\
   --top-k N\n\
       Default top-k sampling limit. Use 0 to disable top-k filtering. Default: 20\n\
   --top-p F\n\
@@ -571,12 +571,13 @@ mod tests {
     }
 
     #[test]
-    fn no_mode_keeps_agentic_coding_default() {
+    fn no_mode_defaults_to_thinking_coding() {
         let d = defaults_from(&[]);
-        assert_eq!(d.temperature, 0.8);
-        assert_eq!(d.presence_penalty, 0.3);
+        assert_eq!(d.temperature, 0.6);
+        assert_eq!(d.top_p, 0.95);
+        assert_eq!(d.presence_penalty, 0.0);
         assert_eq!(d.repetition_penalty, 1.1);
-        assert!(!d.enable_thinking);
+        assert!(d.enable_thinking);
     }
 
     #[test]

@@ -280,8 +280,8 @@ pub const DEFAULT_REASONING_BUDGET_MESSAGE: &str = "\n\nI'll stop reasoning here
 /// Official Qwen3.5 launch presets. Each seeds the full sampling profile and
 /// the think/no-think principal config; per-request params still override
 /// individual fields via the `unwrap_or(defaults.x)` chain. Selected with the
-/// server `--mode <name>` flag; when absent, `GenerationDefaults::default()`
-/// (the agentic-coding profile) is used instead.
+/// server `--mode <name>` flag; when absent, the `thinking-coding` preset is
+/// used instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     ThinkingGeneral,
