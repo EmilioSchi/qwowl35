@@ -1,20 +1,18 @@
-</br>
 > [!WARNING]
-> This project is still incomplete and not really suitable for practical use
-> yet — but it's a fun one to experiment with as a recreational project.
+> This project is still incomplete and not really suitable for practical use yet — but it's a fun one to experiment with as a recreational project.
 
 <div align="center">
   <a href="assets/qwowl35.png">
-    <img src="assets/qwowl35.png" alt="Qwowl35 logo" width="220" />
+    <img src="assets/qwowl35.png" alt="Qwowl35 logo" width="180" />
   </a>
-</br>
-<strong>Qwowl35</strong>
 </br>
 (pronounced /kwaʊl/, a portmanteau of <strong>Qwen</strong> and <strong>owl</strong>)
 </br>
 <em>A <strong>Metal-backed</strong> inference engine for Qwen 3.5.</em>
 </br>
 </div>
+</br>
+</br>
 
 Designed to sit inside **agentic loops** on a MacBook Air M2.
 
