@@ -3,7 +3,7 @@
 
 <div align="center">
   <a href="assets/qwowl35.png">
-    <img src="assets/qwowl35.png" alt="Qwowl35 logo" width="180" />
+    <img src="assets/qwowl35.png" alt="Qwowl35 logo" width="140" />
   </a>
 </br>
 (pronounced /kwaʊl/, a portmanteau of <strong>Qwen</strong> and <strong>owl</strong>)
@@ -44,6 +44,12 @@ way turn out to be useful to other programmers.
   `<line number>:<checksum> | <code>` anchors instead of the classic "replace
   old string with new string" approach, which costs noticeably fewer tokens for
   the same edit.
+- **Tool calls should respect what the model already learned.** This shows up
+  in the BPE tokenization: it's not only the *format* that matters (here, an XML
+  block with a specific structure the model was trained on), but also the *tool
+  names*. Names should be chosen so they're emitted as single tokens — the
+  vocabulary already contains many common function names that tokenize to one
+  token, and leaning on those keeps tool-calling cheaper and more reliable.
 - **Different GPU layouts want different thread decompositions.** How work is
   split across threads during inference has to change with the layout; there is
   no single partitioning that's best everywhere.
@@ -93,26 +99,25 @@ the downloader for you.
 
 ## Quickstart
 
-With the model in place (see above), start the server and query it with any
-OpenAI client:
+With the model in place (see above), start the server, then drive it from the
+**qwowl35** terminal agent:
 
-```
-make run                         # or: cargo run --release -p qw35-server --bin qw35
-```
+```bash
+# 1. start the inference server (listens on 127.0.0.1:8080)
+make run                                    # or: cargo run --release -p qw35-server --bin qw35
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8080/v1", api_key="none")
-resp = client.chat.completions.create(
-    model="qwen35-9b",
-    messages=[{"role": "user", "content": "Write a quicksort in Python."}],
-    max_tokens=8192,
-)
-print(resp.choices[0].message.content)
+# 2. in another terminal, launch the TUI agent
+pip install -r qw35-tui/requirements.txt    # textual, rich, httpx, xxhash
+cd qw35-tui && python -m qwowl35
 ```
 
-The bundled REPL (`python -m qw35_client`) and the `qwowl35` Textual TUI agent
-talk to the same server.
+Type a request (e.g. *"write a quicksort in Python and run it"*) and the agent
+will think, call its bash/file tools, and stream the result. The bundled REPL
+(`python -m qw35_client`) talks to the same server if you'd rather chat without
+the tooling.
+
+See [**qwowl35: the terminal agent**](#qwowl35-the-terminal-agent) below for
+flags and the full picture.
 
 ## qwowl35: the terminal agent
 
@@ -130,7 +135,7 @@ agent's live state (prefill → thinking → inference → bash → edit → don
 ```bash
 pip install -r qw35-tui/requirements.txt   # textual, rich, httpx, xxhash
 cd qw35-tui && python -m qwowl35           # server must listen on 127.0.0.1:8080
-python -m qwowl35 --think on --reasoning-effort high
+python -m qwowl35 --think auto --reasoning-effort high   # --think auto is the default
 ```
 
 Configuration is CLI-only (`--base-url`, `--think auto|on|off`,
@@ -178,53 +183,6 @@ llama.cpp's. The `real_model_decode_path_parity_report` ignored test
 measures decode-vs-prefill logit parity (GF4's 3-bit body still flips
 the occasional argmax versus base weights; the exact Q6_K head keeps
 token selection clean).
-
-## OpenAI v1 API and coding agents
-
-The server speaks both OpenAI wire protocols with full function/tool
-calling, so the major coding agents work against it out of the box:
-
-- **codex** (`wire_api = "responses"`): `POST /v1/responses` with function
-  tools, `function_call` output items (`arguments` as a JSON string),
-  streaming `response.function_call_arguments.delta`/`.done` events, a
-  `sequence_number` on every SSE event, stateless full-input replay
-  (`function_call` / `function_call_output` items), and
-  `incomplete_details: {"reason": "max_output_tokens"}` on truncation.
-- **opencode** (`openai` provider → `/v1/responses`; `openai-compatible`
-  provider → `/v1/chat/completions`): streaming `tool_calls` deltas follow
-  the strict discipline the Vercel AI SDK needs — stable `index`, `id` +
-  `function.name` only in the first delta per call, incremental
-  `function.arguments` fragments, `finish_reason: "tool_calls"`.
-- **pi** (`api: "openai-completions"`): tools, incremental partial-JSON
-  argument streaming, `usage` chunks via `stream_options.include_usage`,
-  and `reasoning_content` on the message when `enable_thinking` is set.
-
-Thinking can be enabled three ways on `/v1/chat/completions`:
-`enable_thinking: true`, vLLM-style
-`chat_template_kwargs: {enable_thinking, preserve_thinking}`, or
-OpenAI-style `reasoning_effort` (`low`/`medium`/`high`/`xhigh` enable it,
-matching what `/v1/responses` accepts in `reasoning.effort`) — pi-based
-agents send only the latter. The server also exposes a llama.cpp-style
-`GET /props` with `default_generation_settings.n_ctx`, which clients
-like little-coder probe at startup to register the live context window.
-
-Tool definitions are injected into the Qwen 3.5 system prompt as compact
-XML signatures and stay inside the stable prompt prefix, so the session
-prefix cache keeps hitting across agent turns. Model `<tool_call>` output
-uses compact Qwen3 XML attributes, for example `<bash command="pwd"/>`, and
-JSON inside `<tool_call>` is rejected as model-format drift. The output is
-parsed by a streaming state machine; malformed blocks degrade to plain content.
-`stop` sequences and `finish_reason`
-(`stop` / `length` / `tool_calls`) are honored on both endpoints.
-`presence_penalty` and `frequency_penalty` follow OpenAI semantics
-(additive, over the generated output only); `repetition_penalty`/
-`repeat_last_n` are the llama.cpp-style knobs (multiplicative, windowed
-over the full context).
-Penalties act on sampled decode only — temperature 0 is pure argmax.
-Not implemented: `n > 1` and `response_format: json_schema` (explicit
-400), `seed`, `logit_bias`, `logprobs` (accepted, ignored), and
-server-side response state (`previous_response_id` is rejected; replay
-the full conversation).
 
 ## Thanks
 
