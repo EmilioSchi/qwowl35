@@ -1,15 +1,64 @@
-<pre>
-<span style="color:#a347ba">   _     Qwowl35</span>
- <span style="color:#a347ba">{</span><span style="color:#585858">ò</span><span style="color:#d7af00">,</span><span style="color:#585858">o</span><span style="color:#a347ba">}</span>
-<span style="color:#a347ba"> /)_)</span>
-<span style="color:#d7af00">  " "</span>
-</pre>
+</br>
+> [!WARNING]
+> This project is still incomplete and not really suitable for practical use
+> yet — but it's a fun one to experiment with as a recreational project.
 
-A Metal-backed inference engine for Qwen 3.5, designed to sit inside
-**agentic loops** on a MacBook Air M2.
+<div align="center">
+  <a href="assets/qwowl35.png">
+    <img src="assets/qwowl35.png" alt="Qwowl35 logo" width="220" />
+  </a>
+</br>
+<strong>Qwowl35</strong>
+</br>
+(pronounced /kwaʊl/, a portmanteau of <strong>Qwen</strong> and <strong>owl</strong>)
+</br>
+<em>A <strong>Metal-backed</strong> inference engine for Qwen 3.5.</em>
+</br>
+</div>
+
+Designed to sit inside **agentic loops** on a MacBook Air M2.
 
 For facts about the served model itself — architecture, weight formats,
 reasoning modes, chat encoding, sampling — see [`MODEL_CARD.md`](MODEL_CARD.md).
+
+## Motivation
+
+This project started with a simple goal: to run **Qwen 3.5 9B** — a model small
+enough to fit, yet capable enough to assist with light coding tasks — entirely
+on my local machine, a **MacBook Air M2**. From there it grew into a playground
+for exploring optimization on several fronts: token efficiency, smarter
+tool-calling, threading during inference, and a friendly user interface.
+
+It is not meant to be a product for the public. It's a recreational experiment —
+I do it because it's fun. My hope is that some of the things I ran into along the
+way turn out to be useful to other programmers.
+
+## What I've learned so far
+
+- **`gf4` quantization is pure and uniform.** Every layer is quantized to
+  exactly 4 bits per weight. It is a 4-bit *grouped floating point* format: 8
+  values are packed into 32 bits, using a 3-bit quantized scale per value plus a
+  single fp8 scale shared across the group. The format comes from zeux's
+  [`calm`](https://github.com/zeux/calm); here it's used as an optional
+  decode-time sidecar, where the smaller weights buy faster generation on the
+  memory-bound decode path — still very much a work in progress.
+- **Anchor-based file editing is token-efficient.** The editing tools key off
+  `<line number>:<checksum> | <code>` anchors instead of the classic "replace
+  old string with new string" approach, which costs noticeably fewer tokens for
+  the same edit.
+- **Different GPU layouts want different thread decompositions.** How work is
+  split across threads during inference has to change with the layout; there is
+  no single partitioning that's best everywhere.
+- **Restricted bash plus a parsing policy is a solid first security layer.**
+  Running a restricted bash, combined with a policy that parses commands to
+  separate the suspicious from the benign, seems to be an effective first line
+  of defense.
+- **An adaptive KV-cache window pays off.** Growing the cache to fit the context
+  rather than preallocating it saves a meaningful amount of memory.
+- **`q8_0` is the smallest quantization I'd actually trust** — and even then I
+  still have doubts about what that numerical compression really costs.
+- **The MacBook runs *hot*.** Sustained inference heats it up enough that an
+  external cooling setup is essentially required.
 
 ## Layout
 
