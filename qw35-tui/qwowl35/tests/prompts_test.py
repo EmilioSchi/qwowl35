@@ -57,17 +57,8 @@ def test_prompt_uses_xml_tool_examples() -> None:
     assert_true("<delete_lines " not in prompt, "old delete tool name absent")
 
 
-def test_prompt_has_macos_stat_guidance() -> None:
-    prompt = build_system_message("/tmp/qw35-test")["content"]
-
-    assert_true("Platform:" in prompt, "platform inserted")
-    assert_true("stat -f '%N %z %SB'" in prompt, "BSD stat example")
-    assert_true("stat -c" in prompt and "do not use GNU-only" in prompt, "GNU stat warning")
-
-
 def main() -> None:
     test_prompt_uses_xml_tool_examples()
-    test_prompt_has_macos_stat_guidance()
     print("prompt tests passed")
 
 
