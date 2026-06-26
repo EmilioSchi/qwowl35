@@ -203,10 +203,6 @@ void *qw35_metal_runtime_create(
         uint64_t model_size,
         const qw35_metal_tensor_desc *tensors,
         uintptr_t tensor_count,
-        const void *gf4_map,
-        uint64_t gf4_size,
-        const qw35_metal_tensor_desc *gf4_tensors,
-        uintptr_t gf4_tensor_count,
         const qw35_metal_hparams *hparams,
         uint32_t ctx_size,
         uint32_t vocab_size,
@@ -223,10 +219,6 @@ void *qw35_metal_runtime_create(
                                              modelSize:model_size
                                                tensors:tensors
                                            tensorCount:tensor_count
-                                                gf4Map:gf4_map
-                                               gf4Size:gf4_size
-                                            gf4Tensors:gf4_tensors
-                                        gf4TensorCount:gf4_tensor_count
                                                hparams:hparams
                                                ctxSize:ctx_size
                                              vocabSize:vocab_size
@@ -311,6 +303,16 @@ int qw35_metal_runtime_sync(void *runtime, char *err, uintptr_t err_len) {
             return 0;
         }
         return 1;
+    }
+}
+
+void qw35_metal_runtime_set_attn_sink(void *runtime, int32_t sink) {
+    @autoreleasepool {
+        if (!runtime) {
+            return;
+        }
+        Qw35MetalRuntime *rt = (__bridge Qw35MetalRuntime *)runtime;
+        [rt setAttnSink:(int)sink];
     }
 }
 

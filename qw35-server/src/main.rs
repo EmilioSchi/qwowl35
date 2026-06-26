@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 // Cwd-relative default model path and the downloader that fetches it. Kept in
 // one place so the `Config` default and the missing-model helper can't drift.
-const DEFAULT_MODEL_PATH: &str = ".gguf/Qwen3.5-9B-Q4_K_M.gguf";
+const DEFAULT_MODEL_PATH: &str = ".gguf/Qwowl3.5-9B.gguf";
 const DOWNLOAD_SCRIPT: &str = "download_model.sh";
 
 // 128K is the throughput sweet spot: decode holds full speed (~19.3 tok/s) and
@@ -47,11 +47,19 @@ fn run(config: Config) -> ExitCode {
         prefill_chunk: config.prefill_chunk,
         kv_cache_type: config.kv_cache_type,
         session_cache: config.session_cache,
-        gf4: config.gf4,
+        // Decode-time sliding-window attention, passed straight to the Metal
+        // runtime over the FFI (no env vars). Off by default (full attention).
+        attn_window: config.attn_window,
+        attn_sink: config.attn_sink,
         warm_weights: config.warm_weights,
         test_responder: config.test_responder,
         verbose: config.verbose,
     };
+
+    // Weight/KV GPU residency pinning (MTLResidencySet, macOS 15+) is always on:
+    // the unified .gguf footprint (~5 GiB, one mmap, no duplicate FFN) fits
+    // comfortably resident on 16 GiB, keeping weight-bandwidth-bound decode fast
+    // over a long session. The Metal runtime pins unconditionally at engine init.
 
     let engine = match Engine::open(engine_config) {
         Ok(engine) => Arc::new(engine),
@@ -72,17 +80,18 @@ fn run(config: Config) -> ExitCode {
     eprintln!("  arch={}", summary.architecture);
     eprintln!("  ctx={}", config.ctx_size);
     eprintln!("  decoder_ready={}", engine.decoder_ready());
-    eprintln!("  backend={}", engine.backend_name());
     eprintln!("  prefill_chunk={}", engine.prefill_chunk());
     eprintln!(
         "  ffn={}",
-        if engine.gf4_active() {
-            "gf4-sidecar"
-        } else {
-            "gguf"
-        }
+        engine.ffn_label()
     );
     eprintln!("  kv_cache={}", engine.kv_cache_type().as_str());
+    if config.attn_window > 0 {
+        eprintln!(
+            "  attn_window={} sink={} (decode-only; bounds attention to keep tok/s flat)",
+            config.attn_window, config.attn_sink
+        );
+    }
     eprintln!(
         "  session_cache={}",
         if engine.session_cache() { "on" } else { "off" }
@@ -174,7 +183,8 @@ struct Config {
     prefill_chunk: u32,
     kv_cache_type: KvCacheType,
     session_cache: bool,
-    gf4: bool,
+    attn_window: i32,
+    attn_sink: i32,
     generation_defaults: GenerationDefaults,
     warm_weights: bool,
     test_responder: bool,
@@ -254,7 +264,8 @@ impl Config {
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
             kv_cache_type: KvCacheType::Q8_0,
             session_cache: true,
-            gf4: true,
+            attn_window: 0,
+            attn_sink: 0,
             generation_defaults: GenerationDefaults::default(),
             warm_weights: false,
             test_responder: false,
@@ -290,8 +301,12 @@ impl Config {
                     })?;
                 }
                 "--no-session-cache" => config.session_cache = false,
-                "--gf4" => config.gf4 = true,
-                "--no-gf4" => config.gf4 = false,
+                "--attn-window" => {
+                    config.attn_window = parse_u32(&arg, &need_arg(&arg, &mut args)?)? as i32;
+                }
+                "--attn-sink" => {
+                    config.attn_sink = parse_u32(&arg, &need_arg(&arg, &mut args)?)? as i32;
+                }
                 "--mode" => {
                     let name = need_arg(&arg, &mut args)?;
                     mode = Some(server::Mode::from_name(&name).ok_or_else(|| {
@@ -462,7 +477,7 @@ fn print_help() {
 \n\
 Model and runtime:\n\
   -m, --model FILE\n\
-      GGUF model path. Default: .gguf/Qwen3.5-9B-Q4_K_M.gguf\n\
+      GGUF model path. Default: .gguf/Qwowl3.5-9B.gguf\n\
   --model-id ID\n\
       Served OpenAI model id. Default: qwen35-9b\n\
   -c, --ctx N, --num-ctx N\n\
@@ -471,8 +486,10 @@ Model and runtime:\n\
       Attention KV cache storage: q8_0 (8.5 bits/element blocks, default) or f16. q8_0 is byte-identical to f16 output in testing at fp16-parity decode speed and ~1.9x less memory; f16 is the lossless reference, kept for KV-cache comparisons.\n\
   --no-session-cache\n\
       Disable the session prefix cache. By default the server keeps the KV cache and SSM state alive between requests and re-evaluates only the new suffix when a prompt extends the previous conversation.\n\
-  --no-gf4\n\
-      Ignore the GF4 sidecar next to the GGUF (<stem>.gf4.bin or <stem>.ffn-gf4.bin) and decode with the base GGUF weights. By default the sidecar is used on the single-token decode path (~19.8 tok/s vs ~13.7 without); its 3-bit tensors occasionally pick a different token than the base weights, with no measured loop or code-quality regressions. --gf4 forces it on explicitly.\n\
+  --attn-window N\n\
+      Decode-time sliding-window attention for the 8 full-attention layers: attend only to the last N positions (plus --attn-sink leading tokens), bounding the per-token attention cost so decode tok/s stays FLAT across a long session instead of degrading with context (e.g. ~13 tok/s at any ctx vs ~10 at 8K / falling further). Default 0 = off (full attention). TRADE-OFF: the model loses exact recall of content older than the window in those layers (the DeltaNet layers carry only compressed long-range), so enable it only when sustained speed matters more than long-range recall. Suggested: 2048-4096.\n\
+  --attn-sink N\n\
+      Leading sink tokens always attended to under --attn-window (StreamingLLM-style). Default 0; 4-8 recommended when --attn-window is set.\n\
   -n, --tokens N\n\
       Default max output tokens when the client omits a limit. Default: -1 (generate until EOS or remaining context is exhausted)\n\
   --num-predict N\n\

@@ -82,10 +82,10 @@ way turn out to be useful to other programmers.
 - `qw35-client/` — Python. Interactive REPL that talks to the server
   (`python -m qw35_client`).
 - `qw35-tool/` — Python. Offline utilities: GGUF metadata dumper and
-  GF4 sidecar cooker.
+  the unified-model cooker (bakes GF4 FFN + AWQ into the `.gguf`).
 - `qw35-tui/` — Python. `qwowl35`, a Textual terminal coding agent that
   drives the server in a tool-calling loop (`python -m qwowl35`).
-- `.gguf/` — Model weights and pre-cooked sidecars (kept at the repo
+- `.gguf/` — The base GGUF and the cooked unified model (kept at the repo
   root so the server's cwd-relative default path resolves).
 
 ## Getting the model
@@ -94,17 +94,18 @@ The weights are git-ignored, so a fresh checkout has none. Fetch them with:
 
 ```
 ./download_model.sh         # base GGUF -> .gguf/Qwen3.5-9B-Q4_K_M.gguf (~5.3 GB)
-./download_model.sh gf4     # cook the optional GF4 decode sidecar (CPU-heavy)
+./download_model.sh cook    # cook the unified Qwowl3.5-9B.gguf (CPU-heavy)
 ./download_model.sh all     # both
 ```
 
-The GGUF comes from `unsloth/Qwen3.5-9B-GGUF` on Hugging Face; pass `--token`
+The base GGUF comes from `unsloth/Qwen3.5-9B-GGUF` on Hugging Face; pass `--token`
 (or set `HF_TOKEN`) if you need authentication, and `QW35_GGUF_DIR` to change the
-target directory. The GF4 sidecar is not downloadable — `gf4` cooks it locally
-from the GGUF with `qw35-tool` (needs `python3` + `numpy` + `gguf`); the server
-runs fine without it (just slower decode) and picks it up automatically when
-present. If you start the server (`make run`) without the model, it offers to run
-the downloader for you.
+target directory. The unified model the server loads by default —
+`Qwowl3.5-9B.gguf` — is not downloadable: `cook` bakes it locally from the
+base GGUF with `qw35-tool` (needs `python3` + `numpy` + `gguf`, and the AWQ
+activation stats — see the section below). The base GGUF is kept as the cook input
+and the quality-comparison reference. If you start the server (`make run`) without
+the model, it offers to run the downloader for you.
 
 ## Quickstart
 
@@ -165,27 +166,30 @@ sweet spot, not the full trained window:
 `--kv-cache-type f16` makes the cache ~1.9× larger than `q8_0`; pass a smaller
 `--ctx` on memory-constrained machines.
 
-## GF4 decode sidecar: speed vs quality
+## The unified model: GF4 + AWQ
 
-A `<stem>.gf4.bin` next to the GGUF replaces weights on the
-single-token decode path by default (prefill always uses the base
-Q4_K/Q5_K/Q6_K weights); `--no-gf4` falls back to base-weight decode.
-GF4 stores eight **3-bit** quants plus an fp8 scale per 32-bit word;
-the shipped sidecar is the `full` cook including `output.weight`
-(~19.8 tok/s decode; a `full-no-head` alternative with an exact Q6_K
-head sits next to it as `.gf4-no-head.bin.bak` — cook other coverages
-with `qw35-tool/qw35_tool/cook_qw35_ffn_gf4_sidecar.py --only ...`).
+The server loads a single self-contained `.gguf`: the base GGUF with its FFN
+gate/up/down tensors baked as **GF4** (eight 3-bit quants plus an fp8 scale per
+32-bit word, GGUF type-id 100) and an **AWQ** per-channel scale folded into the
+post-attention norms. GF4 drives both the single-token decode matvec and the
+tiled multi-token prefill matmul, so there is no separate sidecar, no duplicate
+Q4_K FFN, and one mmap (~4.8 GiB). The cooker is
+`qw35-tool/qw35_tool/cook_qw35_awq_gf4.py MODEL.gguf OUT.gguf --awq act-stats.bin`.
 
-Cross-engine battery (same GGUF served by llama.cpp/Metal as reference;
-5-prompt ladder from a counting loop-probe to a multi-method class,
-fenced code `py_compile`-scored; harness:
-`qw35-tool/qw35_tool/engine_compare.py`, M2 Air 16 GB):
+The canonical build is **`Qwowl3.5-9B.gguf`**, cooked with the AWQ-GF4 approach.
+It was chosen by cooking
+both `awq-gf4` and a plain `gf4` (no AWQ) variant and comparing each, cold, against
+the base Q4_K GGUF (teacher-forced cross-engine quality report,
+`real_model_unified_quality_report`, M2 16 GB):
 
-| engine / decode weights | decode tok/s | compiles | loops |
-|-------------------------|--------------|----------|-------|
-| qw35, GF4 full (default) | ~19.8       | 9/9      | 0/6   |
-| qw35 `--no-gf4` (base)  | ~13.7        | 9/9      | 0/6   |
-| llama.cpp, same GGUF    | ~8           | 9/9      | 0/6   |
+| unified variant | top-1 agreement vs base | mean KL | argmax flips |
+|-----------------|-------------------------|---------|--------------|
+| **awq-gf4 (canonical)** | **89.8%** | **0.038** | **5/49** |
+| gf4 (no AWQ)            | 85.7%     | 0.062   | 7/49       |
+
+AWQ wins on every axis at identical decode speed (~17 tok/s; both variants share
+the same GF4 FFN tensors — AWQ only rescales the norm and gate/up columns). The
+base GGUF is retained purely as this comparison's reference.
 
 qw35's greedy output on the loop-probe is byte-identical to
 llama.cpp's. The `real_model_decode_path_parity_report` ignored test

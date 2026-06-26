@@ -213,6 +213,16 @@ kernel qw35_mul_mm_t qw35_kernel_mul_mm<
     qw35_block_q4_k, 16, qw35_dequantize_q4_k,
     float, float2x4>;
 
+// Unified .qw35 stores the FFN as GF4; prefill dequantizes it through the same
+// template (256-elem super-block, nl=16). qw35_block_gf4 / qw35_dequantize_gf4
+// live in qw35_gf4.metal, which is concatenated before this file.
+template [[host_name("qw35_mul_mm_gf4_f32")]]
+kernel qw35_mul_mm_t qw35_kernel_mul_mm<
+    half, half4x4, simdgroup_half8x8,
+    float, float2x4, simdgroup_float8x8,
+    qw35_block_gf4, 16, qw35_dequantize_gf4,
+    float, float2x4>;
+
 template [[host_name("qw35_mul_mm_q5_k_f32")]]
 kernel qw35_mul_mm_t qw35_kernel_mul_mm<
     half, half4x4, simdgroup_half8x8,

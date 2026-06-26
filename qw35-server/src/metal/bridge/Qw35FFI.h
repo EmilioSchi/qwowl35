@@ -33,16 +33,12 @@ int qw35_metal_warm_model_views(
         uintptr_t err_len);
 
 /// Create a Qw35MetalRuntime.  Returns an opaque retained handle, or NULL.
-/// gf4_map/gf4_tensors may be NULL when no GF4 sidecar is loaded.
+/// The unified .gguf carries its GF4 FFN as type-id 100 tensors in `tensors`.
 void *qw35_metal_runtime_create(
         const void *model_map,
         uint64_t model_size,
         const qw35_metal_tensor_desc *tensors,
         uintptr_t tensor_count,
-        const void *gf4_map,
-        uint64_t gf4_size,
-        const qw35_metal_tensor_desc *gf4_tensors,
-        uintptr_t gf4_tensor_count,
         const qw35_metal_hparams *hparams,
         uint32_t ctx_size,
         uint32_t vocab_size,
@@ -66,6 +62,12 @@ int qw35_metal_runtime_state_checkpoint_restore(void *runtime, char *err, uintpt
 
 /// Wait for all in-flight GPU work to complete.
 int qw35_metal_runtime_sync(void *runtime, char *err, uintptr_t err_len);
+
+/// Set the decode-time sliding-window attention sink (first N positions always
+/// attended). The engine sets this per request to max(--attn-sink, preamble),
+/// where preamble = system block + first user turn, so the window never evicts
+/// the tool-call format or the task. No-op when --attn-window is 0.
+void qw35_metal_runtime_set_attn_sink(void *runtime, int32_t sink);
 
 /// Evaluate one token. Commits asynchronously: GPU errors surface at the
 /// next argmax/copy_logits/reset call. logits_mode is a qw35_logits_mode.

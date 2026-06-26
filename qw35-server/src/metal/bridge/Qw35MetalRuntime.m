@@ -12,9 +12,7 @@
 // by fused kernels. The KV cache is f16. Greedy decode uses a fused
 // Q6_K-matvec+argmax output head and never materializes the logits vector.
 
-#import "Qw35MetalRuntime.h"
-#import "Qw35TensorStore.h"
-#import "Qw35PipelineCache.h"
+#import "Qw35MetalRuntime+Internal.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -27,117 +25,7 @@
 // first use, so a smaller buffer is a real physical-memory saving).
 #define QW35_KV_INITIAL_SLAB 8192u
 
-static NSError *qw35_error(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
-
-static NSError *qw35_error(NSString *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
-    va_end(args);
-    return [NSError errorWithDomain:@"Qw35MetalRuntime"
-                               code:-1
-                           userInfo:@{NSLocalizedDescriptionKey: msg}];
-}
-
-static uint64_t qw35_div_up_u64(uint64_t value, uint64_t divisor) {
-    return (value + divisor - 1) / divisor;
-}
-
-static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSUInteger threads) {
-    if (n == 0) return;
-    [enc dispatchThreadgroups:MTLSizeMake((n + threads - 1) / threads, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-}
-
-/// Per-layer weights resolved once at init so the per-token encode loop does
-/// no string formatting or dictionary lookups. Matvec weights prefer the GF4
-/// sidecar tensor (type_id 100) when one exists.
-@interface Qw35LayerTensors : NSObject
-@property (nonatomic, strong) Qw35Tensor *attnNorm;
-@property (nonatomic, strong) Qw35Tensor *postAttentionNorm;
-// Delta (linear-attention) layers
-@property (nonatomic, strong) Qw35Tensor *attnQkv;
-@property (nonatomic, strong) Qw35Tensor *attnGate;
-@property (nonatomic, strong) Qw35Tensor *ssmBeta;
-@property (nonatomic, strong) Qw35Tensor *ssmAlpha;
-@property (nonatomic, strong) Qw35Tensor *ssmConv;
-@property (nonatomic, strong) Qw35Tensor *ssmDt;
-@property (nonatomic, strong) Qw35Tensor *ssmA;
-@property (nonatomic, strong) Qw35Tensor *ssmNorm;
-@property (nonatomic, strong) Qw35Tensor *ssmOut;
-// Full-attention layers
-@property (nonatomic, strong) Qw35Tensor *attnQ;
-@property (nonatomic, strong) Qw35Tensor *attnK;
-@property (nonatomic, strong) Qw35Tensor *attnV;
-@property (nonatomic, strong) Qw35Tensor *attnQNorm;
-@property (nonatomic, strong) Qw35Tensor *attnKNorm;
-@property (nonatomic, strong) Qw35Tensor *attnOutput;
-// FFN (GF4 tensors when a sidecar is loaded)
-@property (nonatomic, strong) Qw35Tensor *ffnGate;
-@property (nonatomic, strong) Qw35Tensor *ffnUp;
-@property (nonatomic, strong) Qw35Tensor *ffnDown;
-@end
-
 @implementation Qw35LayerTensors
-@end
-
-@interface Qw35MetalRuntime () {
-    id<MTLDevice> _device;
-    id<MTLCommandQueue> _queue;
-    id<MTLLibrary> _library;
-    Qw35TensorStore *_tensorStore;
-    Qw35TensorStore *_gf4Store; // nil without a cooked GF4 sidecar
-    Qw35PipelineCache *_pipelineCache;
-    qw35_metal_hparams _h;
-    uint32_t _ctxSize;      // hard ceiling: max position the cache may ever hold
-    uint32_t _kvCapacity;   // positions currently allocated per layer (grows on demand)
-    uint32_t _kvSlab;       // growth granularity: capacity grows in slab-sized steps
-    uint32_t _vocabSize;
-    uint32_t _maxPrefillChunk;
-    uint32_t _deltaLayerCount;
-    uint32_t _attentionLayerCount;
-    BOOL _kvQ8;            // q8_0 KV cache (34-byte blocks of 32) instead of f16
-    uint64_t _kvRowBytes;  // bytes per (layer, position) K or V cache row
-
-    // Activation / state buffers. Activations are f32; the KV cache is f16.
-    id<MTLBuffer> _act_a;
-    id<MTLBuffer> _act_b;
-    id<MTLBuffer> _norm;
-    id<MTLBuffer> _qkv;
-    id<MTLBuffer> _z_gate;
-    id<MTLBuffer> _beta;
-    id<MTLBuffer> _alpha;
-    id<MTLBuffer> _q_rep;
-    id<MTLBuffer> _k_rep;
-    id<MTLBuffer> _core;
-    id<MTLBuffer> _ffn_gate;
-    id<MTLBuffer> _ffn_up;
-    id<MTLBuffer> _logits;
-    id<MTLBuffer> _k_cache;
-    id<MTLBuffer> _v_cache;
-    id<MTLBuffer> _conv_state;
-    id<MTLBuffer> _ssm_state;
-    // Session checkpoint copies of the recurrent state (CPU-side, small).
-    NSMutableData *_conv_state_ckpt;
-    NSMutableData *_ssm_state_ckpt;
-    BOOL _has_state_ckpt;
-    id<MTLBuffer> _argmax_token;
-    id<MTLBuffer> _argmax_logit;
-    id<MTLBuffer> _argmax_partial_token;
-    id<MTLBuffer> _argmax_partial_logit;
-    id<MTLBuffer> _prefill_tokens;
-    id<MTLBuffer> _rope_freq;
-
-    // Per-layer decode weights (GF4-preferred), resolved once at init.
-    NSArray<Qw35LayerTensors *> *_layers;
-    Qw35Tensor *_tokenEmbd;
-    Qw35Tensor *_outputNorm;
-    Qw35Tensor *_outputWeight; // GF4-preferred
-    BOOL _outputWeightIsGf4;
-
-    // Last committed command buffer of the most recent eval.
-    id<MTLCommandBuffer> _lastCB;
-}
 @end
 
 @implementation Qw35MetalRuntime
@@ -146,10 +34,6 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
                        modelSize:(uint64_t)modelSize
                           tensors:(const qw35_metal_tensor_desc *)tensorDescs
                       tensorCount:(uintptr_t)tensorCount
-                          gf4Map:(const void *)gf4Map
-                         gf4Size:(uint64_t)gf4Size
-                      gf4Tensors:(const qw35_metal_tensor_desc *)gf4Tensors
-                  gf4TensorCount:(uintptr_t)gf4TensorCount
                           hparams:(const qw35_metal_hparams *)hparams
                           ctxSize:(uint32_t)ctxSize
                         vocabSize:(uint32_t)vocabSize
@@ -175,6 +59,21 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
         if (error) *error = qw35_error(@"failed to create Metal command queue");
         return nil;
     }
+
+    const char *capPath = getenv("QW35_CAPTURE_ACT_OUT");
+    if (capPath && *capPath) {
+        _capEnabled = YES;
+        _capPath = strdup(capPath);
+    }
+
+    const char *stageProf = getenv("QW35_STAGE_PROFILE");
+    if (stageProf && *stageProf) {
+        _stageProfile = YES;
+        fprintf(stderr, "qw35: per-stage GPU profiler ON (QW35_STAGE_PROFILE); decode is serialised and SLOW\n");
+    }
+
+    _attnWindow = hparams->attn_window;
+    _attnSink = hparams->attn_sink;
 
     dispatch_data_t libData = dispatch_data_create(metallib,
                                                    (size_t)metallibLen,
@@ -221,29 +120,70 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
         return nil;
     }
 
-    if (gf4Map && gf4Size && gf4Tensors && gf4TensorCount) {
-        _gf4Store = [[Qw35TensorStore alloc] initWithModelMap:gf4Map
-                                                    modelSize:gf4Size
-                                                       tensors:gf4Tensors
-                                                   tensorCount:gf4TensorCount
-                                                        device:_device
-                                                         error:error];
-        if (!_gf4Store) return nil;
-    }
-
     _pipelineCache = [[Qw35PipelineCache alloc] initWithLibrary:_library device:_device];
 
     if (![self resolveLayerTensors:error]) return nil;
     if (![self allocateBuffers:error]) return nil;
     if (![self prewarmPipelines:error]) return nil;
     if (![self reset:error]) return nil;
+    [self setupResidency];
     return self;
 }
 
-/// A decode matvec weight: the GF4 sidecar tensor when present, else GGUF.
+/// Pin the mmap-backed weight buffers, the KV cache, and the large scratch
+/// buffers into an MTLResidencySet (macOS 15+) and request residency ONCE, but
+/// deliberately do NOT associate the set with the command queue.
+///
+/// Why not associate it: a queue-associated residency set keeps its allocations
+/// continuously resident for every command buffer, which holds the unified-
+/// memory subsystem in a high-power state and heats the GPU into thermal
+/// throttle ~1 min sooner under sustained decode — measured 14->7 tok/s within
+/// 2 minutes on an M2/16 GiB. A one-shot requestResidency biases the pages into
+/// fast memory without that continuous-residency power cost; sustained decode
+/// then holds ~14 tok/s. (A/B confirmed: dropping the queue association — or the
+/// request, or the weight pinning — each eliminates the droop; the full
+/// combination is the only one that throttles.) macOS 15+ only.
+- (void)setupResidency {
+    // Runtime feature-detect instead of @available (which needs a runtime symbol
+    // not linked under this build's -nodefaultlibs). MTLResidencySet is macOS 15+.
+    if (![_device respondsToSelector:@selector(newResidencySetWithDescriptor:error:)]) {
+        fprintf(stderr, "qw35: MTLResidencySet unavailable on this OS; residency skipped\n");
+        return;
+    }
+    MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+    NSError *err = nil;
+    id<MTLResidencySet> rs = [_device newResidencySetWithDescriptor:desc error:&err];
+    if (!rs) {
+        fprintf(stderr, "qw35: residency set creation failed: %s\n",
+                err.localizedDescription.UTF8String);
+        return;
+    }
+    NSMutableArray<id<MTLBuffer>> *bufs = [NSMutableArray array];
+    [bufs addObjectsFromArray:[_tensorStore allBuffers]];
+    id<MTLBuffer> scratch[] = {
+        _k_cache, _v_cache, _conv_state, _ssm_state, _act_a, _act_b, _norm,
+        _qkv, _z_gate, _q_rep, _k_rep, _core, _ffn_gate, _ffn_up, _logits, _rope_freq,
+        _beta, _alpha, _argmax_partial_token, _argmax_partial_logit,
+    };
+    for (size_t i = 0; i < sizeof(scratch) / sizeof(scratch[0]); i++) {
+        if (scratch[i]) [bufs addObject:scratch[i]];
+    }
+    uint64_t total = 0;
+    for (id<MTLBuffer> b in bufs) {
+        [rs addAllocation:b];
+        total += b.allocatedSize;
+    }
+    [rs commit];
+    [rs requestResidency];  // one-shot; NOT [_queue addResidencySet:rs] (see above)
+    _residencySet = rs;
+    // No stderr announcement: residency is hardcoded, not a configuration
+    // parameter. The startup summary's `residency=on` line covers user-facing
+    // state; the rare unavailable/failed cases above still warn.
+}
+
+/// A decode matvec weight from the unified .gguf tensor table. The tensor's
+/// type-id (100 = GF4) selects the GF4 vs Q4_K kernel downstream.
 - (Qw35Tensor *)decodeWeightNamed:(NSString *)name error:(NSError **)error {
-    Qw35Tensor *gf4 = [_gf4Store tensorNamed:name];
-    if (gf4) return gf4;
     return [self tensorNamed:name error:error];
 }
 
@@ -270,6 +210,10 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
         Qw35LayerTensors *layer = [Qw35LayerTensors new];
         layer.attnNorm = plain(@"attn_norm.weight");
         layer.postAttentionNorm = plain(@"post_attention_norm.weight");
+        // The unified .gguf bakes the AWQ-folded norm directly into
+        // post_attention_norm, so prefill and decode share it (both run the
+        // GF4+AWQ FFN) — no decode-only override.
+        layer.postAttentionNormDecode = layer.postAttentionNorm;
         layer.ffnGate = weight(@"ffn_gate.weight");
         layer.ffnUp = weight(@"ffn_up.weight");
         layer.ffnDown = weight(@"ffn_down.weight");
@@ -442,9 +386,26 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
         memcpy(dstV + slot * newStride, oldV + slot * oldStride, (size_t)oldStride);
     }
 
+    id<MTLBuffer> oldKBuf = _k_cache;
+    id<MTLBuffer> oldVBuf = _v_cache;
     _k_cache = newK;
     _v_cache = newV;
     _kvCapacity = (uint32_t)newCap;
+
+    // Keep the grown KV cache pinned: swap the old buffers out of the residency
+    // set for the new ones and re-commit. Without this the KV cache silently
+    // leaves residency the first time a session crosses a slab boundary (past
+    // QW35_KV_INITIAL_SLAB), re-introducing the long-session decode droop the
+    // set exists to prevent. The set stays associated with the queue, so no
+    // re-addResidencySet: is needed. Nil on older OSes -> no-op.
+    if (_residencySet) {
+        [_residencySet removeAllocation:oldKBuf];
+        [_residencySet removeAllocation:oldVBuf];
+        [_residencySet addAllocation:newK];
+        [_residencySet addAllocation:newV];
+        [_residencySet commit];
+        [_residencySet requestResidency];
+    }
     return YES;
 }
 
@@ -498,24 +459,23 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
     for (size_t i = 0; i < 4; i++) {
         if (![self attnPipeline:attn[i] error:error]) return NO;
     }
-    if (_gf4Store) {
+    // GF4 FFN is baked into the unified .gguf as type-100 tensors in the tensor
+    // store; the type-id drives the GF4 kernel path.
+    Qw35Tensor *ffnGate0 = [_tensorStore tensorNamed:@"blk.0.ffn_gate.weight"];
+    BOOL gf4Ffn = ffnGate0 != nil && ffnGate0.type_id == 100;
+    if (gf4Ffn) {
         if (![_pipelineCache pipelineNamed:@"qw35_ffn_gate_up_swiglu_gf4_f32" error:error]) return NO;
         if (![_pipelineCache pipelineNamed:@"qw35_decode_matmul_gf4_2row_residual_f32" error:error]) return NO;
         if (![_pipelineCache pipelineNamed:@"qw35_decode_matmul_gf4_2row_f32" error:error]) return NO;
-        if ([_gf4Store tensorNamed:@"output.weight"]) {
+        // Tiled GF4 prefill matmul (full and bounded-output tail-chunk variants).
+        if (![_pipelineCache mulMmPipelineNamed:@"qw35_mul_mm_gf4_f32" bcInp:NO bcOut:NO error:error]) return NO;
+        if (![_pipelineCache mulMmPipelineNamed:@"qw35_mul_mm_gf4_f32" bcInp:NO bcOut:YES error:error]) return NO;
+        Qw35Tensor *baseHead = [_tensorStore tensorNamed:@"output.weight"];
+        if (baseHead != nil && baseHead.type_id == 100) {
             if (![_pipelineCache pipelineNamed:@"qw35_output_gf4_argmax_partials_16row_f32" error:error]) return NO;
         }
     }
     return YES;
-}
-
-- (id<MTLComputePipelineState>)attnPipeline:(NSString *)name error:(NSError **)error {
-    return [_pipelineCache attnPipelineNamed:name
-                                       heads:(int)_h.attention_heads
-                                     kvHeads:(int)_h.attention_kv_heads
-                                     headDim:(int)_h.attention_key_length
-                                     ropeDim:(int)_h.rope_dimension_count
-                                       error:error];
 }
 
 - (BOOL)waitForLastCommand:(NSError **)error {
@@ -532,6 +492,10 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
 
 - (BOOL)sync:(NSError **)error {
     return [self waitForLastCommand:error];
+}
+
+- (void)setAttnSink:(int)sink {
+    _attnSink = sink < 0 ? 0 : sink;
 }
 
 - (BOOL)reset:(NSError **)error {
@@ -612,6 +576,12 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
               pos:(uint32_t)pos
        logitsMode:(qw35_logits_mode)logitsMode
             error:(NSError **)error {
+    if (_capEnabled) {
+        return [self captureEvalToken:token pos:pos logitsMode:logitsMode error:error];
+    }
+    if (_stageProfile) {
+        return [self evalTokenStageProfiled:token pos:pos logitsMode:logitsMode error:error];
+    }
     if (pos >= _ctxSize) {
         if (error) *error = qw35_error(@"requested position exceeds allocated context");
         return NO;
@@ -669,6 +639,289 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
     return YES;
 }
 
+- (void)dealloc {
+    if (_capEnabled) {
+        [self writeCaptureFile];
+    }
+    free(_capPath);
+    free(_capGateUp);
+    free(_capDown);
+}
+
+// ---------------------------------------------------------------------------
+#pragma mark - Calibration activation capture (QW35_CAPTURE_ACT_OUT)
+// ---------------------------------------------------------------------------
+
+/// Encode one stage into a fresh command buffer and wait, so the just-written
+/// scratch buffer can be read back on the CPU before the next stage clobbers it.
+- (BOOL)captureRun:(BOOL (^)(id<MTLComputeCommandEncoder> enc, NSError **error))block
+             error:(NSError **)error {
+    id<MTLCommandBuffer> cb = [_queue commandBufferWithUnretainedReferences];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    BOOL ok = block(enc, error);
+    [enc endEncoding];
+    if (!ok) return NO;
+    [cb commit];
+    [cb waitUntilCompleted];
+    _lastCB = cb;
+    return YES;
+}
+
+/// Write the cumulative per-channel mean-abs activation stats to _capPath.
+/// Format: "QW35ACT\0", version u32, layers u32, gateup_dim u32, down_dim u32,
+/// tokens u64, then [layers*gateup_dim] f32 gate/up means, then
+/// [layers*down_dim] f32 down means.
+- (void)writeCaptureFile {
+    if (!_capPath || !_capGateUp || !_capDown || _capTokens == 0) return;
+    FILE *f = fopen(_capPath, "wb");
+    if (!f) return;
+
+    const uint32_t layers = _h.transformer_layers;
+    const uint32_t gu_dim = (uint32_t)_h.embedding_length;
+    const uint32_t dn_dim = (uint32_t)_h.feed_forward_length;
+    const char magic[8] = {'Q', 'W', '3', '5', 'A', 'C', 'T', '\0'};
+    const uint32_t version = 1;
+    fwrite(magic, 1, 8, f);
+    fwrite(&version, sizeof(version), 1, f);
+    fwrite(&layers, sizeof(layers), 1, f);
+    fwrite(&gu_dim, sizeof(gu_dim), 1, f);
+    fwrite(&dn_dim, sizeof(dn_dim), 1, f);
+    fwrite(&_capTokens, sizeof(_capTokens), 1, f);
+
+    const double inv = 1.0 / (double)_capTokens;
+    const size_t gu_n = (size_t)layers * gu_dim;
+    const size_t dn_n = (size_t)layers * dn_dim;
+    float *buf = (float *)malloc((gu_n > dn_n ? gu_n : dn_n) * sizeof(float));
+    if (buf) {
+        for (size_t i = 0; i < gu_n; i++) buf[i] = (float)(_capGateUp[i] * inv);
+        fwrite(buf, sizeof(float), gu_n, f);
+        for (size_t i = 0; i < dn_n; i++) buf[i] = (float)(_capDown[i] * inv);
+        fwrite(buf, sizeof(float), dn_n, f);
+        free(buf);
+    }
+    fclose(f);
+}
+
+/// Calibration twin of -evalToken:. Runs a serialised per-layer decode and
+/// accumulates the FFN gate/up input (`_norm`) and down input (`_ffn_gate`
+/// after SwiGLU) per channel. Uses the split FFN path so the post-SwiGLU
+/// activation is materialised in `_ffn_gate`. Slow (one CB per stage, with
+/// readback) — calibration only. Enabled by QW35_CAPTURE_ACT_OUT.
+- (BOOL)captureEvalToken:(uint32_t)token
+                     pos:(uint32_t)pos
+              logitsMode:(qw35_logits_mode)logitsMode
+                   error:(NSError **)error {
+    if (pos >= _ctxSize) {
+        if (error) *error = qw35_error(@"requested position exceeds allocated context");
+        return NO;
+    }
+    if (![self ensureKvCapacityForPositions:(uint64_t)pos + 1 error:error]) return NO;
+    if (token >= _vocabSize) {
+        if (error) *error = qw35_error(@"token id is outside the Qw35 vocabulary");
+        return NO;
+    }
+
+    const uint32_t layers = _h.transformer_layers;
+    const uint64_t emb = _h.embedding_length;
+    const uint64_t ffn = _h.feed_forward_length;
+    if (!_capGateUp) {
+        _capGateUp = (double *)calloc((size_t)layers * emb, sizeof(double));
+        _capDown = (double *)calloc((size_t)layers * ffn, sizeof(double));
+        if (!_capGateUp || !_capDown) {
+            if (error) *error = qw35_error(@"capture accumulator allocation failed");
+            return NO;
+        }
+    }
+    const uint32_t interval = _h.full_attention_interval ? _h.full_attention_interval : 4;
+
+    uint32_t deltaSlot = 0, attnSlot = 0;
+    for (uint32_t il = 0; il < layers; il++) {
+        Qw35LayerTensors *layer = _layers[il];
+        const BOOL isAttn = (((il + 1) % interval) == 0);
+        const uint32_t aSlot = attnSlot;
+        const uint32_t dSlot = deltaSlot;
+        const BOOL first = (il == 0);
+        const uint32_t ilc = il;
+
+        // Mixer (+ embedding/first-norm on layer 0) then residual + post-norm:
+        // leaves the FFN gate/up input in `_norm`.
+        if (![self captureRun:^BOOL(id<MTLComputeCommandEncoder> enc, NSError **e) {
+                if (first) {
+                    if (![self encodeEmbedding:enc token:token error:e]) return NO;
+                    if (![self encodeRms:enc src:_act_a weightTensor:_layers[0].attnNorm error:e]) return NO;
+                }
+                if (isAttn) {
+                    if (![self encodeAttentionDecodeLayer:enc layer:layer slot:aSlot pos:pos error:e]) return NO;
+                } else {
+                    if (![self encodeDeltaDecodeLayer:enc layer:layer slot:dSlot error:e]) return NO;
+                }
+                return [self encodeResidualRms:enc weightTensor:layer.postAttentionNorm error:e];
+            } error:error]) return NO;
+        qw35_accum_absmean(_capGateUp + (size_t)il * emb, (const float *)[_norm contents], emb);
+        if (isAttn) attnSlot++; else deltaSlot++;
+
+        // Split FFN gate/up + SwiGLU: leaves the down input in `_ffn_gate`.
+        if (![self captureRun:^BOOL(id<MTLComputeCommandEncoder> enc, NSError **e) {
+                if (![self encodeDecodeMatvecTensor:enc weight:layer.ffnGate input:_norm inputOffset:0 dst:_ffn_gate residual:NO error:e]) return NO;
+                if (![self encodeDecodeMatvecTensor:enc weight:layer.ffnUp input:_norm inputOffset:0 dst:_ffn_up residual:NO error:e]) return NO;
+                return [self encodeSwiGLU:enc n:ffn error:e];
+            } error:error]) return NO;
+        qw35_accum_absmean(_capDown + (size_t)il * ffn, (const float *)[_ffn_gate contents], ffn);
+
+        // Down projection (residual) + the next layer's input norm.
+        if (![self captureRun:^BOOL(id<MTLComputeCommandEncoder> enc, NSError **e) {
+                if (![self encodeDecodeMatvecTensor:enc weight:layer.ffnDown input:_ffn_gate inputOffset:0 dst:_act_a residual:YES error:e]) return NO;
+                if (ilc + 1 < layers) {
+                    return [self encodeRms:enc src:_act_a weightTensor:_layers[ilc + 1].attnNorm error:e];
+                } else if (logitsMode != QW35_LOGITS_NONE) {
+                    return [self encodeRms:enc src:_act_a weightTensor:_outputNorm error:e];
+                }
+                return YES;
+            } error:error]) return NO;
+    }
+
+    if (logitsMode != QW35_LOGITS_NONE) {
+        if (![self captureRun:^BOOL(id<MTLComputeCommandEncoder> enc, NSError **e) {
+                return [self encodeOutputHead:enc normRowOffset:0 logitsMode:logitsMode error:e];
+            } error:error]) return NO;
+    }
+
+    _capTokens++;
+    if ((_capTokens % 16) == 0) [self writeCaptureFile];
+    return YES;
+}
+
+// ---------------------------------------------------------------------------
+#pragma mark - Per-stage GPU profiler (QW35_STAGE_PROFILE)
+// ---------------------------------------------------------------------------
+
+/// Encode one stage class into its own command buffer, wait, and add the
+/// measured on-GPU time (GPUEndTime - GPUStartTime, seconds) to *accum. The
+/// commit/wait CPU latency is NOT attributed (we read GPU timestamps), so the
+/// per-stage buckets stay accurate even though the run is serialised.
+- (BOOL)profStage:(BOOL (^)(id<MTLComputeCommandEncoder> enc, NSError **error))block
+            accum:(double *)accum
+            error:(NSError **)error {
+    id<MTLCommandBuffer> cb = [_queue commandBufferWithUnretainedReferences];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    BOOL ok = block(enc, error);
+    [enc endEncoding];
+    if (!ok) return NO;
+    [cb commit];
+    [cb waitUntilCompleted];
+    double dt = cb.GPUEndTime - cb.GPUStartTime;
+    if (dt > 0) *accum += dt;
+    _lastCB = cb;
+    return YES;
+}
+
+/// Print the current 16-token window's per-stage GPU breakdown at the current
+/// context, then reset the accumulators so the next window shows the trend as
+/// ctx grows. With --attn-window set, `1-attn-layer us/tok` should plateau once
+/// ctx exceeds the window; if it keeps climbing with ctx, the window bound is
+/// not reaching the attention kernel.
+- (void)printStageProfile {
+    double total = _prof_attn + _prof_delta + _prof_ffn + _prof_head + _prof_norm;
+    if (total <= 0 || _prof_tokens == 0) { _prof_tokens = 0; return; }
+    const double t = (double)_prof_tokens;
+    const double us = 1.0e6;
+    const uint32_t na = _attentionLayerCount ? _attentionLayerCount : 1;
+    const uint32_t nd = _deltaLayerCount ? _deltaLayerCount : 1;
+    const uint32_t nl = _h.transformer_layers ? _h.transformer_layers : 1;
+    fprintf(stderr,
+        "[QW35_STAGE_PROFILE] ctx=%u tokens=%llu gpu=%.2fms/tok  "
+        "attn=%.1f%% delta=%.1f%% ffn=%.1f%% head=%.1f%% norm=%.1f%%\n",
+        _prof_pos, (unsigned long long)_prof_tokens, total / t * 1000.0,
+        _prof_attn / total * 100, _prof_delta / total * 100,
+        _prof_ffn / total * 100, _prof_head / total * 100, _prof_norm / total * 100);
+    fprintf(stderr,
+        "[QW35_STAGE_PROFILE]   us/tok: 1-attn-layer=%.1f (x%u=%.1f)  "
+        "1-delta-layer=%.1f (x%u=%.1f)  1-ffn=%.1f (x%u=%.1f)  head=%.1f\n",
+        _prof_attn / t / na * us, na, _prof_attn / t * us,
+        _prof_delta / t / nd * us, nd, _prof_delta / t * us,
+        _prof_ffn / t / nl * us, nl, _prof_ffn / t * us,
+        _prof_head / t * us);
+    _prof_attn = _prof_delta = _prof_ffn = _prof_head = _prof_norm = 0;
+    _prof_tokens = 0;
+}
+
+/// Profiling twin of -evalToken:. Mirrors -encodeDecodeLayers: exactly but
+/// commits one command buffer per stage class so each stage's true on-GPU time
+/// is attributed (see -profStage:accum:). Output is identical to the fast path
+/// (same encode helpers, same order), so generation continues normally; only
+/// wall-clock is slower. Enabled by QW35_STAGE_PROFILE.
+- (BOOL)evalTokenStageProfiled:(uint32_t)token
+                           pos:(uint32_t)pos
+                    logitsMode:(qw35_logits_mode)logitsMode
+                         error:(NSError **)error {
+    if (pos >= _ctxSize) {
+        if (error) *error = qw35_error(@"requested position exceeds allocated context");
+        return NO;
+    }
+    if (![self ensureKvCapacityForPositions:(uint64_t)pos + 1 error:error]) return NO;
+    if (token >= _vocabSize) {
+        if (error) *error = qw35_error(@"token id is outside the Qw35 vocabulary");
+        return NO;
+    }
+
+    const uint32_t layers = _h.transformer_layers;
+    const uint32_t interval = _h.full_attention_interval ? _h.full_attention_interval : 4;
+    uint32_t deltaSlot = 0, attnSlot = 0;
+
+    for (uint32_t il = 0; il < layers; il++) {
+        Qw35LayerTensors *layer = _layers[il];
+        const BOOL isAttn = (((il + 1) % interval) == 0);
+        const BOOL first = (il == 0);
+        const uint32_t aSlot = attnSlot, dSlot = deltaSlot;
+        const uint32_t ilc = il;
+
+        // Stage 1 — mixer (+ embedding/first input-norm on layer 0).
+        if (![self profStage:^BOOL(id<MTLComputeCommandEncoder> enc, NSError **e) {
+                if (first) {
+                    if (![self encodeEmbedding:enc token:token error:e]) return NO;
+                    if (![self encodeRms:enc src:_act_a weightTensor:_layers[0].attnNorm error:e]) return NO;
+                }
+                if (isAttn) return [self encodeAttentionDecodeLayer:enc layer:layer slot:aSlot pos:pos error:e];
+                return [self encodeDeltaDecodeLayer:enc layer:layer slot:dSlot error:e];
+            } accum:(isAttn ? &_prof_attn : &_prof_delta) error:error]) return NO;
+        if (isAttn) attnSlot++; else deltaSlot++;
+
+        // Stage 2 — residual add + post-attention norm.
+        if (![self profStage:^BOOL(id<MTLComputeCommandEncoder> enc, NSError **e) {
+                return [self encodeResidualRms:enc weightTensor:layer.postAttentionNormDecode error:e];
+            } accum:&_prof_norm error:error]) return NO;
+
+        // Stage 3 — FFN (fused GF4 when type-id 100, else split).
+        if (![self profStage:^BOOL(id<MTLComputeCommandEncoder> enc, NSError **e) {
+                if (layer.ffnGate.type_id == 100 && layer.ffnUp.type_id == 100) {
+                    return [self encodeGf4FusedFfn:enc layer:layer error:e];
+                }
+                if (![self encodeDecodeMatvecTensor:enc weight:layer.ffnGate input:_norm inputOffset:0 dst:_ffn_gate residual:NO error:e]) return NO;
+                if (![self encodeDecodeMatvecTensor:enc weight:layer.ffnUp input:_norm inputOffset:0 dst:_ffn_up residual:NO error:e]) return NO;
+                if (![self encodeSwiGLU:enc n:_h.feed_forward_length error:e]) return NO;
+                return [self encodeDecodeMatvecTensor:enc weight:layer.ffnDown input:_ffn_gate inputOffset:0 dst:_act_a residual:YES error:e];
+            } accum:&_prof_ffn error:error]) return NO;
+
+        // Stage 4 — chain the next layer's input norm (or the output norm).
+        if (![self profStage:^BOOL(id<MTLComputeCommandEncoder> enc, NSError **e) {
+                if (ilc + 1 < layers) return [self encodeRms:enc src:_act_a weightTensor:_layers[ilc + 1].attnNorm error:e];
+                if (logitsMode != QW35_LOGITS_NONE) return [self encodeRms:enc src:_act_a weightTensor:_outputNorm error:e];
+                return YES;
+            } accum:&_prof_norm error:error]) return NO;
+    }
+
+    if (logitsMode != QW35_LOGITS_NONE) {
+        if (![self profStage:^BOOL(id<MTLComputeCommandEncoder> enc, NSError **e) {
+                return [self encodeOutputHead:enc normRowOffset:0 logitsMode:logitsMode error:e];
+            } accum:&_prof_head error:error]) return NO;
+    }
+
+    _prof_pos = pos;
+    _prof_tokens++;
+    if ((_prof_tokens % 16) == 0) [self printStageProfile];
+    return YES;
+}
+
 /// Encode layers [begin, end). On entry for begin == 0 this also encodes the
 /// embedding lookup and the first attn_norm; for begin > 0 it assumes the
 /// previous range left the layer-input norm in `_norm` (norm chaining).
@@ -702,7 +955,7 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
         }
 
         // act_a += act_b, then norm with post_attention_norm.
-        if (![self encodeResidualRms:enc weightTensor:layer.postAttentionNorm error:error]) return NO;
+        if (![self encodeResidualRms:enc weightTensor:layer.postAttentionNormDecode error:error]) return NO;
 
         if (layer.ffnGate.type_id == 100 && layer.ffnUp.type_id == 100) {
             // GF4 FFN: fused gate+up+SwiGLU, then down with the residual add
@@ -724,196 +977,6 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
             if (![self encodeRms:enc src:_act_a weightTensor:_outputNorm error:error]) return NO;
         }
     }
-    return YES;
-}
-
-- (BOOL)encodeDeltaDecodeLayer:(id<MTLComputeCommandEncoder>)enc
-                         layer:(Qw35LayerTensors *)layer
-                          slot:(uint32_t)slot
-                         error:(NSError **)error {
-    const int conv_channels = (int)(_h.ssm_inner_size + 2u * _h.ssm_group_count * _h.ssm_state_size);
-    const uint64_t conv_slot_elems = (uint64_t)conv_channels * (_h.ssm_conv_kernel - 1);
-    const uint64_t state_slot_elems = (uint64_t)_h.ssm_time_step_rank * _h.ssm_state_size * _h.ssm_state_size;
-    const NSUInteger conv_off = (NSUInteger)(slot * conv_slot_elems * sizeof(float));
-    const NSUInteger state_off = (NSUInteger)(slot * state_slot_elems * sizeof(float));
-    const float scale = 1.0f / sqrtf((float)_h.ssm_state_size);
-
-    if (![self encodeDecodeMatvecTensor:enc weight:layer.attnQkv input:_norm inputOffset:0 dst:_qkv residual:NO error:error]) return NO;
-    if (![self encodeDecodeMatvecTensor:enc weight:layer.attnGate input:_norm inputOffset:0 dst:_z_gate residual:NO error:error]) return NO;
-    if (![self encodeDecodeMatvecTensor:enc weight:layer.ssmBeta input:_norm inputOffset:0 dst:_beta residual:NO error:error]) return NO;
-    if (![self encodeDecodeMatvecTensor:enc weight:layer.ssmAlpha input:_norm inputOffset:0 dst:_alpha residual:NO error:error]) return NO;
-
-    // Single fused kernel: conv1d step + SiLU, L2 norm of q/k, gated
-    // delta-rule state update, per-head group RMS norm and SiLU(z) gating.
-    // Reads the z gate from _z_gate and overwrites it with the gated output.
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_ssm_conv_recurrent_gate_norm_step128_f32" error:error];
-    if (!pipe) return NO;
-    int num_v_heads = (int)_h.ssm_time_step_rank;
-    int head_dim = (int)_h.ssm_state_size;
-    float eps = _h.rms_epsilon;
-    [enc setComputePipelineState:pipe];
-    [enc setBuffer:_qkv offset:0 atIndex:0];
-    [enc setBuffer:layer.ssmConv.buffer offset:layer.ssmConv.offset atIndex:1];
-    [enc setBuffer:_conv_state offset:conv_off atIndex:2];
-    [enc setBuffer:_beta offset:0 atIndex:3];
-    [enc setBuffer:_alpha offset:0 atIndex:4];
-    [enc setBuffer:layer.ssmDt.buffer offset:layer.ssmDt.offset atIndex:5];
-    [enc setBuffer:layer.ssmA.buffer offset:layer.ssmA.offset atIndex:6];
-    [enc setBuffer:_ssm_state offset:state_off atIndex:7];
-    [enc setBuffer:_z_gate offset:0 atIndex:8];
-    [enc setBuffer:layer.ssmNorm.buffer offset:layer.ssmNorm.offset atIndex:9];
-    [enc setBuffer:_z_gate offset:0 atIndex:10];
-    [enc setBytes:&conv_channels length:sizeof(conv_channels) atIndex:11];
-    [enc setBytes:&num_v_heads length:sizeof(num_v_heads) atIndex:12];
-    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:13];
-    [enc setBytes:&scale length:sizeof(scale) atIndex:14];
-    [enc setBytes:&eps length:sizeof(eps) atIndex:15];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)_h.ssm_group_count, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-
-    if (![self encodeDecodeMatvecTensor:enc weight:layer.ssmOut input:_z_gate inputOffset:0 dst:_act_b residual:NO error:error]) return NO;
-    return YES;
-}
-
-/// GF4 decode FFN: fused gate+up+SwiGLU into _ffn_gate, then down projection
-/// accumulating into _act_a.
-- (BOOL)encodeGf4FusedFfn:(id<MTLComputeCommandEncoder>)enc
-                    layer:(Qw35LayerTensors *)layer
-                    error:(NSError **)error {
-    const int64_t emb = (int64_t)_h.embedding_length;
-    const int64_t ffn = (int64_t)_h.feed_forward_length;
-
-    id<MTLComputePipelineState> gateUp = [_pipelineCache pipelineNamed:@"qw35_ffn_gate_up_swiglu_gf4_f32" error:error];
-    if (!gateUp) return NO;
-    int64_t n_groups = emb / 8;
-    [enc setComputePipelineState:gateUp];
-    [enc setBuffer:layer.ffnGate.buffer offset:layer.ffnGate.offset atIndex:0];
-    [enc setBuffer:layer.ffnUp.buffer offset:layer.ffnUp.offset atIndex:1];
-    [enc setBuffer:_norm offset:0 atIndex:2];
-    [enc setBuffer:_ffn_gate offset:0 atIndex:3];
-    [enc setBytes:&n_groups length:sizeof(n_groups) atIndex:4];
-    [enc setBytes:&emb length:sizeof(emb) atIndex:5];
-    [enc setBytes:&ffn length:sizeof(ffn) atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)qw35_div_up_u64((uint64_t)ffn, 8), 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
-
-    return [self encodeDecodeMatvecTensor:enc weight:layer.ffnDown input:_ffn_gate inputOffset:0 dst:_act_a residual:YES error:error];
-}
-
-- (BOOL)encodeAttentionDecodeLayer:(id<MTLComputeCommandEncoder>)enc
-                             layer:(Qw35LayerTensors *)layer
-                              slot:(uint32_t)slot
-                               pos:(uint32_t)pos
-                             error:(NSError **)error {
-    const NSUInteger kv_off = (NSUInteger)((uint64_t)slot * _kvCapacity * _kvRowBytes);
-    const float scale = 1.0f / sqrtf((float)_h.attention_key_length);
-
-    if (![self encodeDecodeMatvecTensor:enc weight:layer.attnQ input:_norm inputOffset:0 dst:_qkv residual:NO error:error]) return NO;
-    if (![self encodeDecodeMatvecTensor:enc weight:layer.attnK input:_norm inputOffset:0 dst:_ffn_gate residual:NO error:error]) return NO;
-    if (![self encodeDecodeMatvecTensor:enc weight:layer.attnV input:_norm inputOffset:0 dst:_ffn_up residual:NO error:error]) return NO;
-
-    Qw35Tensor *q_norm = layer.attnQNorm;
-    Qw35Tensor *k_norm = layer.attnKNorm;
-    id<MTLComputePipelineState> prep =
-        [self attnPipeline:_kvQ8 ? @"qw35_attn_decode_preprocess_q8_0_f32"
-                                 : @"qw35_attn_decode_preprocess_f32"
-                     error:error];
-    if (!prep) return NO;
-
-    int64_t n_head = _h.attention_heads;
-    int64_t n_kv_head = _h.attention_kv_heads;
-    int64_t head_dim = _h.attention_key_length;
-    int64_t pos64 = pos;
-    float eps = _h.rms_epsilon;
-    int64_t rope_dim = _h.rope_dimension_count;
-    [enc setComputePipelineState:prep];
-    [enc setBuffer:_qkv offset:0 atIndex:0];
-    [enc setBuffer:_ffn_gate offset:0 atIndex:1];
-    [enc setBuffer:_ffn_up offset:0 atIndex:2];
-    [enc setBuffer:q_norm.buffer offset:q_norm.offset atIndex:3];
-    [enc setBuffer:k_norm.buffer offset:k_norm.offset atIndex:4];
-    [enc setBuffer:_q_rep offset:0 atIndex:5];
-    [enc setBuffer:_z_gate offset:0 atIndex:6];
-    [enc setBuffer:_k_cache offset:kv_off atIndex:7];
-    [enc setBuffer:_v_cache offset:kv_off atIndex:8];
-    [enc setBytes:&n_head length:sizeof(n_head) atIndex:9];
-    [enc setBytes:&n_kv_head length:sizeof(n_kv_head) atIndex:10];
-    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:11];
-    [enc setBytes:&pos64 length:sizeof(pos64) atIndex:12];
-    [enc setBytes:&eps length:sizeof(eps) atIndex:13];
-    [enc setBuffer:_rope_freq offset:0 atIndex:14];
-    [enc setBytes:&rope_dim length:sizeof(rope_dim) atIndex:15];
-    qw35_dispatch_1d(enc, (NSUInteger)(_h.attention_heads * _h.attention_key_length), 256);
-
-    // Barrier-free flash decode: one simdgroup per head, sigmoid output gate
-    // applied in-kernel.
-    id<MTLComputePipelineState> attn =
-        [self attnPipeline:_kvQ8 ? @"qw35_attention_gqa_flash_decode_q8_0_f32"
-                                 : @"qw35_attention_gqa_flash_decode_f32"
-                     error:error];
-    if (!attn) return NO;
-    int64_t seq_len = (int64_t)pos + 1;
-    [enc setComputePipelineState:attn];
-    [enc setBuffer:_q_rep offset:0 atIndex:0];
-    [enc setBuffer:_k_cache offset:kv_off atIndex:1];
-    [enc setBuffer:_v_cache offset:kv_off atIndex:2];
-    [enc setBuffer:_core offset:0 atIndex:3];
-    [enc setBuffer:_z_gate offset:0 atIndex:4];
-    [enc setBytes:&n_head length:sizeof(n_head) atIndex:5];
-    [enc setBytes:&n_kv_head length:sizeof(n_kv_head) atIndex:6];
-    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:7];
-    [enc setBytes:&seq_len length:sizeof(seq_len) atIndex:8];
-    [enc setBytes:&scale length:sizeof(scale) atIndex:9];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)_h.attention_heads, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-
-    if (![self encodeDecodeMatvecTensor:enc weight:layer.attnOutput input:_core inputOffset:0 dst:_act_b residual:NO error:error]) return NO;
-    return YES;
-}
-
-- (BOOL)encodeOutputHead:(id<MTLComputeCommandEncoder>)enc
-           normRowOffset:(NSUInteger)normRowOffset
-              logitsMode:(qw35_logits_mode)logitsMode
-                   error:(NSError **)error {
-    if (logitsMode == QW35_LOGITS_FULL) {
-        return [self encodeDecodeMatvecTensor:enc weight:_outputWeight input:_norm inputOffset:normRowOffset dst:_logits residual:NO error:error];
-    }
-
-    // Greedy: fused matvec + per-threadgroup argmax over 16 vocab rows, then
-    // a single reduction over the partials. Prefers GF4 output weights.
-    const int64_t rows = (int64_t)_outputWeight.dims[1];
-    const int64_t k = (int64_t)_h.embedding_length;
-    const int64_t groups = (int64_t)qw35_div_up_u64((uint64_t)rows, 16);
-
-    NSString *partialsKernel = _outputWeightIsGf4
-        ? @"qw35_output_gf4_argmax_partials_16row_f32"
-        : @"qw35_output_q6_k_argmax_partials_16row_f32";
-    const int64_t n_blocks =
-        _outputWeightIsGf4 ? k / 8 : (int64_t)qw35_div_up_u64((uint64_t)k, 256);
-
-    id<MTLComputePipelineState> partials = [_pipelineCache pipelineNamed:partialsKernel error:error];
-    if (!partials) return NO;
-    [enc setComputePipelineState:partials];
-    [enc setBuffer:_outputWeight.buffer offset:_outputWeight.offset atIndex:0];
-    [enc setBuffer:_norm offset:normRowOffset atIndex:1];
-    [enc setBuffer:_argmax_partial_token offset:0 atIndex:2];
-    [enc setBuffer:_argmax_partial_logit offset:0 atIndex:3];
-    [enc setBytes:&n_blocks length:sizeof(n_blocks) atIndex:4];
-    [enc setBytes:&k length:sizeof(k) atIndex:5];
-    [enc setBytes:&rows length:sizeof(rows) atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)groups, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
-
-    id<MTLComputePipelineState> reduce = [_pipelineCache pipelineNamed:@"qw35_output_argmax_reduce_partials_f32" error:error];
-    if (!reduce) return NO;
-    [enc setComputePipelineState:reduce];
-    [enc setBuffer:_argmax_partial_token offset:0 atIndex:0];
-    [enc setBuffer:_argmax_partial_logit offset:0 atIndex:1];
-    [enc setBuffer:_argmax_token offset:0 atIndex:2];
-    [enc setBuffer:_argmax_logit offset:0 atIndex:3];
-    [enc setBytes:&groups length:sizeof(groups) atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     return YES;
 }
 
@@ -1000,520 +1063,6 @@ static void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger n, NSU
     if (!ok) return NO;
     [cb commit];
     _lastCB = cb;
-    return YES;
-}
-
-- (BOOL)encodeDeltaPrefillLayer:(id<MTLComputeCommandEncoder>)enc
-                           slot:(uint32_t)slot
-                         tokens:(uint32_t)tokensCount
-                         prefix:(NSString *)prefix
-                          error:(NSError **)error {
-    const int conv_channels = (int)(_h.ssm_inner_size + 2u * _h.ssm_group_count * _h.ssm_state_size);
-    const uint64_t conv_slot_elems = (uint64_t)conv_channels * (_h.ssm_conv_kernel - 1);
-    const uint64_t state_slot_elems = (uint64_t)_h.ssm_time_step_rank * _h.ssm_state_size * _h.ssm_state_size;
-    const NSUInteger conv_off = (NSUInteger)(slot * conv_slot_elems * sizeof(float));
-    const NSUInteger state_off = (NSUInteger)(slot * state_slot_elems * sizeof(float));
-    const float scale = 1.0f / sqrtf((float)_h.ssm_state_size);
-
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_qkv.weight"] input:_norm inputOffset:0 dst:_qkv dstOffset:0 tokens:tokensCount error:error]) return NO;
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_gate.weight"] input:_norm inputOffset:0 dst:_z_gate dstOffset:0 tokens:tokensCount error:error]) return NO;
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"ssm_beta.weight"] input:_norm inputOffset:0 dst:_beta dstOffset:0 tokens:tokensCount error:error]) return NO;
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"ssm_alpha.weight"] input:_norm inputOffset:0 dst:_alpha dstOffset:0 tokens:tokensCount error:error]) return NO;
-
-    Qw35Tensor *conv_w = [self tensorNamed:[prefix stringByAppendingString:@"ssm_conv1d.weight"] error:error];
-    if (!conv_w) return NO;
-    id<MTLComputePipelineState> conv_pipe = [_pipelineCache pipelineNamed:@"qw35_ssm_conv1d_step4_batch_f32" error:error];
-    if (!conv_pipe) return NO;
-    int n_tokens = (int)tokensCount;
-    [enc setComputePipelineState:conv_pipe];
-    [enc setBuffer:_qkv offset:0 atIndex:0];
-    [enc setBuffer:conv_w.buffer offset:conv_w.offset atIndex:1];
-    [enc setBuffer:_conv_state offset:conv_off atIndex:2];
-    [enc setBuffer:_qkv offset:0 atIndex:3];
-    [enc setBytes:&conv_channels length:sizeof(conv_channels) atIndex:4];
-    [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:5];
-    qw35_dispatch_1d(enc, (NSUInteger)conv_channels, 256);
-
-    id<MTLComputePipelineState> prep_pipe = [_pipelineCache pipelineNamed:@"qw35_ssm_l2_repeat_qk_batch_f32" error:error];
-    if (!prep_pipe) return NO;
-    int num_k_heads = (int)_h.ssm_group_count;
-    int num_v_heads = (int)_h.ssm_time_step_rank;
-    int head_dim = (int)_h.ssm_state_size;
-    int src_stride = conv_channels;
-    float eps = _h.rms_epsilon;
-    [enc setComputePipelineState:prep_pipe];
-    [enc setBuffer:_qkv offset:0 atIndex:0];
-    [enc setBuffer:_qkv offset:(NSUInteger)(_h.ssm_group_count * _h.ssm_state_size * sizeof(float)) atIndex:1];
-    [enc setBuffer:_q_rep offset:0 atIndex:2];
-    [enc setBuffer:_k_rep offset:0 atIndex:3];
-    [enc setBytes:&num_k_heads length:sizeof(num_k_heads) atIndex:4];
-    [enc setBytes:&num_v_heads length:sizeof(num_v_heads) atIndex:5];
-    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:6];
-    [enc setBytes:&eps length:sizeof(eps) atIndex:7];
-    [enc setBytes:&src_stride length:sizeof(src_stride) atIndex:8];
-    [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:9];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tokensCount,
-                                          (NSUInteger)_h.ssm_time_step_rank,
-                                          1)
-         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-
-    Qw35Tensor *dt = [self tensorNamed:[prefix stringByAppendingString:@"ssm_dt.bias"] error:error];
-    Qw35Tensor *a = [self tensorNamed:[prefix stringByAppendingString:@"ssm_a"] error:error];
-    if (!dt || !a) return NO;
-    id<MTLComputePipelineState> rec_pipe = [_pipelineCache pipelineNamed:@"qw35_ssm_recurrent_step128_batch_rows_f32" error:error];
-    if (!rec_pipe) return NO;
-    int v_stride = conv_channels;
-    [enc setComputePipelineState:rec_pipe];
-    [enc setBuffer:_q_rep offset:0 atIndex:0];
-    [enc setBuffer:_k_rep offset:0 atIndex:1];
-    [enc setBuffer:_qkv offset:(NSUInteger)(2u * _h.ssm_group_count * _h.ssm_state_size * sizeof(float)) atIndex:2];
-    [enc setBuffer:_beta offset:0 atIndex:3];
-    [enc setBuffer:_alpha offset:0 atIndex:4];
-    [enc setBuffer:dt.buffer offset:dt.offset atIndex:5];
-    [enc setBuffer:a.buffer offset:a.offset atIndex:6];
-    [enc setBuffer:_ssm_state offset:state_off atIndex:7];
-    [enc setBuffer:_core offset:0 atIndex:8];
-    [enc setBytes:&num_v_heads length:sizeof(num_v_heads) atIndex:9];
-    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:10];
-    [enc setBytes:&scale length:sizeof(scale) atIndex:11];
-    [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:12];
-    [enc setBytes:&v_stride length:sizeof(v_stride) atIndex:13];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)_h.ssm_state_size + 3u) / 4u,
-                                          (NSUInteger)_h.ssm_time_step_rank,
-                                          1)
-         threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
-
-    Qw35Tensor *ssm_norm = [self tensorNamed:[prefix stringByAppendingString:@"ssm_norm.weight"] error:error];
-    if (!ssm_norm) return NO;
-    id<MTLComputePipelineState> gate_norm_pipe = [_pipelineCache pipelineNamed:@"qw35_ssm_gate_norm_batch_f32" error:error];
-    if (!gate_norm_pipe) return NO;
-    [enc setComputePipelineState:gate_norm_pipe];
-    [enc setBuffer:_core offset:0 atIndex:0];
-    [enc setBuffer:_z_gate offset:0 atIndex:1];
-    [enc setBuffer:ssm_norm.buffer offset:ssm_norm.offset atIndex:2];
-    [enc setBuffer:_z_gate offset:0 atIndex:3];
-    [enc setBytes:&num_v_heads length:sizeof(num_v_heads) atIndex:4];
-    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:5];
-    [enc setBytes:&eps length:sizeof(eps) atIndex:6];
-    [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:7];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tokensCount, (NSUInteger)_h.ssm_time_step_rank, 1)
-         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"ssm_out.weight"] input:_z_gate inputOffset:0 dst:_act_b dstOffset:0 tokens:tokensCount error:error]) return NO;
-    return YES;
-}
-
-- (BOOL)encodeAttentionPrefillLayer:(id<MTLComputeCommandEncoder>)enc
-                               slot:(uint32_t)slot
-                               pos0:(uint32_t)pos0
-                             tokens:(uint32_t)tokensCount
-                             prefix:(NSString *)prefix
-                              error:(NSError **)error {
-    const NSUInteger kv_off = (NSUInteger)((uint64_t)slot * _kvCapacity * _kvRowBytes);
-    const float scale = 1.0f / sqrtf((float)_h.attention_key_length);
-
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_q.weight"] input:_norm inputOffset:0 dst:_qkv dstOffset:0 tokens:tokensCount error:error]) return NO;
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_k.weight"] input:_norm inputOffset:0 dst:_ffn_gate dstOffset:0 tokens:tokensCount error:error]) return NO;
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_v.weight"] input:_norm inputOffset:0 dst:_ffn_up dstOffset:0 tokens:tokensCount error:error]) return NO;
-
-    Qw35Tensor *q_norm = [self tensorNamed:[prefix stringByAppendingString:@"attn_q_norm.weight"] error:error];
-    Qw35Tensor *k_norm = [self tensorNamed:[prefix stringByAppendingString:@"attn_k_norm.weight"] error:error];
-    if (!q_norm || !k_norm) return NO;
-    id<MTLComputePipelineState> prep =
-        [self attnPipeline:_kvQ8 ? @"qw35_attn_prefill_preprocess_q8_0_f32"
-                                 : @"qw35_attn_prefill_preprocess_f32"
-                     error:error];
-    if (!prep) return NO;
-
-    int64_t n_head = _h.attention_heads;
-    int64_t n_kv_head = _h.attention_kv_heads;
-    int64_t head_dim = _h.attention_key_length;
-    int64_t pos064 = pos0;
-    int64_t n_tokens = tokensCount;
-    float eps = _h.rms_epsilon;
-    int64_t rope_dim = _h.rope_dimension_count;
-    const uint64_t work_dim = _h.attention_heads * _h.attention_key_length;
-    const uint64_t kv_work = _h.attention_kv_heads * _h.attention_key_length;
-    const uint64_t max_work = work_dim > kv_work ? work_dim : kv_work;
-    [enc setComputePipelineState:prep];
-    [enc setBuffer:_qkv offset:0 atIndex:0];
-    [enc setBuffer:_ffn_gate offset:0 atIndex:1];
-    [enc setBuffer:_ffn_up offset:0 atIndex:2];
-    [enc setBuffer:q_norm.buffer offset:q_norm.offset atIndex:3];
-    [enc setBuffer:k_norm.buffer offset:k_norm.offset atIndex:4];
-    [enc setBuffer:_q_rep offset:0 atIndex:5];
-    [enc setBuffer:_z_gate offset:0 atIndex:6];
-    [enc setBuffer:_k_cache offset:kv_off atIndex:7];
-    [enc setBuffer:_v_cache offset:kv_off atIndex:8];
-    [enc setBytes:&n_head length:sizeof(n_head) atIndex:9];
-    [enc setBytes:&n_kv_head length:sizeof(n_kv_head) atIndex:10];
-    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:11];
-    [enc setBytes:&pos064 length:sizeof(pos064) atIndex:12];
-    [enc setBytes:&eps length:sizeof(eps) atIndex:13];
-    [enc setBuffer:_rope_freq offset:0 atIndex:14];
-    [enc setBytes:&rope_dim length:sizeof(rope_dim) atIndex:15];
-    [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:20];
-    qw35_dispatch_1d(enc, (NSUInteger)((uint64_t)tokensCount * max_work), 256);
-
-    id<MTLComputePipelineState> attn =
-        [self attnPipeline:_kvQ8 ? @"qw35_attention_gqa_prefill_q8_0_f32"
-                                 : @"qw35_attention_gqa_prefill_f32"
-                     error:error];
-    if (!attn) return NO;
-    [enc setComputePipelineState:attn];
-    [enc setBuffer:_q_rep offset:0 atIndex:0];
-    [enc setBuffer:_k_cache offset:kv_off atIndex:1];
-    [enc setBuffer:_v_cache offset:kv_off atIndex:2];
-    [enc setBuffer:_core offset:0 atIndex:3];
-    [enc setBuffer:_z_gate offset:0 atIndex:4];
-    [enc setBytes:&n_head length:sizeof(n_head) atIndex:5];
-    [enc setBytes:&n_kv_head length:sizeof(n_kv_head) atIndex:6];
-    [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:7];
-    [enc setBytes:&pos064 length:sizeof(pos064) atIndex:8];
-    [enc setBytes:&scale length:sizeof(scale) atIndex:9];
-    [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:10];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tokensCount,
-                                          (NSUInteger)_h.attention_heads,
-                                          1)
-         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_output.weight"] input:_core inputOffset:0 dst:_act_b dstOffset:0 tokens:tokensCount error:error]) return NO;
-    return YES;
-}
-
-// ---------------------------------------------------------------------------
-#pragma mark - Per-operation encoders
-// ---------------------------------------------------------------------------
-
-- (BOOL)encodeEmbedding:(id<MTLComputeCommandEncoder>)enc
-                  token:(uint32_t)token
-                  error:(NSError **)error {
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_get_row_q4_k_f32" error:error];
-    if (!pipe) return NO;
-    int64_t k = (int64_t)_h.embedding_length;
-    [enc setComputePipelineState:pipe];
-    [enc setBuffer:_tokenEmbd.buffer offset:_tokenEmbd.offset atIndex:0];
-    [enc setBuffer:_act_a offset:0 atIndex:1];
-    [enc setBytes:&token length:sizeof(token) atIndex:2];
-    [enc setBytes:&k length:sizeof(k) atIndex:3];
-    qw35_dispatch_1d(enc, (NSUInteger)_h.embedding_length, 256);
-    return YES;
-}
-
-- (BOOL)encodeEmbeddingBatch:(id<MTLComputeCommandEncoder>)enc
-                       count:(uint32_t)count
-                       error:(NSError **)error {
-    Qw35Tensor *embd = [self tensorNamed:@"token_embd.weight" error:error];
-    if (!embd) return NO;
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_get_rows_q4_k_f32" error:error];
-    if (!pipe) return NO;
-    int64_t k = (int64_t)_h.embedding_length;
-    [enc setComputePipelineState:pipe];
-    [enc setBuffer:embd.buffer offset:embd.offset atIndex:0];
-    [enc setBuffer:_prefill_tokens offset:0 atIndex:1];
-    [enc setBuffer:_act_a offset:0 atIndex:2];
-    [enc setBytes:&k length:sizeof(k) atIndex:3];
-    qw35_dispatch_1d(enc, (NSUInteger)count * _h.embedding_length, 256);
-    return YES;
-}
-
-/// RMS norm of one act_a row into _norm.
-- (BOOL)encodeRms:(id<MTLComputeCommandEncoder>)enc
-              src:(id<MTLBuffer>)src
-     weightTensor:(Qw35Tensor *)w
-            error:(NSError **)error {
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_rms_norm_weight_f32" error:error];
-    if (!pipe) return NO;
-    float eps = _h.rms_epsilon;
-    int64_t n64 = (int64_t)_h.embedding_length;
-    [enc setComputePipelineState:pipe];
-    [enc setBuffer:src offset:0 atIndex:0];
-    [enc setBuffer:w.buffer offset:w.offset atIndex:1];
-    [enc setBuffer:_norm offset:0 atIndex:2];
-    [enc setBytes:&eps length:sizeof(eps) atIndex:3];
-    [enc setBytes:&n64 length:sizeof(n64) atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    return YES;
-}
-
-/// Fused act_a += act_b followed by RMS norm into _norm (single row).
-- (BOOL)encodeResidualRms:(id<MTLComputeCommandEncoder>)enc
-             weightTensor:(Qw35Tensor *)w
-                    error:(NSError **)error {
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_residual_rms_norm_weight_f32" error:error];
-    if (!pipe) return NO;
-    float eps = _h.rms_epsilon;
-    int64_t n64 = (int64_t)_h.embedding_length;
-    [enc setComputePipelineState:pipe];
-    [enc setBuffer:_act_a offset:0 atIndex:0];
-    [enc setBuffer:_act_b offset:0 atIndex:1];
-    [enc setBuffer:w.buffer offset:w.offset atIndex:2];
-    [enc setBuffer:_norm offset:0 atIndex:3];
-    [enc setBytes:&eps length:sizeof(eps) atIndex:4];
-    [enc setBytes:&n64 length:sizeof(n64) atIndex:5];
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    return YES;
-}
-
-- (BOOL)encodeRmsBatch:(id<MTLComputeCommandEncoder>)enc
-                weight:(NSString *)weightName
-                tokens:(uint32_t)tokensCount
-                 error:(NSError **)error {
-    Qw35Tensor *w = [self tensorNamed:weightName error:error];
-    if (!w) return NO;
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_rms_norm_weight_batch_f32" error:error];
-    if (!pipe) return NO;
-    float eps = _h.rms_epsilon;
-    int64_t n64 = (int64_t)_h.embedding_length;
-    [enc setComputePipelineState:pipe];
-    [enc setBuffer:_act_a offset:0 atIndex:0];
-    [enc setBuffer:w.buffer offset:w.offset atIndex:1];
-    [enc setBuffer:_norm offset:0 atIndex:2];
-    [enc setBytes:&eps length:sizeof(eps) atIndex:3];
-    [enc setBytes:&n64 length:sizeof(n64) atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tokensCount, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    return YES;
-}
-
-/// Fused act_a += act_b followed by RMS norm into _norm (all rows).
-- (BOOL)encodeResidualRmsBatch:(id<MTLComputeCommandEncoder>)enc
-                        weight:(NSString *)weightName
-                        tokens:(uint32_t)tokensCount
-                         error:(NSError **)error {
-    Qw35Tensor *w = [self tensorNamed:weightName error:error];
-    if (!w) return NO;
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_residual_rms_norm_weight_batch_f32" error:error];
-    if (!pipe) return NO;
-    float eps = _h.rms_epsilon;
-    int64_t n64 = (int64_t)_h.embedding_length;
-    [enc setComputePipelineState:pipe];
-    [enc setBuffer:_act_a offset:0 atIndex:0];
-    [enc setBuffer:_act_b offset:0 atIndex:1];
-    [enc setBuffer:w.buffer offset:w.offset atIndex:2];
-    [enc setBuffer:_norm offset:0 atIndex:3];
-    [enc setBytes:&eps length:sizeof(eps) atIndex:4];
-    [enc setBytes:&n64 length:sizeof(n64) atIndex:5];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tokensCount, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    return YES;
-}
-
-/// Single-token quantized matvec. With residual == YES the kernel adds into
-/// dst instead of overwriting it (Q4_K, Q6_K, and GF4 weights only).
-/// GF4 sidecar tensors carry type_id 100.
-- (BOOL)encodeDecodeMatvecTensor:(id<MTLComputeCommandEncoder>)enc
-                          weight:(Qw35Tensor *)w
-                           input:(id<MTLBuffer>)input
-                     inputOffset:(NSUInteger)inputOffset
-                             dst:(id<MTLBuffer>)dst
-                        residual:(BOOL)residual
-                           error:(NSError **)error {
-    const int64_t k = (int64_t)w.dims[0];
-    const int64_t rows = (int64_t)w.dims[1];
-
-    NSString *kernel = nil;
-    uint64_t block_elems = 256;
-    BOOL q8_geometry = NO;
-    switch (w.type_id) {
-        case 8:
-            kernel = @"qw35_decode_matmul_q8_0_f32";
-            block_elems = 32;
-            q8_geometry = YES;
-            break;
-        case 12:
-            kernel = residual ? @"qw35_decode_matmul_q4_k_2row_residual_f32"
-                              : @"qw35_decode_matmul_q4_k_2row_f32";
-            break;
-        case 13:
-            kernel = @"qw35_decode_matmul_q5_k_2row_f32";
-            break;
-        case 14:
-            kernel = residual ? @"qw35_decode_matmul_q6_k_llama_residual_f32"
-                              : @"qw35_decode_matmul_q6_k_llama_f32";
-            break;
-        case 100:
-            kernel = residual ? @"qw35_decode_matmul_gf4_2row_residual_f32"
-                              : @"qw35_decode_matmul_gf4_2row_f32";
-            block_elems = 8;
-            break;
-        default:
-            if (error) *error = qw35_error(@"unsupported tensor type %u for %@", w.type_id, w.name);
-            return NO;
-    }
-    if (residual && w.type_id != 12 && w.type_id != 14 && w.type_id != 100) {
-        if (error) *error = qw35_error(@"no residual matvec kernel for tensor type %u (%@)", w.type_id, w.name);
-        return NO;
-    }
-
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:kernel error:error];
-    if (!pipe) return NO;
-    int64_t n_blocks = (int64_t)qw35_div_up_u64((uint64_t)k, block_elems);
-    [enc setComputePipelineState:pipe];
-    [enc setBuffer:w.buffer offset:w.offset atIndex:0];
-    [enc setBuffer:input offset:inputOffset atIndex:1];
-    [enc setBuffer:dst offset:0 atIndex:2];
-    [enc setBytes:&n_blocks length:sizeof(n_blocks) atIndex:3];
-    [enc setBytes:&k length:sizeof(k) atIndex:4];
-    [enc setBytes:&rows length:sizeof(rows) atIndex:5];
-    if (q8_geometry) {
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)qw35_div_up_u64((uint64_t)rows, 8), 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
-    } else {
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)qw35_div_up_u64((uint64_t)rows, 4), 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
-    }
-    return YES;
-}
-
-/// Multi-token matvec for prefill: tiled simdgroup matmul for any chunk of
-/// two or more tokens; single tokens fall back to the decode matvec path.
-- (BOOL)encodeMatvecBatch:(id<MTLComputeCommandEncoder>)enc
-                   weight:(NSString *)weightName
-                    input:(id<MTLBuffer>)input
-              inputOffset:(NSUInteger)inputOffset
-                      dst:(id<MTLBuffer>)dst
-                dstOffset:(NSUInteger)dstOffset
-                   tokens:(uint32_t)tokensCount
-                    error:(NSError **)error {
-    Qw35Tensor *w = [self tensorNamed:weightName error:error];
-    if (!w) return NO;
-    if (w.n_dims < 2) {
-        if (error) *error = qw35_error(@"tensor %@ is not a matrix", weightName);
-        return NO;
-    }
-    int64_t k = (int64_t)w.dims[0];
-    int64_t rows = (int64_t)w.dims[1];
-
-    if (tokensCount == 1) {
-        Qw35Tensor *preferred = [self decodeWeightNamed:weightName error:error];
-        if (!preferred) return NO;
-        return [self encodeDecodeMatvecTensor:enc weight:preferred input:input inputOffset:inputOffset dst:dst residual:NO error:error];
-    }
-
-    NSString *tiledKernel = nil;
-    switch (w.type_id) {
-        case 8:  tiledKernel = @"qw35_mul_mm_q8_0_f32"; break;
-        case 12: tiledKernel = @"qw35_mul_mm_q4_k_f32"; break;
-        case 13: tiledKernel = @"qw35_mul_mm_q5_k_f32"; break;
-        case 14: tiledKernel = @"qw35_mul_mm_q6_k_f32"; break;
-        default:
-            if (error) *error = qw35_error(@"unsupported tensor type %u for %@", w.type_id, weightName);
-            return NO;
-    }
-    return [self encodeTiledKMatmul:enc
-                             tensor:w
-                         kernelName:tiledKernel
-                              input:input
-                        inputOffset:inputOffset
-                                dst:dst
-                          dstOffset:dstOffset
-                             tokens:tokensCount
-                               rows:rows
-                                  k:k
-                              error:error];
-}
-
-- (BOOL)encodeTiledKMatmul:(id<MTLComputeCommandEncoder>)enc
-                    tensor:(Qw35Tensor *)w
-                kernelName:(NSString *)kernelName
-                     input:(id<MTLBuffer>)input
-               inputOffset:(NSUInteger)inputOffset
-                       dst:(id<MTLBuffer>)dst
-                 dstOffset:(NSUInteger)dstOffset
-                    tokens:(uint32_t)tokensCount
-                      rows:(int64_t)rows
-                         k:(int64_t)k
-                     error:(NSError **)error {
-    if (rows <= 0 || k <= 0 || tokensCount == 0) return YES;
-    if (((uint64_t)k % 256u) != 0) {
-        if (error) *error = qw35_error(@"K-quant tiled matmul requires k to be a multiple of 256 for %@", w.name);
-        return NO;
-    }
-    const uint64_t row_bytes = rows > 0 ? w.bytes / (uint64_t)rows : 0;
-    if (row_bytes == 0) {
-        if (error) *error = qw35_error(@"invalid K-quant row bytes for %@", w.name);
-        return NO;
-    }
-
-    const BOOL bc_inp = ((uint64_t)k % 32u) != 0;
-    const BOOL bc_out = ((uint64_t)rows % 64u) != 0 || (tokensCount % 32u) != 0;
-    id<MTLComputePipelineState> pipe =
-        [_pipelineCache mulMmPipelineNamed:kernelName bcInp:bc_inp bcOut:bc_out error:error];
-    if (!pipe) return NO;
-
-    qw35_metal_args_mul_mm args = {
-        .ne00 = (int32_t)k,
-        .ne02 = 1,
-        .nb01 = row_bytes,
-        .nb02 = row_bytes * (uint64_t)rows,
-        .nb03 = row_bytes * (uint64_t)rows,
-        .ne12 = 1,
-        .nb10 = sizeof(float),
-        .nb11 = (uint64_t)k * sizeof(float),
-        .nb12 = (uint64_t)k * (uint64_t)tokensCount * sizeof(float),
-        .nb13 = (uint64_t)k * (uint64_t)tokensCount * sizeof(float),
-        .ne0 = (int32_t)rows,
-        .ne1 = (int32_t)tokensCount,
-        .r2 = 1,
-        .r3 = 1,
-    };
-
-    [enc setComputePipelineState:pipe];
-    [enc setBytes:&args length:sizeof(args) atIndex:0];
-    [enc setBuffer:w.buffer offset:w.offset atIndex:1];
-    [enc setBuffer:input offset:inputOffset atIndex:2];
-    [enc setBuffer:dst offset:dstOffset atIndex:3];
-    // sa: 64x32 half (4096 B) + sb: 32x32 float (4096 B); the bounded-output
-    // staging path reuses the same 8192 B as a 64x32 float tile.
-    [enc setThreadgroupMemoryLength:8192u atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)tokensCount + 31u) / 32u,
-                                          ((NSUInteger)rows + 63u) / 64u,
-                                          1)
-         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-    return YES;
-}
-
-/// SwiGLU over _ffn_gate/_ffn_up into _ffn_gate.
-- (BOOL)encodeSwiGLU:(id<MTLComputeCommandEncoder>)enc
-                   n:(uint64_t)n
-               error:(NSError **)error {
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_swiglu_f32" error:error];
-    if (!pipe) return NO;
-    int64_t n64 = (int64_t)n;
-    [enc setComputePipelineState:pipe];
-    [enc setBuffer:_ffn_gate offset:0 atIndex:0];
-    [enc setBuffer:_ffn_up offset:0 atIndex:1];
-    [enc setBuffer:_ffn_gate offset:0 atIndex:2];
-    [enc setBytes:&n64 length:sizeof(n64) atIndex:3];
-    qw35_dispatch_1d(enc, (NSUInteger)n, 256);
-    return YES;
-}
-
-// ---------------------------------------------------------------------------
-#pragma mark - Readback
-// ---------------------------------------------------------------------------
-
-- (BOOL)readArgmaxToken:(uint32_t *)token logit:(float *)logit error:(NSError **)error {
-    if (!token || !logit) {
-        if (error) *error = qw35_error(@"invalid argmax output pointers");
-        return NO;
-    }
-    if (![self waitForLastCommand:error]) return NO;
-    *token = *((uint32_t *)[_argmax_token contents]);
-    *logit = *((float *)[_argmax_logit contents]);
-    return YES;
-}
-
-- (BOOL)copyLogits:(float *)dst len:(uintptr_t)len error:(NSError **)error {
-    if (!dst || len < _vocabSize) {
-        if (error) *error = qw35_error(@"invalid logits readback buffer");
-        return NO;
-    }
-    if (![self waitForLastCommand:error]) return NO;
-    memcpy(dst, [_logits contents], (size_t)_vocabSize * sizeof(float));
     return YES;
 }
 

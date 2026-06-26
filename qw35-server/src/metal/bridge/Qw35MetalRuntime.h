@@ -22,17 +22,12 @@
 /// compiled metallib bytes.  Allocates all scratch buffers and precomputes
 /// RoPE frequency tables.
 ///
-/// gf4Map may be NULL; when present it is the mmap of the cooked GF4 FFN
-/// sidecar and gf4Tensors describes its tensors (type_id 100). GF4 weights
-/// replace the GGUF FFN weights on the single-token decode path.
+/// The unified .gguf carries its GF4 FFN as type-id 100 tensors in the tensor
+/// list; the type_id selects GF4 vs Q4_K kernels per weight.
 - (instancetype)initWithModelMap:(const void *)modelMap
                        modelSize:(uint64_t)modelSize
                           tensors:(const qw35_metal_tensor_desc *)tensorDescs
                       tensorCount:(uintptr_t)tensorCount
-                          gf4Map:(const void *)gf4Map
-                         gf4Size:(uint64_t)gf4Size
-                      gf4Tensors:(const qw35_metal_tensor_desc *)gf4Tensors
-                  gf4TensorCount:(uintptr_t)gf4TensorCount
                           hparams:(const qw35_metal_hparams *)hparams
                           ctxSize:(uint32_t)ctxSize
                         vocabSize:(uint32_t)vocabSize
@@ -76,6 +71,10 @@
 
 /// Wait for all in-flight GPU work to complete.
 - (BOOL)sync:(NSError **)error;
+
+/// Set the decode-time sliding-window attention sink (first N positions always
+/// attended). Set per request to keep the system prompt + first user turn pinned.
+- (void)setAttnSink:(int)sink;
 
 /// Wait for in-flight work, then read back the argmax token and its logit.
 - (BOOL)readArgmaxToken:(uint32_t *)token logit:(float *)logit error:(NSError **)error;

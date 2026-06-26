@@ -34,6 +34,11 @@
 /// Look up a tensor by name.  Returns nil if not found.
 - (Qw35Tensor *)tensorNamed:(NSString *)name;
 
+/// All distinct backing MTLBuffers (one per tensor view), for adding to a
+/// residency set so the mmap-backed weight pages are not paged out under
+/// unified-memory pressure during a long decode session.
+- (NSArray<id<MTLBuffer>> *)allBuffers;
+
 /// Validate that the essential tensors (embedding, output norm, output head)
 /// exist and have the expected types and dimensions.
 - (BOOL)validateRequiredForEmbeddingLength:(uint32_t)embeddingLength

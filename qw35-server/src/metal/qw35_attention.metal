@@ -192,6 +192,8 @@ kernel void qw35_attention_gqa_flash_decode_f32(
     constant int64_t &head_dim [[buffer(7)]],
     constant int64_t &seq_len [[buffer(8)]],
     constant float &sm_scale [[buffer(9)]],
+    constant int &attn_window [[buffer(10)]],
+    constant int &attn_sink [[buffer(11)]],
     uint h_u [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
@@ -212,7 +214,20 @@ kernel void qw35_attention_gqa_flash_decode_f32(
     float l = 0.0f;
     float acc[8] = {0.0f};
 
-    for (int t = 0; t < int(seq_len); ++t) {
+    // Sliding-window + attention sink: attend to the first `sink` positions and
+    // the last `attn_window` positions only, bounding the loop to sink+window
+    // instead of O(seq_len). attn_window <= 0 (or covering the whole context)
+    // means full attention.
+    const int sl = int(seq_len);
+    int sink = max(0, min(attn_sink, sl));
+    int recent_start, total;
+    if (attn_window <= 0 || sink + attn_window >= sl) {
+        sink = 0; recent_start = 0; total = sl;
+    } else {
+        recent_start = sl - attn_window; total = sink + attn_window;
+    }
+    for (int idx = 0; idx < total; ++idx) {
+        const int t = (idx < sink) ? idx : (recent_start + (idx - sink));
         const int k_off = t * kv_dim + kv_h * hd + d0;
 
         float dot = 0.0f;
@@ -452,6 +467,8 @@ kernel void qw35_attention_gqa_flash_decode_##TAG##_f32( \
     constant int64_t &head_dim [[buffer(7)]], \
     constant int64_t &seq_len [[buffer(8)]], \
     constant float &sm_scale [[buffer(9)]], \
+    constant int &attn_window [[buffer(10)]], \
+    constant int &attn_sink [[buffer(11)]], \
     uint h_u [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]] \
 ) { \
@@ -472,7 +489,13 @@ kernel void qw35_attention_gqa_flash_decode_##TAG##_f32( \
     float m = -INFINITY; \
     float l = 0.0f; \
     float acc[8] = {0.0f}; \
-    for (int t = 0; t < int(seq_len); ++t) { \
+    const int sl = int(seq_len); \
+    int sink = max(0, min(attn_sink, sl)); \
+    int recent_start, total; \
+    if (attn_window <= 0 || sink + attn_window >= sl) { sink = 0; recent_start = 0; total = sl; } \
+    else { recent_start = sl - attn_window; total = sink + attn_window; } \
+    for (int idx = 0; idx < total; ++idx) { \
+        const int t = (idx < sink) ? idx : (recent_start + (idx - sink)); \
         device const BT * kb = &k_cache[t * blocks_per_row + blk_i]; \
         const float kd = float(kb->d); \
         float dot = 0.0f; \

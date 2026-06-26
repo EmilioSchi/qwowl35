@@ -2,8 +2,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::time::Duration;
 
-use crate::gf4_sidecar::MappedGf4Sidecar;
-use crate::gguf::{MappedGguf, WarmReport};
+use crate::loader::{MappedGguf, WarmReport};
 use crate::graph::QwenHparams;
 
 pub const WARMUP_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qw35.metallib"));
@@ -96,10 +95,6 @@ extern "C" {
         model_size: u64,
         tensors: *const MetalTensorDesc,
         tensor_count: usize,
-        gf4_map: *const c_void,
-        gf4_size: u64,
-        gf4_tensors: *const MetalTensorDesc,
-        gf4_tensor_count: usize,
         hparams: *const MetalHparams,
         ctx_size: u32,
         vocab_size: u32,
@@ -123,6 +118,7 @@ extern "C" {
         err_len: usize,
     ) -> i32;
     fn qw35_metal_runtime_sync(runtime: *mut c_void, err: *mut i8, err_len: usize) -> i32;
+    fn qw35_metal_runtime_set_attn_sink(runtime: *mut c_void, sink: i32);
     fn qw35_metal_runtime_eval_token(
         runtime: *mut c_void,
         token: u32,
@@ -250,15 +246,19 @@ unsafe impl Send for MetalRuntime {}
 impl MetalRuntime {
     pub fn new(
         gguf: &MappedGguf,
-        gf4: Option<&MappedGf4Sidecar>,
         hparams: &QwenHparams,
         ctx_size: u32,
         vocab_size: u32,
         prefill_chunk: u32,
         kv_cache_type: KvCacheType,
+        attn_window: i32,
+        attn_sink: i32,
     ) -> Result<Self, String> {
         #[cfg(target_os = "macos")]
         {
+            // The unified .gguf carries its GF4 FFN as type-id 100 tensors in
+            // the normal tensor table, so a single descriptor list covers every
+            // weight (the type-id selects GF4 vs Q4_K kernels per tensor).
             let tensors: Vec<MetalTensorDesc> = gguf
                 .tensors
                 .iter()
@@ -279,27 +279,9 @@ impl MetalRuntime {
                     }
                 })
                 .collect();
-            // GF4 sidecar tensors are surfaced with type_id 100; dims follow
-            // the GGUF convention (dims[0] = row length).
-            let gf4_tensors: Vec<MetalTensorDesc> = gf4
-                .map(|sidecar| {
-                    sidecar
-                        .tensors
-                        .iter()
-                        .map(|tensor| MetalTensorDesc {
-                            name: tensor.name.as_ptr(),
-                            name_len: tensor.name.len(),
-                            dims: [u64::from(tensor.cols), u64::from(tensor.rows), 1, 1],
-                            n_dims: 2,
-                            type_id: 100,
-                            abs_offset: tensor.data_offset,
-                            bytes: tensor.data_nbytes,
-                            elements: u64::from(tensor.rows) * u64::from(tensor.cols),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let hparams = MetalHparams::from(hparams);
+            let mut hparams = MetalHparams::from(hparams);
+            hparams.attn_window = attn_window;
+            hparams.attn_sink = attn_sink;
             let mut err = vec![0i8; 4096];
             let raw = unsafe {
                 qw35_metal_runtime_create(
@@ -307,15 +289,6 @@ impl MetalRuntime {
                     gguf.len(),
                     tensors.as_ptr(),
                     tensors.len(),
-                    gf4.map(|sidecar| sidecar.as_ptr().cast::<c_void>())
-                        .unwrap_or(std::ptr::null()),
-                    gf4.map(|sidecar| sidecar.len()).unwrap_or(0),
-                    if gf4_tensors.is_empty() {
-                        std::ptr::null()
-                    } else {
-                        gf4_tensors.as_ptr()
-                    },
-                    gf4_tensors.len(),
                     &hparams,
                     ctx_size,
                     vocab_size,
@@ -336,7 +309,7 @@ impl MetalRuntime {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (gguf, gf4, hparams, ctx_size, prefill_chunk, kv_cache_type);
+            let _ = (gguf, hparams, ctx_size, prefill_chunk, kv_cache_type);
             Ok(Self {
                 vocab_size: vocab_size as usize,
             })
@@ -407,6 +380,20 @@ impl MetalRuntime {
         #[cfg(not(target_os = "macos"))]
         {
             Err("Qw35 native runtime reset requires macOS Metal".to_string())
+        }
+    }
+
+    /// Set the decode-time sliding-window attention sink (first N positions
+    /// always attended). Set per request to pin the system prompt + first user
+    /// turn so the window never evicts the tool-call format or the task.
+    pub fn set_attn_sink(&mut self, sink: i32) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            qw35_metal_runtime_set_attn_sink(self.raw.as_ptr(), sink);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = sink;
         }
     }
 
@@ -574,6 +561,7 @@ const REQUIRED_NATIVE_KERNELS: &[&str] = &[
     "qw35_mul_mm_q4_k_f32",
     "qw35_mul_mm_q5_k_f32",
     "qw35_mul_mm_q6_k_f32",
+    "qw35_mul_mm_gf4_f32",
     "qw35_attn_decode_preprocess_f32",
     "qw35_attn_prefill_preprocess_f32",
     "qw35_attention_gqa_flash_decode_f32",
@@ -628,6 +616,8 @@ struct MetalHparams {
     ssm_time_step_rank: u32,
     ssm_inner_size: u32,
     full_attention_interval: u32,
+    attn_window: i32,
+    attn_sink: i32,
 }
 
 #[cfg(target_os = "macos")]
@@ -655,6 +645,9 @@ impl From<&QwenHparams> for MetalHparams {
             ssm_time_step_rank: value.ssm_time_step_rank,
             ssm_inner_size: value.ssm_inner_size,
             full_attention_interval: value.full_attention_interval,
+            // Filled in by MetalRuntime::new from EngineConfig (not a model hparam).
+            attn_window: 0,
+            attn_sink: 0,
         }
     }
 }

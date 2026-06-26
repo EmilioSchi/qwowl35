@@ -1,4 +1,4 @@
-use qw35_server::gguf::MappedGguf;
+use qw35_server::loader::MappedGguf;
 use qw35_server::graph::plan_qwen35;
 use qw35_server::model::{
     validate_prefill_chunk, Engine, EngineConfig, GenerateRequest, GenerationTimings, TokenLimit,
@@ -1026,7 +1026,9 @@ fn open_engine(config: &DirectConfig) -> Result<(Engine, f64), String> {
         test_responder: config.test_responder,
         prefill_chunk: config.prefill_chunk,
         kv_cache_type: config.kv_cache_type,
-        gf4: true,
+        // Benchmarks run full attention; the sliding window is a serving knob.
+        attn_window: 0,
+        attn_sink: 0,
         // Benchmarks measure full prefill cost; cross-run prefix reuse would
         // skew repeated identical prompts.
         session_cache: false,
@@ -1319,7 +1321,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut config = DirectConfig {
-        model_path: PathBuf::from(".gguf/Qwen3.5-9B-Q4_K_M.gguf"),
+        model_path: PathBuf::from(".gguf/Qwowl3.5-9B.gguf"),
         ctx_size: 4096,
         runs: 3,
         warmup_runs: 1,
@@ -1367,7 +1369,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut config = HostConfig {
-        model_path: PathBuf::from(".gguf/Qwen3.5-9B-Q4_K_M.gguf"),
+        model_path: PathBuf::from(".gguf/Qwowl3.5-9B.gguf"),
         ctx_size: 4096,
         runs: 3,
         prompt: PromptConfig {
@@ -1571,7 +1573,7 @@ HTTP options:\n\
   --timeout-ms N             Socket timeout. Default: 900000\n\
 \n\
 Direct options:\n\
-  -m, --model FILE           Default: .gguf/Qwen3.5-9B-Q4_K_M.gguf\n\
+  -m, --model FILE           Default: .gguf/Qwowl3.5-9B.gguf\n\
   -c, --ctx N                Default: 4096\n\
   --runs N                   Timed generation runs. Default: 3\n\
   --warmup-runs N            Untimed generation runs after load. Default: 1\n\
@@ -1582,7 +1584,7 @@ Direct options:\n\
   --test-responder           Benchmark metadata/tokenizer/test path without native inference.\n\
 \n\
 Host options:\n\
-  -m, --model FILE           Default: .gguf/Qwen3.5-9B-Q4_K_M.gguf\n\
+  -m, --model FILE           Default: .gguf/Qwowl3.5-9B.gguf\n\
   -c, --ctx N                Context used for reset-byte estimates. Default: 4096\n\
   --runs N                   Timed host runs. Default: 3\n\
   -n, --tokens N             Token count for decode-prefix benchmark. Default: 1812\n\

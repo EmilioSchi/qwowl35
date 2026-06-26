@@ -1,4 +1,4 @@
-use crate::gguf::MappedGguf;
+use crate::loader::MappedGguf;
 use std::collections::{HashMap, HashSet};
 
 const TOKEN_TYPE_NORMAL: i32 = 1;
@@ -615,7 +615,7 @@ fn insert_byte_mapping(
 #[cfg(test)]
 mod tests {
     use super::{qwen35_pretokenize, DecodeState, QwenTokenizer, QwenTokenizerSpec};
-    use crate::gguf::MappedGguf;
+    use crate::loader::MappedGguf;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};

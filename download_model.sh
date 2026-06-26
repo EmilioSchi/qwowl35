@@ -3,13 +3,19 @@ set -e
 
 # qw35 model downloader.
 #
-# Fetches the base GGUF from Hugging Face into ./.gguf/ (the cwd-relative path
-# the server loads by default) and can cook the optional GF4 decode sidecar with
-# the project tool. The GF4 sidecar is NOT downloadable: it is generated locally
-# from the GGUF.
+# Fetches the base GGUF from Hugging Face into ./.gguf/ and cooks the canonical
+# unified model the server loads by default — Qwowl3.5-9B.gguf: the base
+# GGUF with its FFN baked as GF4 (type-id 100) and an AWQ fold in the norms.
+# The unified model is NOT downloadable: it is cooked locally from the base GGUF.
+# The base GGUF is kept as the cook input and the quality-comparison reference.
 
 REPO="unsloth/Qwen3.5-9B-GGUF"
 MODEL_FILE="Qwen3.5-9B-Q4_K_M.gguf"
+# Canonical unified model (cooked with the AWQ-GF4 approach, the winner of the
+# awq-gf4 vs gf4 quality comparison) and
+# the AWQ activation stats it folds in (captured from the base model).
+CANON_FILE="Qwowl3.5-9B.gguf"
+ACT_STATS_FILE="act-stats.bin"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${QW35_GGUF_DIR:-"$ROOT/.gguf"}
@@ -18,34 +24,36 @@ case "$OUT_DIR" in
     *) OUT_DIR="$ROOT/$OUT_DIR" ;;
 esac
 TOKEN=${HF_TOKEN:-}
-COOK="$ROOT/qw35-tool/qw35_tool/cook_qw35_ffn_gf4_sidecar.py"
+COOK="$ROOT/qw35-tool/qw35_tool/cook_qw35_awq_gf4.py"
 
 usage() {
     cat <<EOF
 qw35 model downloader
 
 Usage:
-  ./download_model.sh [model|gf4|all] [--token TOKEN]
+  ./download_model.sh [model|cook|all] [--token TOKEN]
 
 Targets:
 
   model   (default) Download the base GGUF
-          $MODEL_FILE (~5.3 GB) into the model directory. This is all the
-          server needs to run.
+          $MODEL_FILE (~5.3 GB) into the model directory. This is the cook
+          input and the quality-comparison reference.
 
-  gf4     Cook the GF4 decode sidecar from the downloaded GGUF using
-          qw35-tool. Optional: the server runs without it (just slower decode,
-          ~13.7 vs ~19.8 tok/s) and picks it up automatically when present.
+  cook    Cook the canonical unified model $CANON_FILE from the
+          downloaded base GGUF using qw35-tool (FFN baked as GF4 + AWQ norm
+          fold). This is the file the server loads by default. Needs the AWQ
+          activation stats $ACT_STATS_FILE; if absent, capture them first with:
+            cargo test -p qw35-server --lib real_model_capture_activations -- --ignored
           CPU-heavy; takes several minutes. Requires python3 + numpy + gguf.
 
-  all     Run model, then gf4.
+  all     Run model, then cook.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache (~/.cache/huggingface/token) is used if present.
 
 Environment:
-  QW35_GGUF_DIR  Directory used for the GGUF and sidecar.
+  QW35_GGUF_DIR  Directory used for the base GGUF and cooked unified model.
                  Default: ./.gguf
 
 After downloading, the default server command just works:
@@ -55,7 +63,7 @@ EOF
 
 TARGET=model
 case "${1:-}" in
-    model|gf4|all) TARGET=$1; shift ;;
+    model|cook|gf4|all) TARGET=$1; shift ;;
     -h|--help|help) usage; exit 0 ;;
     "" ) ;;
     --token) ;;  # no target given, options follow
@@ -106,49 +114,57 @@ download_model() {
     echo "Saved $out"
 }
 
-cook_gf4() {
+cook_unified() {
     model="$OUT_DIR/$MODEL_FILE"
-    sidecar="$OUT_DIR/${MODEL_FILE%.gguf}.gf4.bin"
+    canon="$OUT_DIR/$CANON_FILE"
+    act_stats="$OUT_DIR/$ACT_STATS_FILE"
 
     if [ ! -s "$model" ]; then
-        echo "GGUF not found: $model" >&2
+        echo "Base GGUF not found: $model" >&2
         echo "Run './download_model.sh model' first." >&2
         exit 1
     fi
 
-    if [ -s "$sidecar" ]; then
-        echo "Already cooked: $sidecar"
+    if [ -s "$canon" ]; then
+        echo "Already cooked: $canon"
         return
     fi
 
+    if [ ! -s "$act_stats" ]; then
+        echo "AWQ activation stats not found: $act_stats" >&2
+        echo "Capture them from the base model first:" >&2
+        echo "  cargo test -p qw35-server --lib real_model_capture_activations -- --ignored" >&2
+        exit 1
+    fi
+
     if ! command -v python3 >/dev/null 2>&1; then
-        echo "Cooking the GF4 sidecar requires python3." >&2
+        echo "Cooking the unified model requires python3." >&2
         exit 1
     fi
     if ! python3 -c "import numpy, gguf" >/dev/null 2>&1; then
-        echo "Cooking the GF4 sidecar requires the numpy and gguf packages." >&2
+        echo "Cooking the unified model requires the numpy and gguf packages." >&2
         echo "Install them with:" >&2
         echo "  python3 -m pip install -U numpy gguf" >&2
         exit 1
     fi
 
-    echo "Cooking GF4 sidecar from $MODEL_FILE (CPU-heavy, takes several minutes)..."
-    python3 "$COOK" "$model" --only full
-    echo "Cooked $sidecar"
+    echo "Cooking unified $CANON_FILE from $MODEL_FILE (CPU-heavy, takes several minutes)..."
+    python3 "$COOK" "$model" "$canon" --awq "$act_stats"
+    echo "Cooked $canon"
 }
 
 case "$TARGET" in
     model)
         download_model
         echo
-        echo "Tip: './download_model.sh gf4' cooks the optional GF4 speed sidecar."
+        echo "Tip: './download_model.sh cook' cooks the canonical unified $CANON_FILE."
         ;;
-    gf4)
-        cook_gf4
+    cook|gf4)
+        cook_unified
         ;;
     all)
         download_model
-        cook_gf4
+        cook_unified
         ;;
 esac
 

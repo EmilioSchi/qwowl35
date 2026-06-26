@@ -1,4 +1,4 @@
-use crate::gguf::{tensor_type_name, MappedGguf};
+use crate::loader::{tensor_type_name, MappedGguf};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
@@ -205,24 +205,29 @@ fn require_tensor(gguf: &MappedGguf, name: &str, missing: &mut Vec<String>) {
 }
 
 fn qwen_metal_type_supported(name: &str) -> bool {
-    matches!(name, "f32" | "q4_k" | "q5_k" | "q6_k" | "q8_0")
+    // "gf4" is the unified .gguf FFN codec: both the single-token decode matvec
+    // and the tiled multi-token prefill matmul have GF4 kernels. ("gf2" has no
+    // tiled prefill kernel, so it is intentionally not prefill-capable here.)
+    matches!(name, "f32" | "q4_k" | "q5_k" | "q6_k" | "q8_0" | "gf4")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{plan_qwen35, qwen_metal_type_supported};
-    use crate::gguf::MappedGguf;
+    use crate::loader::MappedGguf;
     use std::collections::BTreeMap;
     use std::path::Path;
 
     #[test]
     fn supports_real_qwen35_gguf_quant_formats() {
-        for name in ["f32", "q4_k", "q5_k", "q6_k", "q8_0"] {
+        for name in ["f32", "q4_k", "q5_k", "q6_k", "q8_0", "gf4"] {
             assert!(qwen_metal_type_supported(name), "{name}");
         }
 
         assert!(!qwen_metal_type_supported("q3_k"));
         assert!(!qwen_metal_type_supported("iq1_s"));
+        // gf2 has a decode matvec but no tiled prefill kernel yet.
+        assert!(!qwen_metal_type_supported("gf2"));
     }
 
     #[test]

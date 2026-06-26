@@ -1,4 +1,4 @@
-use crate::gguf::{MappedGguf, WarmReport};
+use crate::loader::{MappedGguf, WarmReport};
 use crate::graph::{plan_qwen35, GraphPlan};
 use crate::metal;
 use crate::tokenizer::{DecodeState, QwenTokenizer};
@@ -11,7 +11,9 @@ mod sampling;
 mod stop_sequence;
 mod text_filter;
 mod think_budget;
-use prompt::{render_qwen35_chat_prompt, render_qwen35_chat_prompt_with_boundary};
+use prompt::{
+    render_qwen35_chat_prompt, render_qwen35_chat_prompt_with_boundaries,
+};
 use sampling::sample_from_logits;
 use stop_sequence::{earliest_stop_match, StopSequenceWatcher};
 use text_filter::GeneratedTextFilter;
@@ -29,7 +31,10 @@ pub struct EngineConfig {
     pub prefill_chunk: u32,
     pub kv_cache_type: metal::KvCacheType,
     pub session_cache: bool,
-    pub gf4: bool,
+    /// Decode-time sliding-window attention (0 = full attention) and leading
+    /// sink tokens, from --attn-window/--attn-sink. Passed to the Metal runtime.
+    pub attn_window: i32,
+    pub attn_sink: i32,
     pub warm_weights: bool,
     pub test_responder: bool,
     pub verbose: bool,
@@ -177,16 +182,17 @@ pub enum GenerateError {
 
 pub struct Engine {
     metal_runtime: Option<Mutex<RuntimeSession>>,
+    // The GPU reads the GF4 FFN weights directly from this mapping; it must
+    // outlive metal_runtime (fields drop in declaration order).
     gguf: MappedGguf,
-    // The GPU reads GF4 weights directly from this mapping; it must outlive
-    // metal_runtime (fields drop in declaration order).
-    gf4_sidecar: Option<crate::gf4_sidecar::MappedGf4Sidecar>,
     model_path: PathBuf,
     model_id: String,
     ctx_size: u32,
     prefill_chunk: u32,
     kv_cache_type: metal::KvCacheType,
     session_cache: bool,
+    attn_window: i32,
+    attn_sink: i32,
     test_responder: bool,
     verbose: bool,
     created: u64,
@@ -271,36 +277,21 @@ impl Engine {
             "tokenizer vocabulary is too large for the native Metal runtime".to_string()
         })?;
 
-        // A cooked GF4 sidecar next to the GGUF is picked up automatically;
-        // every tensor it contains replaces the GGUF weight on the decode
-        // path. Prefers the comprehensive .gf4.bin, falls back to the
-        // FFN-only .ffn-gf4.bin.
-        let gf4_sidecar = if config.test_responder || !config.gf4 {
-            None
-        } else {
-            let candidates = gf4_sidecar_candidates(&config.model_path);
-            match candidates.iter().find(|path| path.exists()) {
-                Some(sidecar_path) => {
-                    let sidecar = crate::gf4_sidecar::MappedGf4Sidecar::open(sidecar_path)?;
-                    sidecar.validate_qw35(graph_plan.hparams.block_count)?;
-                    Some(sidecar)
-                }
-                None => None,
-            }
-        };
-
+        // The GF4 FFN lives in the unified .gguf (GGUF type-id 100 tensors), read
+        // through the normal tensor table — no separate sidecar, no discovery.
         let metal_runtime = if config.test_responder {
             None
         } else {
             Some(Mutex::new(RuntimeSession {
                 runtime: metal::MetalRuntime::new(
                     &gguf,
-                    gf4_sidecar.as_ref(),
                     &graph_plan.hparams,
                     config.ctx_size,
                     vocab_size,
                     config.prefill_chunk,
                     config.kv_cache_type,
+                    config.attn_window,
+                    config.attn_sink,
                 )?,
                 evaluated: Vec::new(),
                 checkpoint: None,
@@ -310,13 +301,14 @@ impl Engine {
         Ok(Self {
             metal_runtime,
             gguf,
-            gf4_sidecar,
             model_path: config.model_path,
             model_id: config.model_id,
             ctx_size: config.ctx_size,
             prefill_chunk: config.prefill_chunk,
             kv_cache_type: config.kv_cache_type,
             session_cache: config.session_cache,
+            attn_window: config.attn_window,
+            attn_sink: config.attn_sink,
             test_responder: config.test_responder,
             verbose: config.verbose,
             created: unix_time(),
@@ -354,9 +346,27 @@ impl Engine {
         self.session_cache
     }
 
-    /// True when decode uses the cooked GF4 FFN sidecar.
+    /// True when decode uses GF4 FFN weights — i.e. the unified .gguf with its
+    /// FFN baked as type-id 100 (a plain base GGUF decodes on Q4_K instead).
     pub fn gf4_active(&self) -> bool {
-        self.gf4_sidecar.is_some()
+        self.ffn_is_gf4()
+    }
+
+    /// True when the GGUF itself carries a GF4 (type-id 100) FFN — i.e. the
+    /// unified Qwowl3.5-9B .gguf rather than a plain base GGUF.
+    fn ffn_is_gf4(&self) -> bool {
+        self.gguf
+            .tensor("blk.0.ffn_gate.weight")
+            .is_some_and(|t| t.type_id == 100)
+    }
+
+    /// Label for the startup summary `ffn=` line.
+    pub fn ffn_label(&self) -> &'static str {
+        if self.ffn_is_gf4() {
+            "gf4-unified"
+        } else {
+            "gguf"
+        }
     }
 
     pub fn test_responder(&self) -> bool {
@@ -365,14 +375,6 @@ impl Engine {
 
     pub fn decoder_ready(&self) -> bool {
         self.test_responder || (self.graph_plan.decoder_ready() && self.metal_runtime.is_some())
-    }
-
-    pub fn backend_name(&self) -> &'static str {
-        if self.test_responder {
-            "test-responder"
-        } else {
-            "native-metal"
-        }
     }
 
     pub fn warm_report(&self) -> Option<&WarmReport> {
@@ -705,7 +707,7 @@ impl Engine {
         P: FnMut(usize, usize),
     {
         let total_start = Instant::now();
-        let (prompt, stable_len) = render_qwen35_chat_prompt_with_boundary(
+        let (prompt, stable_len, preamble_len) = render_qwen35_chat_prompt_with_boundaries(
             &request.messages,
             request.enable_thinking,
             request.preserve_thinking,
@@ -735,6 +737,18 @@ impl Engine {
         } else {
             0
         };
+        // Sliding-window attention sink floor: pin the system block + first user
+        // turn (the preamble) so a long session never evicts the tool-call format
+        // or the task from the windowed attention layers. Only needed when the
+        // window is active; tokenize the preamble prefix for its token length.
+        let preamble_tokens = if self.attn_window > 0 && preamble_len > 0 {
+            self.tokenizer
+                .encode(&prompt[..preamble_len], true)
+                .map(|t| t.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let tokenize_duration = tokenize_start.elapsed();
         if prompt_tokens.is_empty() {
             return Err(GenerateError::BadRequest(
@@ -752,6 +766,14 @@ impl Engine {
         })?;
         let session = &mut *session_guard;
         let runtime_lock_duration = lock_start.elapsed();
+
+        // Pin system prompt + first user turn under the sliding window: the
+        // effective sink is at least the preamble length, so the windowed
+        // attention layers keep seeing the tool-call format and the task.
+        if self.attn_window > 0 {
+            let sink = self.attn_sink.max(preamble_tokens as i32);
+            session.runtime.set_attn_sink(sink);
+        }
 
         // Session prefix cache: reuse live GPU state when the new prompt
         // extends it, rewind to the prompt-boundary checkpoint when it
@@ -879,6 +901,14 @@ impl Engine {
             message_tokens,
         );
 
+        // Fast-path per-window decode-tps trace (QW35_DECODE_TRACE): prints the
+        // instantaneous tok/s every 128 decoded tokens with the current ctx, so a
+        // session-length slowdown can be localized on the production path without
+        // the serialised stage profiler perturbing thermals/timing.
+        let decode_trace = std::env::var("QW35_DECODE_TRACE").is_ok();
+        let mut trace_win_start = Instant::now();
+        let mut trace_win_tokens = 0u32;
+
         for step in 0..max_tokens {
             let sample_start = Instant::now();
             // While the thinking-budget tracker is draining a forced close
@@ -929,6 +959,20 @@ impl Engine {
 
             completion.push(next);
             all_seen.push(next);
+            if decode_trace {
+                trace_win_tokens += 1;
+                if trace_win_tokens >= 128 {
+                    let dt = trace_win_start.elapsed().as_secs_f64();
+                    eprintln!(
+                        "[QW35_DECODE_TRACE] ctx={} win={}tok {:.2}tok/s",
+                        prompt_tokens.len() + step as usize,
+                        trace_win_tokens,
+                        trace_win_tokens as f64 / dt
+                    );
+                    trace_win_start = Instant::now();
+                    trace_win_tokens = 0;
+                }
+            }
             let detokenize_start = Instant::now();
             let delta = self.tokenizer.decode_one(next, false, &mut decode_state);
             detokenize_duration += detokenize_start.elapsed();
@@ -1080,25 +1124,6 @@ fn prefill_path_for(prefill_chunk: u32, prompt_tokens: usize) -> PrefillPath {
     }
 }
 
-/// Sidecar paths derived from the GGUF model path, in preference order. The
-/// `.gguf` suffix is replaced explicitly (never any other extension, so dots
-/// in the model name stay intact) and the plain appended form
-/// `<model>.gguf.gf4.bin` is accepted too. Comprehensive `.gf4.bin` sidecars
-/// are preferred over FFN-only `.ffn-gf4.bin` ones.
-fn gf4_sidecar_candidates(model_path: &Path) -> Vec<PathBuf> {
-    let file_name = model_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let mut candidates = Vec::new();
-    for suffix in ["gf4.bin", "ffn-gf4.bin"] {
-        if let Some(stem) = file_name.strip_suffix(".gguf") {
-            candidates.push(model_path.with_file_name(format!("{stem}.{suffix}")));
-        }
-        candidates.push(model_path.with_file_name(format!("{file_name}.{suffix}")));
-    }
-    candidates
-}
 
 fn validate_model(gguf: &MappedGguf) -> Result<(), String> {
     let architecture = gguf
@@ -1259,37 +1284,10 @@ fn unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        gf4_sidecar_candidates, plan_session_reuse, render_qwen35_chat_prompt, ChatTurn, Engine,
+        plan_session_reuse, render_qwen35_chat_prompt, ChatTurn, Engine,
         EngineConfig, GenerateRequest, SessionReuse, TokenLimit, DEFAULT_MODEL_ID,
     };
     use std::path::PathBuf;
-
-    #[test]
-    fn gf4_sidecar_candidates_derive_from_gguf_name() {
-        let candidates = gf4_sidecar_candidates(PathBuf::from(".gguf/My.Model-1.2.gguf").as_path());
-        let names: Vec<_> = candidates
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "My.Model-1.2.gf4.bin",
-                "My.Model-1.2.gguf.gf4.bin",
-                "My.Model-1.2.ffn-gf4.bin",
-                "My.Model-1.2.gguf.ffn-gf4.bin",
-            ]
-        );
-        assert!(candidates.iter().all(|p| p.starts_with(".gguf")));
-
-        // Without a .gguf extension only the appended forms are probed; dots
-        // in the model name must never be chopped.
-        let names: Vec<_> = gf4_sidecar_candidates(PathBuf::from("model-v1.2").as_path())
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
-            .collect();
-        assert_eq!(names, ["model-v1.2.gf4.bin", "model-v1.2.ffn-gf4.bin"]);
-    }
 
     #[test]
     fn session_reuse_extends_live_state() {
@@ -1575,10 +1573,9 @@ mod tests {
 
     /// Diagnostic for the repetition-loop investigation: teacher-force the
     /// captured looping transcript through the chunked prefill path and the
-    /// single-token decode path and report per-probe argmax flips and logit
-    /// divergence. With a GF4 sidecar active the single-token path uses GF4
-    /// weights (production decode); without it both paths use the base GGUF
-    /// weights, so any flip is pure kernel-path divergence.
+    /// single-token decode path on the base GGUF and report per-probe argmax
+    /// flips and logit divergence. Both paths use the same base weights, so any
+    /// flip is pure kernel-path divergence.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "diagnostic: prints decode-vs-prefill logit parity along a repetitive transcript"]
@@ -1604,47 +1601,175 @@ mod tests {
             completion.push_str("202 - 4 = 198? No. ");
         }
 
-        for gf4 in [false, true] {
-            let engine = open_real_engine_with(32, gf4, 2048);
-            if gf4 && !engine.gf4_active() {
-                eprintln!("gf4 variant skipped: no sidecar next to the GGUF");
-                continue;
-            }
-            let mut text = render_qwen35_chat_prompt(&messages, false, false);
-            text.push_str(&completion);
-            let tokens = engine
-                .tokenizer
-                .encode(&text, true)
-                .expect("transcript should tokenize");
-            let probes: Vec<usize> = (15..tokens.len()).step_by(16).collect();
+        let engine = open_real_engine_with(32, 2048);
+        let mut text = render_qwen35_chat_prompt(&messages, false, false);
+        text.push_str(&completion);
+        let tokens = engine
+            .tokenizer
+            .encode(&text, true)
+            .expect("transcript should tokenize");
+        let probes: Vec<usize> = (15..tokens.len()).step_by(16).collect();
 
-            let batch = teacher_forced_probe_logits(&engine, &tokens, &probes, false);
-            let single = teacher_forced_probe_logits(&engine, &tokens, &probes, true);
+        let batch = teacher_forced_probe_logits(&engine, &tokens, &probes, false);
+        let single = teacher_forced_probe_logits(&engine, &tokens, &probes, true);
 
-            let mut flips = 0usize;
-            let mut worst_abs = 0.0f32;
-            for (idx, probe) in probes.iter().enumerate() {
-                let (a, b) = (&batch[idx], &single[idx]);
-                let (ta, tb) = (argmax(a), argmax(b));
-                let max_abs = a
-                    .iter()
-                    .zip(b)
-                    .map(|(x, y)| (x - y).abs())
-                    .fold(0.0f32, f32::max);
-                worst_abs = worst_abs.max(max_abs);
-                if ta != tb {
-                    flips += 1;
-                    eprintln!(
-                        "gf4={gf4} probe pos {probe:>4}: ARGMAX FLIP batch={ta} ({:+.4}) single={tb} ({:+.4}) max_abs={max_abs:.4}",
-                        a[ta as usize], b[tb as usize]
-                    );
-                }
+        let mut flips = 0usize;
+        let mut worst_abs = 0.0f32;
+        for (idx, probe) in probes.iter().enumerate() {
+            let (a, b) = (&batch[idx], &single[idx]);
+            let (ta, tb) = (argmax(a), argmax(b));
+            let max_abs = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            worst_abs = worst_abs.max(max_abs);
+            if ta != tb {
+                flips += 1;
+                eprintln!(
+                    "probe pos {probe:>4}: ARGMAX FLIP batch={ta} ({:+.4}) single={tb} ({:+.4}) max_abs={max_abs:.4}",
+                    a[ta as usize], b[tb as usize]
+                );
             }
-            eprintln!(
-                "gf4={gf4}: probes={} argmax_flips={flips} worst_max_abs_logit_diff={worst_abs:.4}",
-                probes.len()
-            );
         }
+        eprintln!(
+            "probes={} argmax_flips={flips} worst_max_abs_logit_diff={worst_abs:.4}",
+            probes.len()
+        );
+    }
+
+    /// Shared (label, user prompt, fixed assistant continuation) corpus used by
+    /// both activation calibration and the deterministic quality report, so the
+    /// AWQ scales are fit on the same domains they are scored on.
+    #[cfg(target_os = "macos")]
+    fn sidecar_calibration_corpus() -> Vec<(&'static str, &'static str, &'static str)> {
+        vec![
+            (
+                "math-code",
+                "Write a python script solve_real_root.py that finds all real roots of ((1 - x) / 5)^4 - 16 = 0",
+                "We solve ((1 - x)/5)^4 = 16, so (1 - x)/5 = ±2, giving 1 - x = ±10. \
+                 Thus x = 1 - 10 = -9 or x = 1 + 10 = 11. The two real roots are -9 and 11.\n\n\
+                 ```python\nimport numpy as np\n\ndef real_roots():\n    \
+                 roots = [1 - 5 * 2, 1 + 5 * 2]\n    return sorted(roots)\n\n\
+                 if __name__ == \"__main__\":\n    print(real_roots())\n```\n",
+            ),
+            (
+                "reasoning",
+                "Explain step by step why the sky appears blue during the day.",
+                "Sunlight contains all colors. As it passes through the atmosphere, shorter \
+                 wavelengths (blue) scatter far more than longer ones because Rayleigh scattering \
+                 grows as one over wavelength to the fourth power. That scattered blue light reaches \
+                 our eyes from every direction, so the daytime sky looks blue.",
+            ),
+            (
+                "rust-code",
+                "Write an iterative Rust function that returns the nth Fibonacci number.",
+                "```rust\nfn fib(n: u64) -> u64 {\n    let (mut a, mut b) = (0u64, 1u64);\n    \
+                 for _ in 0..n {\n        let next = a + b;\n        a = b;\n        b = next;\n    }\n    a\n}\n```\n\
+                 It runs in O(n) time and O(1) space, returning 0 for n = 0.",
+            ),
+            (
+                "multilingual",
+                "Traduci in italiano: The cat sleeps on the warm roof while it rains.",
+                "Il gatto dorme sul tetto caldo mentre piove. La frase mantiene il presente \
+                 e descrive un'azione continua sotto la pioggia.",
+            ),
+            (
+                "math-word",
+                "A train travels 60 km in the first hour and 90 km in the next two hours. \
+                 What is its average speed over the whole trip?",
+                "Total distance is 60 + 90 = 150 km. Total time is 1 + 2 = 3 hours. \
+                 Average speed = distance / time = 150 / 3 = 50 km/h. Note this is the \
+                 time-weighted average, not the mean of 60 and 45.",
+            ),
+            (
+                "py-debug",
+                "Why does this raise IndexError: `xs = [1,2,3]; print(xs[len(xs)])` and how do I fix it?",
+                "Python lists are zero-indexed, so valid indices are 0..len(xs)-1. `xs[len(xs)]` \
+                 is `xs[3]`, one past the end, which raises IndexError. Use `xs[len(xs)-1]` or \
+                 `xs[-1]` to get the last element, and guard with `if xs:` for empty lists.",
+            ),
+            (
+                "prose",
+                "Summarize the water cycle in three sentences.",
+                "Water evaporates from oceans, lakes, and rivers, turning into vapor that rises \
+                 into the atmosphere. As the vapor cools it condenses into clouds and eventually \
+                 falls back to the surface as precipitation such as rain or snow. The water then \
+                 collects in bodies of water or soaks into the ground, and the cycle repeats.",
+            ),
+            (
+                "json",
+                "Return a JSON object describing a book with title, author, year, and a list of two tags.",
+                "```json\n{\n  \"title\": \"The Pragmatic Programmer\",\n  \
+                 \"author\": \"Andrew Hunt and David Thomas\",\n  \"year\": 1999,\n  \
+                 \"tags\": [\"software\", \"craftsmanship\"]\n}\n```\n",
+            ),
+            (
+                "sql",
+                "Write a SQL query to select the names of employees in the 'Sales' department earning more than 50000.",
+                "```sql\nSELECT e.name\nFROM employees AS e\nJOIN departments AS d ON e.dept_id = d.id\n\
+                 WHERE d.name = 'Sales' AND e.salary > 50000\nORDER BY e.name;\n```\n",
+            ),
+        ]
+    }
+
+    /// Drive the calibration corpus through the capture-routed decode path so
+    /// the runtime accumulates per-channel FFN activation magnitudes. Set
+    /// QW35_CAPTURE_ACT_OUT to the desired stats path (defaults next to the
+    /// GGUF). Uses base weights (no GF4) so the stats reflect the reference.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "diagnostic: capture per-channel FFN activation stats for AWQ"]
+    fn real_model_capture_activations() {
+        let _gpu = real_model_gpu_lock();
+        let out = std::env::var("QW35_CAPTURE_ACT_OUT")
+            .unwrap_or_else(|_| ".gguf/act-stats.bin".to_string());
+        std::env::set_var("QW35_CAPTURE_ACT_OUT", &out);
+
+        let engine = open_real_engine_with(32, 4096);
+        let mut total = 0usize;
+        for (label, user, assistant) in sidecar_calibration_corpus() {
+            let messages = vec![ChatTurn {
+                role: "user".to_string(),
+                content: user.to_string(),
+            }];
+            let mut text = render_qwen35_chat_prompt(&messages, false, false);
+            text.push_str(assistant);
+            let tokens = engine.tokenizer.encode(&text, true).expect("tokenize");
+            let last = tokens.len() - 1;
+            let _ = teacher_forced_probe_logits(&engine, &tokens, &[last], true);
+            total += tokens.len();
+            eprintln!("  captured [{label}] {} tokens", tokens.len());
+        }
+        drop(engine); // dealloc flushes the final (<16-token) window
+        eprintln!("capture complete: ~{total} tokens -> {out}");
+        assert!(
+            std::path::Path::new(&out).exists(),
+            "capture stats file should be written"
+        );
+    }
+
+    /// KL(P || Q) in nats for two logit vectors, P = softmax(reference),
+    /// Q = softmax(candidate). Numerically stable via max-subtraction.
+    #[cfg(target_os = "macos")]
+    fn kl_div_logits(reference: &[f32], candidate: &[f32]) -> f64 {
+        let lse = |v: &[f32]| -> (f32, f32) {
+            let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let s: f32 = v.iter().map(|x| (x - m).exp()).sum();
+            (m, s.ln())
+        };
+        let (pm, plse) = lse(reference);
+        let (qm, qlse) = lse(candidate);
+        let mut kl = 0.0f64;
+        for (a, b) in reference.iter().zip(candidate) {
+            let log_p = (a - pm - plse) as f64;
+            let log_q = (b - qm - qlse) as f64;
+            let p = log_p.exp();
+            if p > 0.0 {
+                kl += p * (log_p - log_q);
+            }
+        }
+        kl
     }
 
     /// Diagnostic: print qw35's token ids for the cross-engine repro prompt
@@ -1654,7 +1779,7 @@ mod tests {
     #[ignore = "diagnostic: dumps tokenization of the cross-engine repro prompt"]
     fn real_model_tokenization_dump() {
         let _gpu = real_model_gpu_lock();
-        let engine = open_real_engine_with(32, false, 128);
+        let engine = open_real_engine_with(32, 128);
         let prompt = "<|im_start|>user\nmake a reverse count from 218 to 156, jumping by 2 one time and other by 4<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
         let ids = engine.tokenizer.encode(prompt, true).expect("encode");
         eprintln!("qw35 tokens ({}): {:?}", ids.len(), ids);
@@ -1662,14 +1787,20 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn open_engine_at(path: &str, prefill_chunk: u32) -> Engine {
+        open_engine_at_ctx(path, prefill_chunk, 128)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_engine_at_ctx(path: &str, prefill_chunk: u32, ctx_size: u32) -> Engine {
         Engine::open(EngineConfig {
             model_path: PathBuf::from(path),
             model_id: DEFAULT_MODEL_ID.to_string(),
-            ctx_size: 128,
+            ctx_size,
             prefill_chunk,
             kv_cache_type: crate::metal::KvCacheType::Q8_0,
             session_cache: false,
-            gf4: true,
+            attn_window: 0,
+            attn_sink: 0,
             warm_weights: false,
             test_responder: false,
             verbose: false,
@@ -1677,13 +1808,119 @@ mod tests {
         .unwrap_or_else(|err| panic!("failed to open real native engine: {err}"))
     }
 
+    /// Cross-engine deterministic quality of the unified .gguf: its GF4/AWQ DECODE
+    /// path vs the base GGUF reference (its Q4_K PREFILL path), teacher-forced on
+    /// the SAME tokens. The unified .gguf runs GF4 on both of a single engine's
+    /// paths, so an intra-engine prefill-vs-decode report cannot measure
+    /// quality-vs-base for it — this opens the two models SEQUENTIALLY
+    /// (base first: capture reference logits, then drop it; candidate second) so
+    /// peak memory is a single model. Set QW35_MODEL_UNDER_TEST to the unified
+    /// .gguf (default .gguf/Qwowl3.5-9B.gguf); QW35_BASE_MODEL overrides
+    /// the reference (default the Q4_K GGUF). Reports argmax flips, top-1
+    /// agreement, mean/worst KL(base||candidate), worst |Δlogit|, and the first
+    /// divergence.
     #[cfg(target_os = "macos")]
-    fn open_real_engine(prefill_chunk: u32) -> Engine {
-        open_real_engine_with(prefill_chunk, true, 128)
+    #[test]
+    #[ignore = "diagnostic: cross-engine quality of the unified .gguf vs the base GGUF"]
+    fn real_model_unified_quality_report() {
+        let _gpu = real_model_gpu_lock();
+        let base_path = std::env::var("QW35_BASE_MODEL")
+            .unwrap_or_else(|_| ".gguf/Qwen3.5-9B-Q4_K_M.gguf".to_string());
+        let cand_path = std::env::var("QW35_MODEL_UNDER_TEST")
+            .unwrap_or_else(|_| ".gguf/Qwowl3.5-9B.gguf".to_string());
+        let corpus = sidecar_calibration_corpus();
+
+        // Pass 1 — base reference (Q4_K prefill path). Capture tokens, probe
+        // positions, and reference logits per transcript, then free the engine.
+        let mut refs: Vec<(String, Vec<u32>, Vec<usize>, Vec<Vec<f32>>)> = Vec::new();
+        {
+            let base = open_engine_at_ctx(&base_path, 32, 4096);
+            for (label, user, assistant) in &corpus {
+                let messages = vec![ChatTurn {
+                    role: "user".to_string(),
+                    content: (*user).to_string(),
+                }];
+                let mut text = render_qwen35_chat_prompt(&messages, false, false);
+                text.push_str(assistant);
+                let tokens = base.tokenizer.encode(&text, true).expect("tokenize");
+                let begin = (tokens.len() / 4).max(15);
+                let probes: Vec<usize> = (begin..tokens.len()).step_by(16).collect();
+                if probes.is_empty() {
+                    continue;
+                }
+                let ref_logits = teacher_forced_probe_logits(&base, &tokens, &probes, false);
+                refs.push(((*label).to_string(), tokens, probes, ref_logits));
+            }
+            drop(base);
+        }
+
+        // Pass 2 — candidate decode path (GF4/AWQ), scored on the same tokens.
+        let cand = open_engine_at_ctx(&cand_path, 32, 4096);
+        eprintln!(
+            "unified_quality: base={base_path} candidate={cand_path} ffn={}",
+            cand.ffn_label()
+        );
+        let mut total_probes = 0usize;
+        let mut total_flips = 0usize;
+        let mut sum_kl = 0.0f64;
+        let mut worst_abs = 0.0f32;
+        let mut worst_kl = 0.0f64;
+        let mut first_divergence: Option<(usize, String)> = None;
+        for (label, tokens, probes, ref_logits) in &refs {
+            let cand_logits = teacher_forced_probe_logits(&cand, tokens, probes, true);
+            let mut flips = 0usize;
+            let mut kl_sum = 0.0f64;
+            for (idx, &probe) in probes.iter().enumerate() {
+                let (a, b) = (&ref_logits[idx], &cand_logits[idx]);
+                let (ta, tb) = (argmax(a), argmax(b));
+                let max_abs = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                let kl = kl_div_logits(a, b);
+                worst_abs = worst_abs.max(max_abs);
+                worst_kl = worst_kl.max(kl);
+                kl_sum += kl;
+                if ta != tb {
+                    flips += 1;
+                    if first_divergence.is_none() {
+                        first_divergence = Some((probe, format!("{label}: base={ta} cand={tb}")));
+                    }
+                }
+            }
+            total_probes += probes.len();
+            total_flips += flips;
+            sum_kl += kl_sum;
+            eprintln!(
+                "  [{label:<12}] probes={:>3} flips={flips:>2} mean_kl={:.5}",
+                probes.len(),
+                kl_sum / probes.len() as f64,
+            );
+        }
+        let agree = if total_probes > 0 {
+            100.0 * (total_probes - total_flips) as f64 / total_probes as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "unified_quality TOTAL: probes={total_probes} flips={total_flips} \
+             top1_agreement={agree:.2}% mean_kl={:.5} worst_kl={worst_kl:.5} worst_abs={worst_abs:.4}",
+            sum_kl / total_probes.max(1) as f64,
+        );
+        match &first_divergence {
+            Some((probe, what)) => eprintln!("  first divergence at probe pos {probe}: {what}"),
+            None => eprintln!("  no argmax divergence across the corpus"),
+        }
     }
 
     #[cfg(target_os = "macos")]
-    fn open_real_engine_with(prefill_chunk: u32, gf4: bool, ctx_size: u32) -> Engine {
+    fn open_real_engine(prefill_chunk: u32) -> Engine {
+        open_real_engine_with(prefill_chunk, 128)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn open_real_engine_with(prefill_chunk: u32, ctx_size: u32) -> Engine {
         Engine::open(EngineConfig {
             model_path: PathBuf::from(".gguf/Qwen3.5-9B-Q4_K_M.gguf"),
             model_id: DEFAULT_MODEL_ID.to_string(),
@@ -1691,7 +1928,8 @@ mod tests {
             prefill_chunk,
             kv_cache_type: crate::metal::KvCacheType::Q8_0,
             session_cache: false,
-            gf4,
+            attn_window: 0,
+            attn_sink: 0,
             warm_weights: false,
             test_responder: false,
             verbose: false,

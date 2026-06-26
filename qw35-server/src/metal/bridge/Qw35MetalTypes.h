@@ -44,6 +44,10 @@ typedef struct {
     uint32_t ssm_time_step_rank;
     uint32_t ssm_inner_size;
     uint32_t full_attention_interval;
+    // Decode-time sliding-window attention config (from --attn-window/--attn-sink).
+    // window <= 0 means full attention; sink = leading tokens always attended.
+    int32_t  attn_window;
+    int32_t  attn_sink;
 } qw35_metal_hparams;
 
 /// Output-head mode for an eval call.

@@ -1004,7 +1004,6 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "model": engine.model_id(),
-        "backend": engine.backend_name(),
         "decoder_ready": engine.decoder_ready(),
         "test_responder": engine.test_responder(),
         "ctx_size": engine.ctx_size(),
@@ -1069,7 +1068,6 @@ fn model_json(engine: &Engine) -> serde_json::Value {
         "created": engine.created(),
         "owned_by": "local",
         "metadata": {
-            "backend": engine.backend_name(),
             "architecture": summary.architecture,
             "name": summary.name,
             "size_label": summary.size_label,

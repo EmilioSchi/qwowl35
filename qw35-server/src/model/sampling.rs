@@ -11,34 +11,53 @@ pub(super) fn sample_from_logits(
     seen: &[u32],
     prompt_len: usize,
 ) -> u32 {
+    // Penalties touch only a handful of token ids (the seen/repeat windows), so
+    // apply them to those ids directly instead of probing a hash set/map for
+    // every one of the ~248K vocab entries — that per-entry hashing dominated
+    // sampling (measured ~7 ms/token; see bench_sample_from_logits_full_vocab).
+    // We patch a working copy, then do a single hashing-free pass to build the
+    // candidate set.
+    let mut adjusted: Vec<f32> = logits.to_vec();
+
     // OpenAI semantics: presence and frequency penalties consider only the
     // generated output (logit -= count * frequency + (count > 0) * presence).
     // Penalizing prompt tokens too would demote every identifier mentioned in
-    // a long agentic prompt. The repetition penalty intentionally differs: it
-    // is the llama.cpp-style knob and spans the full repeat_last_n window.
-    let mut completion_counts: HashMap<u32, f32> = HashMap::new();
-    for &token in &seen[prompt_len.min(seen.len())..] {
-        *completion_counts.entry(token).or_insert(0.0) += 1.0;
-    }
-    let repetition_ids = repeat_penalty_token_set(seen, request.repeat_last_n);
-    let mut candidates = Vec::with_capacity(logits.len());
-    for (id, &logit) in logits.iter().enumerate() {
-        if !logit.is_finite() {
-            continue;
+    // a long agentic prompt.
+    if request.presence_penalty != 0.0 || request.frequency_penalty != 0.0 {
+        let mut completion_counts: HashMap<u32, f32> = HashMap::new();
+        for &token in &seen[prompt_len.min(seen.len())..] {
+            *completion_counts.entry(token).or_insert(0.0) += 1.0;
         }
-        let id = id as u32;
-        let mut adjusted = logit;
-        if let Some(&count) = completion_counts.get(&id) {
-            adjusted -= count * request.frequency_penalty + request.presence_penalty;
-        }
-        if repetition_ids.contains(&id) && request.repetition_penalty != 1.0 {
-            if adjusted < 0.0 {
-                adjusted *= request.repetition_penalty;
-            } else {
-                adjusted /= request.repetition_penalty;
+        for (id, count) in completion_counts {
+            if let Some(slot) = adjusted.get_mut(id as usize) {
+                if slot.is_finite() {
+                    *slot -= count * request.frequency_penalty + request.presence_penalty;
+                }
             }
         }
-        candidates.push((id, adjusted));
+    }
+
+    // The repetition penalty is the llama.cpp-style knob and spans the full
+    // repeat_last_n window (prompt tokens included).
+    if request.repetition_penalty != 1.0 {
+        for id in repeat_penalty_token_set(seen, request.repeat_last_n) {
+            if let Some(slot) = adjusted.get_mut(id as usize) {
+                if slot.is_finite() {
+                    if *slot < 0.0 {
+                        *slot *= request.repetition_penalty;
+                    } else {
+                        *slot /= request.repetition_penalty;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut candidates: Vec<(u32, f32)> = Vec::with_capacity(adjusted.len());
+    for (id, &logit) in adjusted.iter().enumerate() {
+        if logit.is_finite() {
+            candidates.push((id as u32, logit));
+        }
     }
 
     if candidates.is_empty() {
@@ -190,6 +209,34 @@ mod tests {
         assert_eq!(sample_from_logits(&logits, &request, &[0, 1], 1), 1);
         // Three occurrences: 2.0 - 1.2 = 0.8 loses to 1.0.
         assert_eq!(sample_from_logits(&logits, &request, &[0, 1, 1, 1], 1), 2);
+    }
+
+    #[test]
+    #[ignore = "diagnostic: CPU cost of sample_from_logits over the full 248K vocab"]
+    fn bench_sample_from_logits_full_vocab() {
+        let vocab = 248_320usize;
+        let mut logits = vec![0.0f32; vocab];
+        for (i, l) in logits.iter_mut().enumerate() {
+            *l = ((i as f32) * 0.000_123).sin() * 5.0;
+        }
+        let mut request = sampler_request(0.0, 0.0, 1.1);
+        request.temperature = 0.6;
+        request.top_p = 0.95;
+        request.top_k = 20;
+        request.repeat_last_n = 64;
+        // Realistic mid-session history (~2000 generated tokens).
+        let seen: Vec<u32> = (0..2000u32).map(|i| (i.wrapping_mul(37)) % vocab as u32).collect();
+        let prompt_len = 1900usize;
+        let iters = 300u32;
+        let start = std::time::Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..iters {
+            acc += u64::from(sample_from_logits(&logits, &request, &seen, prompt_len));
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(iters);
+        eprintln!(
+            "sample_from_logits: {ms:.3} ms/token over {vocab} vocab ({iters} iters) [sink={acc}]"
+        );
     }
 
     #[test]

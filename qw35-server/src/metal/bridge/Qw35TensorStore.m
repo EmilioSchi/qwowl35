@@ -37,6 +37,19 @@
 
 @implementation Qw35TensorStore
 
+- (NSArray<id<MTLBuffer>> *)allBuffers {
+    NSMutableArray<id<MTLBuffer>> *out = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (Qw35Tensor *tensor in self.tensors.allValues) {
+        id<MTLBuffer> buffer = tensor.buffer;
+        if (buffer && ![seen containsObject:buffer]) {
+            [seen addObject:buffer];
+            [out addObject:buffer];
+        }
+    }
+    return out;
+}
+
 static inline uint64_t round_up_u64(uint64_t value, uint64_t alignment) {
     uint64_t rem = value % alignment;
     return rem == 0 ? value : value + alignment - rem;

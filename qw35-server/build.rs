@@ -10,6 +10,7 @@ const METAL_SOURCES: &[&str] = &[
     "src/metal/qw35_core.metal",
     "src/metal/qw35_matvec.metal",
     "src/metal/qw35_gf4.metal",
+    "src/metal/qw35_gf2.metal",
     "src/metal/qw35_ssm.metal",
     "src/metal/qw35_attention.metal",
     "src/metal/qw35_output.metal",
@@ -127,6 +128,13 @@ fn compile_objc_bridge(clang_tool: &Path, out_dir: &Path) {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=qw35bridge");
+    // The runtime is split into Objective-C categories (Qw35MetalRuntime+*.m),
+    // one per forward-pass stage. A category defines no symbol the linker
+    // references directly, so without -ObjC ld would dead-strip those object
+    // files out of the static archive and the category methods would be missing
+    // at runtime (unrecognized selector). -ObjC force-loads archive members that
+    // contain Objective-C classes or categories.
+    println!("cargo:rustc-link-arg=-ObjC");
 }
 
 fn compile_metal_to_metallib(

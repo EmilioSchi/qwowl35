@@ -42,6 +42,8 @@ fn start_test_server() -> TestServer {
             kv_cache_type: qw35_server::metal::KvCacheType::Q8_0,
             session_cache: true,
             gf4: true,
+            attn_window: 0,
+            attn_sink: 0,
             warm_weights: true,
             test_responder: true,
             verbose: false,

@@ -25,6 +25,38 @@ static inline float qw35_gf4_dot8_f32(device const float * x, int64_t c, uint32_
     return qw35_gf4_dot8_vec_f32(x0, x1, word);
 }
 
+// --- Tiled (multi-token prefill) support -----------------------------------
+// The unified .qw35 stores the FFN as GF4, so the prompt/prefill tiled matmul
+// must dequantize GF4 just like the K-quant tiled path. We expose GF4 as a
+// 256-element "super-block" (32 packed words) so it drops into the generic
+// qw35_kernel_mul_mm template with nl=16 — identical pointer math to Q4_K,
+// only the per-sub-block dequant differs. Row stride is (cols/8)*4 bytes =
+// sizeof(qw35_block_gf4) per 256 columns, with no per-block header.
+struct qw35_block_gf4 {
+    uint32_t words[32];
+};
+
+// Dequantize sub-block `il` (0..15) = 16 contiguous weights = two GF4 words,
+// reusing the exact bit/sign extraction of qw35_gf4_dot8_vec_f32 above.
+template <typename type4x4>
+void qw35_dequantize_gf4(device const qw35_block_gf4 *xb, short il, thread type4x4 &reg) {
+    device const uint32_t *ws = xb->words + 2 * il;
+    for (short hw = 0; hw < 2; ++hw) {
+        const uint32_t word = ws[hw];
+        const int packed = int((word & 0xfff00000u) | ((word >> 4) & 0x0000fff0u));
+        const float scale = float(as_type<half>(ushort(word << 8))) * -0.25f * 0.0001220703125f;
+        for (short i = 0; i < 4; ++i) {
+            int shifted = packed << (9 - i * 3);
+            if (i != 0) shifted &= 0xe000e000;
+            const short2 q = as_type<short2>(shifted);
+            const short e0 = hw * 8 + i;      // weights 0..3 of this word
+            const short e1 = hw * 8 + i + 4;  // weights 4..7 of this word
+            reg[e0 / 4][e0 % 4] = half(float(q.x) * scale);
+            reg[e1 / 4][e1 % 4] = half(float(q.y) * scale);
+        }
+    }
+}
+
 // Fused single-token FFN gate+up matvec with SwiGLU applied in-kernel:
 // swiglu_dst[row] = silu(gate_row . y) * (up_row . y).
 kernel void qw35_ffn_gate_up_swiglu_gf4_f32(
