@@ -3,14 +3,16 @@ set -e
 
 # qw35 model downloader.
 #
-# Fetches the base GGUF from Hugging Face into ./.gguf/ and cooks the canonical
-# unified model the server loads by default — Qwowl3.5-9B.gguf: the base
-# GGUF with its FFN baked as GF4 (type-id 100) and an AWQ fold in the norms.
-# The unified model is NOT downloadable: it is cooked locally from the base GGUF.
+# Fetches GGUFs from Hugging Face into ./.gguf/. The canonical unified model the
+# server loads by default — Qwowl3.5-9B.gguf: the base GGUF with its FFN baked as
+# GF4 (type-id 100) and an AWQ fold in the norms — can either be downloaded
+# directly or cooked locally from the base GGUF.
 # The base GGUF is kept as the cook input and the quality-comparison reference.
 
 REPO="unsloth/Qwen3.5-9B-GGUF"
 MODEL_FILE="Qwen3.5-9B-Q4_K_M.gguf"
+# Hugging Face repo hosting the prebuilt canonical unified model.
+CANON_REPO="EmilioSchi/Qwowl3.5-9B-GGUF"
 # Canonical unified model (cooked with the AWQ-GF4 approach, the winner of the
 # awq-gf4 vs gf4 quality comparison) and
 # the AWQ activation stats it folds in (captured from the base model).
@@ -31,22 +33,27 @@ usage() {
 qw35 model downloader
 
 Usage:
-  ./download_model.sh [model|cook|all] [--token TOKEN]
+  ./download_model.sh [download|model|cook|all] [--token TOKEN]
 
 Targets:
 
-  model   (default) Download the base GGUF
-          $MODEL_FILE (~5.3 GB) into the model directory. This is the cook
-          input and the quality-comparison reference.
+  download  (default) Download the prebuilt canonical unified model
+            $CANON_FILE from $CANON_REPO into the model
+            directory. This is the file the server loads by default — no
+            cooking needed.
 
-  cook    Cook the canonical unified model $CANON_FILE from the
-          downloaded base GGUF using qw35-tool (FFN baked as GF4 + AWQ norm
-          fold). This is the file the server loads by default. Needs the AWQ
-          activation stats $ACT_STATS_FILE; if absent, capture them first with:
-            cargo test -p qw35-server --lib real_model_capture_activations -- --ignored
-          CPU-heavy; takes several minutes. Requires python3 + numpy + gguf.
+  model     Download the base GGUF
+            $MODEL_FILE (~5.3 GB) into the model directory. This is the
+            cook input and the quality-comparison reference.
 
-  all     Run model, then cook.
+  cook      Cook the canonical unified model $CANON_FILE from the
+            downloaded base GGUF using qw35-tool (FFN baked as GF4 + AWQ norm
+            fold). An alternative to 'download'. Needs the AWQ activation stats
+            $ACT_STATS_FILE; if absent, capture them first with:
+              cargo test -p qw35-server --lib real_model_capture_activations -- --ignored
+            CPU-heavy; takes several minutes. Requires python3 + numpy + gguf.
+
+  all       Run model, then cook.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -61,9 +68,9 @@ After downloading, the default server command just works:
 EOF
 }
 
-TARGET=model
+TARGET=download
 case "${1:-}" in
-    model|cook|gf4|all) TARGET=$1; shift ;;
+    download|unified|model|cook|gf4|all) TARGET=$1; shift ;;
     -h|--help|help) usage; exit 0 ;;
     "" ) ;;
     --token) ;;  # no target given, options follow
@@ -102,6 +109,32 @@ download_model() {
 
     echo "Downloading $MODEL_FILE"
     echo "from https://huggingface.co/$REPO"
+    echo "If the download stops, run the same command again to resume it."
+
+    if [ -n "$TOKEN" ]; then
+        curl -fL --progress-meter -C - -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
+    else
+        curl -fL --progress-meter -C - -o "$part" "$url"
+    fi
+
+    mv "$part" "$out"
+    echo "Saved $out"
+}
+
+download_unified() {
+    out="$OUT_DIR/$CANON_FILE"
+    part="$out.part"
+    url="https://huggingface.co/$CANON_REPO/resolve/main/$CANON_FILE"
+
+    mkdir -p "$OUT_DIR"
+
+    if [ -s "$out" ]; then
+        echo "Already downloaded: $out"
+        return
+    fi
+
+    echo "Downloading $CANON_FILE"
+    echo "from https://huggingface.co/$CANON_REPO"
     echo "If the download stops, run the same command again to resume it."
 
     if [ -n "$TOKEN" ]; then
@@ -154,10 +187,14 @@ cook_unified() {
 }
 
 case "$TARGET" in
+    download|unified)
+        download_unified
+        ;;
     model)
         download_model
         echo
-        echo "Tip: './download_model.sh cook' cooks the canonical unified $CANON_FILE."
+        echo "Tip: './download_model.sh cook' cooks the canonical unified $CANON_FILE,"
+        echo "or './download_model.sh download' fetches the prebuilt one."
         ;;
     cook|gf4)
         cook_unified

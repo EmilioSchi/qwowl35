@@ -93,19 +93,29 @@ way turn out to be useful to other programmers.
 The weights are git-ignored, so a fresh checkout has none. Fetch them with:
 
 ```
-./download_model.sh         # base GGUF -> .gguf/Qwen3.5-9B-Q4_K_M.gguf (~5.3 GB)
-./download_model.sh cook    # cook the unified Qwowl3.5-9B.gguf (CPU-heavy)
-./download_model.sh all     # both
+./download_model.sh         # prebuilt unified Qwowl3.5-9B.gguf (default, ~4.8 GB)
+./download_model.sh model   # base GGUF -> .gguf/Qwen3.5-9B-Q4_K_M.gguf (~5.3 GB)
+./download_model.sh cook    # cook the unified Qwowl3.5-9B.gguf locally (CPU-heavy)
+./download_model.sh all     # base GGUF, then cook
 ```
 
-The base GGUF comes from `unsloth/Qwen3.5-9B-GGUF` on Hugging Face; pass `--token`
-(or set `HF_TOKEN`) if you need authentication, and `QW35_GGUF_DIR` to change the
-target directory. The unified model the server loads by default —
-`Qwowl3.5-9B.gguf` — is not downloadable: `cook` bakes it locally from the
-base GGUF with `qw35-tool` (needs `python3` + `numpy` + `gguf`, and the AWQ
-activation stats — see the section below). The base GGUF is kept as the cook input
-and the quality-comparison reference. If you start the server (`make run`) without
-the model, it offers to run the downloader for you.
+The unified model the server loads by default — `Qwowl3.5-9B.gguf` — can be
+fetched two ways:
+
+- **Download it directly** (default, recommended) with `./download_model.sh`,
+  which pulls the prebuilt file from
+  [`EmilioSchi/Qwowl3.5-9B-GGUF`](https://huggingface.co/EmilioSchi/Qwowl3.5-9B-GGUF)
+  on Hugging Face — no cooking needed.
+
+- **Cook it locally** with `./download_model.sh cook`, which bakes it from the
+  base GGUF with `qw35-tool` (needs `python3` + `numpy` + `gguf`, and the AWQ
+  activation stats — see the section below).
+
+The base GGUF (`./download_model.sh model`) comes from `unsloth/Qwen3.5-9B-GGUF`
+and is only needed as the cook input and the quality-comparison reference. Pass
+`--token` (or set `HF_TOKEN`) for authenticated downloads, and `QW35_GGUF_DIR` to
+change the target directory. If you start the server (`make run`) without the
+model, it offers to run the downloader for you.
 
 ## Quickstart
 
