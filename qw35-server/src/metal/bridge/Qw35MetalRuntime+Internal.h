@@ -26,6 +26,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Upper bound on live KV slab buffers (sizes the ivar arrays and the bindless
+// pointer buffer). Must equal QW35_MAX_SLABS in qw35_attention.metal, which sizes
+// the matching read-kernel argument-buffer struct. 64 * QW35_KV_INITIAL_SLAB
+// (8192) = 524288 positions, above the largest supported --ctx; -initWithModelMap:
+// clamps ctx to that product so the cache can always reach the ceiling.
+#define QW35_MAX_SLABS 64u
+
 /// Per-layer weights resolved once at init so the per-token encode loop does
 /// no string formatting or dictionary lookups. FFN matvec weights are GF4
 /// (type_id 100) in the unified .gguf.
@@ -118,8 +125,15 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
     id<MTLBuffer> _ffn_gate;
     id<MTLBuffer> _ffn_up;
     id<MTLBuffer> _logits;
-    id<MTLBuffer> _k_cache;
-    id<MTLBuffer> _v_cache;
+    // Segmented KV cache: append-only per-slab buffers. Each slab buffer holds
+    // ALL attention layers for one slab-window of positions, with a fixed
+    // per-layer stride of _kvSlab positions (decoupled from live capacity), so
+    // growth never restrides/copies existing data — it just appends one buffer.
+    id<MTLBuffer> _kSlabs[QW35_MAX_SLABS];
+    id<MTLBuffer> _vSlabs[QW35_MAX_SLABS];
+    id<MTLBuffer> _kSlabPtrs;   // uint64 gpuAddress array — bindless read arg
+    id<MTLBuffer> _vSlabPtrs;
+    uint32_t _kvSlabCount;
     id<MTLBuffer> _conv_state;
     id<MTLBuffer> _ssm_state;
     // Session checkpoint copies of the recurrent state (CPU-side, small).
@@ -202,6 +216,8 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
 - (BOOL)resolveLayerTensors:(NSError **)error;
 - (BOOL)allocateBuffers:(NSError **)error;
 - (BOOL)ensureKvCapacityForPositions:(uint64_t)positions error:(NSError **)error;
+- (void)updateSlabPtrs;
+- (void)useKvSlabsForRead:(id<MTLComputeCommandEncoder>)enc;
 - (id<MTLBuffer>)newFloatBuffer:(uint64_t)count label:(NSString *)label;
 - (BOOL)prewarmPipelines:(NSError **)error;
 - (id<MTLComputePipelineState>)attnPipeline:(NSString *)name error:(NSError **)error;

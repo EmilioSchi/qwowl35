@@ -22,7 +22,13 @@
                               slot:(uint32_t)slot
                                pos:(uint32_t)pos
                              error:(NSError **)error {
-    const NSUInteger kv_off = (NSUInteger)((uint64_t)slot * _kvCapacity * _kvRowBytes);
+    // Segmented KV: the current token lives entirely in slab s; bind that one
+    // slab for the write at the fixed per-layer stride (_kvSlab, not capacity).
+    const uint32_t s = pos / _kvSlab;
+    const NSUInteger kv_off = (NSUInteger)((uint64_t)slot * _kvSlab * _kvRowBytes);
+    int64_t cache_row = (int64_t)pos - (int64_t)s * (int64_t)_kvSlab;
+    int kv_slab_i = (int)_kvSlab;
+    int slot_i = (int)slot;
     const float scale = 1.0f / sqrtf((float)_h.attention_key_length);
 
     if (![self encodeDecodeMatvecTensor:enc weight:layer.attnQ input:_norm inputOffset:0 dst:_qkv residual:NO error:error]) return NO;
@@ -51,8 +57,8 @@
     [enc setBuffer:k_norm.buffer offset:k_norm.offset atIndex:4];
     [enc setBuffer:_q_rep offset:0 atIndex:5];
     [enc setBuffer:_z_gate offset:0 atIndex:6];
-    [enc setBuffer:_k_cache offset:kv_off atIndex:7];
-    [enc setBuffer:_v_cache offset:kv_off atIndex:8];
+    [enc setBuffer:_kSlabs[s] offset:kv_off atIndex:7];
+    [enc setBuffer:_vSlabs[s] offset:kv_off atIndex:8];
     [enc setBytes:&n_head length:sizeof(n_head) atIndex:9];
     [enc setBytes:&n_kv_head length:sizeof(n_kv_head) atIndex:10];
     [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:11];
@@ -60,6 +66,7 @@
     [enc setBytes:&eps length:sizeof(eps) atIndex:13];
     [enc setBuffer:_rope_freq offset:0 atIndex:14];
     [enc setBytes:&rope_dim length:sizeof(rope_dim) atIndex:15];
+    [enc setBytes:&cache_row length:sizeof(cache_row) atIndex:16];
     qw35_dispatch_1d(enc, (NSUInteger)(_h.attention_heads * _h.attention_key_length), 256);
 
     // Barrier-free flash decode: one simdgroup per head, sigmoid output gate
@@ -72,8 +79,8 @@
     int64_t seq_len = (int64_t)pos + 1;
     [enc setComputePipelineState:attn];
     [enc setBuffer:_q_rep offset:0 atIndex:0];
-    [enc setBuffer:_k_cache offset:kv_off atIndex:1];
-    [enc setBuffer:_v_cache offset:kv_off atIndex:2];
+    [enc setBuffer:_kSlabPtrs offset:0 atIndex:1];
+    [enc setBuffer:_vSlabPtrs offset:0 atIndex:2];
     [enc setBuffer:_core offset:0 atIndex:3];
     [enc setBuffer:_z_gate offset:0 atIndex:4];
     [enc setBytes:&n_head length:sizeof(n_head) atIndex:5];
@@ -85,6 +92,9 @@
     int attn_sink = _attnSink;
     [enc setBytes:&attn_window length:sizeof(attn_window) atIndex:10];
     [enc setBytes:&attn_sink length:sizeof(attn_sink) atIndex:11];
+    [enc setBytes:&kv_slab_i length:sizeof(kv_slab_i) atIndex:16];
+    [enc setBytes:&slot_i length:sizeof(slot_i) atIndex:17];
+    [self useKvSlabsForRead:enc];  // bindless slabs: ensure residency + write->read hazard
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)_h.attention_heads, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
@@ -98,7 +108,13 @@
                              tokens:(uint32_t)tokensCount
                              prefix:(NSString *)prefix
                               error:(NSError **)error {
-    const NSUInteger kv_off = (NSUInteger)((uint64_t)slot * _kvCapacity * _kvRowBytes);
+    // Segmented KV: evalTokens guarantees this batch does not straddle a slab,
+    // so the whole [pos0, pos0+tokens) range writes into slab s.
+    const uint32_t s = pos0 / _kvSlab;
+    const NSUInteger kv_off = (NSUInteger)((uint64_t)slot * _kvSlab * _kvRowBytes);
+    int64_t cache_pos0 = (int64_t)pos0 - (int64_t)s * (int64_t)_kvSlab;
+    int kv_slab_i = (int)_kvSlab;
+    int slot_i = (int)slot;
     const float scale = 1.0f / sqrtf((float)_h.attention_key_length);
 
     if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_q.weight"] input:_norm inputOffset:0 dst:_qkv dstOffset:0 tokens:tokensCount error:error]) return NO;
@@ -132,8 +148,8 @@
     [enc setBuffer:k_norm.buffer offset:k_norm.offset atIndex:4];
     [enc setBuffer:_q_rep offset:0 atIndex:5];
     [enc setBuffer:_z_gate offset:0 atIndex:6];
-    [enc setBuffer:_k_cache offset:kv_off atIndex:7];
-    [enc setBuffer:_v_cache offset:kv_off atIndex:8];
+    [enc setBuffer:_kSlabs[s] offset:kv_off atIndex:7];
+    [enc setBuffer:_vSlabs[s] offset:kv_off atIndex:8];
     [enc setBytes:&n_head length:sizeof(n_head) atIndex:9];
     [enc setBytes:&n_kv_head length:sizeof(n_kv_head) atIndex:10];
     [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:11];
@@ -141,6 +157,7 @@
     [enc setBytes:&eps length:sizeof(eps) atIndex:13];
     [enc setBuffer:_rope_freq offset:0 atIndex:14];
     [enc setBytes:&rope_dim length:sizeof(rope_dim) atIndex:15];
+    [enc setBytes:&cache_pos0 length:sizeof(cache_pos0) atIndex:16];
     [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:20];
     qw35_dispatch_1d(enc, (NSUInteger)((uint64_t)tokensCount * max_work), 256);
 
@@ -151,8 +168,8 @@
     if (!attn) return NO;
     [enc setComputePipelineState:attn];
     [enc setBuffer:_q_rep offset:0 atIndex:0];
-    [enc setBuffer:_k_cache offset:kv_off atIndex:1];
-    [enc setBuffer:_v_cache offset:kv_off atIndex:2];
+    [enc setBuffer:_kSlabPtrs offset:0 atIndex:1];
+    [enc setBuffer:_vSlabPtrs offset:0 atIndex:2];
     [enc setBuffer:_core offset:0 atIndex:3];
     [enc setBuffer:_z_gate offset:0 atIndex:4];
     [enc setBytes:&n_head length:sizeof(n_head) atIndex:5];
@@ -161,6 +178,9 @@
     [enc setBytes:&pos064 length:sizeof(pos064) atIndex:8];
     [enc setBytes:&scale length:sizeof(scale) atIndex:9];
     [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:10];
+    [enc setBytes:&kv_slab_i length:sizeof(kv_slab_i) atIndex:16];
+    [enc setBytes:&slot_i length:sizeof(slot_i) atIndex:17];
+    [self useKvSlabsForRead:enc];  // bindless slabs: ensure residency + write->read hazard
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tokensCount,
                                           (NSUInteger)_h.attention_heads,
                                           1)

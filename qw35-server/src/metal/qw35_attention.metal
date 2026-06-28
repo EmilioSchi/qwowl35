@@ -1,4 +1,16 @@
 // Attention preprocess and GQA kernels (f16 KV cache).
+
+// Segmented KV cache: the read kernels receive the live slab buffers as a
+// bindless argument-buffer struct (an array of device pointers, one per slab).
+// The host fills a plain buffer with each slab's gpuAddress; residency keeps
+// the slabs GPU-accessible. A top-level `device T* device*` arg is rejected by
+// the compiler, so the pointer array must be wrapped in a struct.
+// Must match QW35_MAX_SLABS in Qw35MetalRuntime.m (the host sizes the pointer
+// buffer to that count).
+#define QW35_MAX_SLABS 64
+struct Qw35KvSlabsU  { device const ushort* slab[QW35_MAX_SLABS]; };
+struct Qw35KvSlabsQ8 { device const qw35_block_q8_0* slab[QW35_MAX_SLABS]; };
+
 constant int QW35_ATTN_N_HEAD [[function_constant(FC_ATTN_HEADS)]];
 
 constant int QW35_ATTN_N_KV_HEAD [[function_constant(FC_ATTN_KV_HEADS)]];
@@ -24,6 +36,7 @@ kernel void qw35_attn_decode_preprocess_f32(
     constant float &eps [[buffer(13)]],
     device const float * rope_freq [[buffer(14)]],
     constant int64_t &rope_dim [[buffer(15)]],
+    constant int64_t &cache_row [[buffer(16)]],
     uint idx [[thread_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]
 ) {
@@ -74,7 +87,7 @@ kernel void qw35_attn_decode_preprocess_f32(
             ss += v * v;
         }
         const float inv = rsqrt(ss / float(hd) + eps);
-        const int cache_off = int(pos) * kv_dim + int(idx);
+        const int cache_off = int(cache_row) * kv_dim + int(idx);
         if (d < rope) {
             const int pair = d < half_rope ? d : d - half_rope;
             const float x0 = k_src[k_base + pair] * inv * k_norm_w[pair];
@@ -106,6 +119,7 @@ kernel void qw35_attn_prefill_preprocess_f32(
     constant float &eps [[buffer(13)]],
     device const float * rope_freq [[buffer(14)]],
     constant int64_t &rope_dim [[buffer(15)]],
+    constant int64_t &cache_pos0 [[buffer(16)]],
     constant int64_t &n_tokens [[buffer(20)]],
     uint gid [[thread_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]
@@ -123,6 +137,7 @@ kernel void qw35_attn_prefill_preprocess_f32(
     const int rope = QW35_ATTN_ROPE_DIM_CONST;
     const int half_rope = rope / 2;
     const int pos = int(pos0) + token;
+    const int cache_pos = int(cache_pos0) + token;
 
     threadgroup float rope_cos[64];
     threadgroup float rope_sin[64];
@@ -166,7 +181,7 @@ kernel void qw35_attn_prefill_preprocess_f32(
             ss += v * v;
         }
         const float inv = rsqrt(ss / float(hd) + eps);
-        const int cache_off = pos * kv_dim + idx;
+        const int cache_off = cache_pos * kv_dim + idx;
         if (d < rope) {
             const int pair = d < half_rope ? d : d - half_rope;
             const float x0 = k_src[k_base + pair] * inv * k_norm_w[pair];
@@ -183,8 +198,8 @@ kernel void qw35_attn_prefill_preprocess_f32(
 
 kernel void qw35_attention_gqa_flash_decode_f32(
     device const float * q [[buffer(0)]],
-    device const ushort * k_cache [[buffer(1)]],
-    device const ushort * v_cache [[buffer(2)]],
+    device const Qw35KvSlabsU & k_slabs [[buffer(1)]],
+    device const Qw35KvSlabsU & v_slabs [[buffer(2)]],
     device float * dst [[buffer(3)]],
     device const float * gate [[buffer(4)]],
     constant int64_t &n_head [[buffer(5)]],
@@ -194,6 +209,8 @@ kernel void qw35_attention_gqa_flash_decode_f32(
     constant float &sm_scale [[buffer(9)]],
     constant int &attn_window [[buffer(10)]],
     constant int &attn_sink [[buffer(11)]],
+    constant int &kv_slab [[buffer(16)]],
+    constant int &slot_i [[buffer(17)]],
     uint h_u [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
@@ -206,6 +223,7 @@ kernel void qw35_attention_gqa_flash_decode_f32(
     const int kv_dim = QW35_ATTN_N_KV_HEAD * hd;
     const int q_off = h * hd;
     const int d0 = int(lane) * 8;
+    const int layer_base = slot_i * (kv_slab * kv_dim);
 
     float qv[8];
     for (int i = 0; i < 8; i++) qv[i] = q[q_off + d0 + i];
@@ -228,11 +246,15 @@ kernel void qw35_attention_gqa_flash_decode_f32(
     }
     for (int idx = 0; idx < total; ++idx) {
         const int t = (idx < sink) ? idx : (recent_start + (idx - sink));
-        const int k_off = t * kv_dim + kv_h * hd + d0;
+        const int s = t / kv_slab;
+        const int lt = t - s * kv_slab;
+        device const ushort * kc = k_slabs.slab[s];
+        device const ushort * vc = v_slabs.slab[s];
+        const int k_off = layer_base + lt * kv_dim + kv_h * hd + d0;
 
         float dot = 0.0f;
         for (int i = 0; i < 8; i++) {
-            dot += qv[i] * qw35_bf16_to_f32(k_cache[k_off + i]);
+            dot += qv[i] * qw35_bf16_to_f32(kc[k_off + i]);
         }
         dot = simd_sum(dot);
 
@@ -242,7 +264,7 @@ kernel void qw35_attention_gqa_flash_decode_f32(
         const float score_scale = exp(score - next_m);
 
         for (int i = 0; i < 8; i++) {
-            acc[i] = acc[i] * old_scale + score_scale * qw35_bf16_to_f32(v_cache[k_off + i]);
+            acc[i] = acc[i] * old_scale + score_scale * qw35_bf16_to_f32(vc[k_off + i]);
         }
         l = l * old_scale + score_scale;
         m = next_m;
@@ -307,6 +329,7 @@ kernel void qw35_attn_decode_preprocess_##TAG##_f32( \
     constant float &eps [[buffer(13)]], \
     device const float * rope_freq [[buffer(14)]], \
     constant int64_t &rope_dim [[buffer(15)]], \
+    constant int64_t &cache_row [[buffer(16)]], \
     uint idx [[thread_position_in_grid]], \
     uint tid [[thread_index_in_threadgroup]] \
 ) { \
@@ -363,7 +386,7 @@ kernel void qw35_attn_decode_preprocess_##TAG##_f32( \
     } \
     threadgroup_barrier(mem_flags::mem_threadgroup); \
     if (idx < uint(kv_dim) && (tid % QK) == 0) { \
-        const int row = int(pos) * (kv_dim / QK); \
+        const int row = int(cache_row) * (kv_dim / QK); \
         const int blk = int(idx) / QK; \
         QFN(&tg_k[tid], &k_cache[row + blk]); \
         QFN(&tg_v[tid], &v_cache[row + blk]); \
@@ -386,6 +409,7 @@ kernel void qw35_attn_prefill_preprocess_##TAG##_f32( \
     constant float &eps [[buffer(13)]], \
     device const float * rope_freq [[buffer(14)]], \
     constant int64_t &rope_dim [[buffer(15)]], \
+    constant int64_t &cache_pos0 [[buffer(16)]], \
     constant int64_t &n_tokens [[buffer(20)]], \
     uint gid [[thread_position_in_grid]], \
     uint tid [[thread_index_in_threadgroup]] \
@@ -450,7 +474,7 @@ kernel void qw35_attn_prefill_preprocess_##TAG##_f32( \
     } \
     threadgroup_barrier(mem_flags::mem_threadgroup); \
     if (active && idx < kv_dim && (tid % QK) == 0) { \
-        const int row = pos * (kv_dim / QK); \
+        const int row = (int(cache_pos0) + token) * (kv_dim / QK); \
         const int blk = idx / QK; \
         QFN(&tg_k[tid], &k_cache[row + blk]); \
         QFN(&tg_v[tid], &v_cache[row + blk]); \
@@ -458,8 +482,8 @@ kernel void qw35_attn_prefill_preprocess_##TAG##_f32( \
 } \
 kernel void qw35_attention_gqa_flash_decode_##TAG##_f32( \
     device const float * q [[buffer(0)]], \
-    device const BT * k_cache [[buffer(1)]], \
-    device const BT * v_cache [[buffer(2)]], \
+    device const Qw35KvSlabsQ8 & k_slabs [[buffer(1)]], \
+    device const Qw35KvSlabsQ8 & v_slabs [[buffer(2)]], \
     device float * dst [[buffer(3)]], \
     device const float * gate [[buffer(4)]], \
     constant int64_t &n_head [[buffer(5)]], \
@@ -469,6 +493,8 @@ kernel void qw35_attention_gqa_flash_decode_##TAG##_f32( \
     constant float &sm_scale [[buffer(9)]], \
     constant int &attn_window [[buffer(10)]], \
     constant int &attn_sink [[buffer(11)]], \
+    constant int &kv_slab [[buffer(16)]], \
+    constant int &slot_i [[buffer(17)]], \
     uint h_u [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]] \
 ) { \
@@ -484,6 +510,7 @@ kernel void qw35_attention_gqa_flash_decode_##TAG##_f32( \
     const int eb = kv_h * hd + d0; \
     const int blk_i = eb / QK; \
     const int e0 = eb % QK; \
+    const int layer_base = slot_i * (kv_slab * blocks_per_row); \
     float qv[8]; \
     for (int i = 0; i < 8; i++) qv[i] = q[q_off + d0 + i]; \
     float m = -INFINITY; \
@@ -496,7 +523,9 @@ kernel void qw35_attention_gqa_flash_decode_##TAG##_f32( \
     else { recent_start = sl - attn_window; total = sink + attn_window; } \
     for (int idx = 0; idx < total; ++idx) { \
         const int t = (idx < sink) ? idx : (recent_start + (idx - sink)); \
-        device const BT * kb = &k_cache[t * blocks_per_row + blk_i]; \
+        const int s = t / kv_slab; \
+        const int lt = t - s * kv_slab; \
+        device const BT * kb = &k_slabs.slab[s][layer_base + lt * blocks_per_row + blk_i]; \
         const float kd = float(kb->d); \
         float dot = 0.0f; \
         for (int i = 0; i < 8; i++) { dot += qv[i] * DFN(kb, e0 + i); } \
@@ -505,7 +534,7 @@ kernel void qw35_attention_gqa_flash_decode_##TAG##_f32( \
         const float next_m = max(m, score); \
         const float old_scale = isinf(m) ? 0.0f : exp(m - next_m); \
         const float score_scale = exp(score - next_m); \
-        device const BT * vb = &v_cache[t * blocks_per_row + blk_i]; \
+        device const BT * vb = &v_slabs.slab[s][layer_base + lt * blocks_per_row + blk_i]; \
         const float vd = float(vb->d); \
         for (int i = 0; i < 8; i++) { \
             acc[i] = acc[i] * old_scale + score_scale * vd * DFN(vb, e0 + i); \
@@ -529,8 +558,8 @@ QW35_GEN_KV_KERNELS(q8_0, qw35_block_q8_0, qw35_q8_0_quantize_block, qw35_q8_0_d
 // with context (matmul-bound) instead of collapsing under per-position barriers.
 kernel void qw35_attention_gqa_prefill_f32(
     device const float * q [[buffer(0)]],
-    device const ushort * k_cache [[buffer(1)]],
-    device const ushort * v_cache [[buffer(2)]],
+    device const Qw35KvSlabsU & k_slabs [[buffer(1)]],
+    device const Qw35KvSlabsU & v_slabs [[buffer(2)]],
     device float * dst [[buffer(3)]],
     device const float * gate [[buffer(4)]],
     constant int64_t &n_head [[buffer(5)]],
@@ -539,6 +568,8 @@ kernel void qw35_attention_gqa_prefill_f32(
     constant int64_t &pos0 [[buffer(8)]],
     constant float &sm_scale [[buffer(9)]],
     constant int64_t &n_tokens [[buffer(10)]],
+    constant int &kv_slab [[buffer(16)]],
+    constant int &slot_i [[buffer(17)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
@@ -554,6 +585,7 @@ kernel void qw35_attention_gqa_prefill_f32(
     const int q_off = token * out_dim + h * hd;
     const int d0 = int(lane) * 8;
     const int seq_len = int(pos0) + token + 1;
+    const int layer_base = slot_i * (kv_slab * kv_dim);
 
     float qv[8];
     for (int i = 0; i < 8; i++) qv[i] = q[q_off + d0 + i];
@@ -563,16 +595,20 @@ kernel void qw35_attention_gqa_prefill_f32(
     float acc[8] = {0.0f};
 
     for (int t = 0; t < seq_len; ++t) {
-        const int k_off = t * kv_dim + kv_h * hd + d0;
+        const int s = t / kv_slab;
+        const int lt = t - s * kv_slab;
+        device const ushort * kc = k_slabs.slab[s];
+        device const ushort * vc = v_slabs.slab[s];
+        const int k_off = layer_base + lt * kv_dim + kv_h * hd + d0;
         float dot = 0.0f;
-        for (int i = 0; i < 8; i++) dot += qv[i] * qw35_bf16_to_f32(k_cache[k_off + i]);
+        for (int i = 0; i < 8; i++) dot += qv[i] * qw35_bf16_to_f32(kc[k_off + i]);
         dot = simd_sum(dot);
         const float score = dot * sm_scale;
         const float next_m = max(m, score);
         const float old_scale = isinf(m) ? 0.0f : exp(m - next_m);
         const float score_scale = exp(score - next_m);
         for (int i = 0; i < 8; i++)
-            acc[i] = acc[i] * old_scale + score_scale * qw35_bf16_to_f32(v_cache[k_off + i]);
+            acc[i] = acc[i] * old_scale + score_scale * qw35_bf16_to_f32(vc[k_off + i]);
         l = l * old_scale + score_scale;
         m = next_m;
     }
@@ -584,8 +620,8 @@ kernel void qw35_attention_gqa_prefill_f32(
 
 kernel void qw35_attention_gqa_prefill_q8_0_f32(
     device const float * q [[buffer(0)]],
-    device const qw35_block_q8_0 * k_cache [[buffer(1)]],
-    device const qw35_block_q8_0 * v_cache [[buffer(2)]],
+    device const Qw35KvSlabsQ8 & k_slabs [[buffer(1)]],
+    device const Qw35KvSlabsQ8 & v_slabs [[buffer(2)]],
     device float * dst [[buffer(3)]],
     device const float * gate [[buffer(4)]],
     constant int64_t &n_head [[buffer(5)]],
@@ -594,6 +630,8 @@ kernel void qw35_attention_gqa_prefill_q8_0_f32(
     constant int64_t &pos0 [[buffer(8)]],
     constant float &sm_scale [[buffer(9)]],
     constant int64_t &n_tokens [[buffer(10)]],
+    constant int &kv_slab [[buffer(16)]],
+    constant int &slot_i [[buffer(17)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]
 ) {
@@ -613,6 +651,7 @@ kernel void qw35_attention_gqa_prefill_q8_0_f32(
     const int blk_i = eb / QW35_QK8_0;
     const int e0 = eb % QW35_QK8_0;
     const int seq_len = int(pos0) + token + 1;
+    const int layer_base = slot_i * (kv_slab * blocks_per_row);
 
     float qv[8];
     for (int i = 0; i < 8; i++) qv[i] = q[q_off + d0 + i];
@@ -622,7 +661,9 @@ kernel void qw35_attention_gqa_prefill_q8_0_f32(
     float acc[8] = {0.0f};
 
     for (int t = 0; t < seq_len; ++t) {
-        device const qw35_block_q8_0 * kb = &k_cache[t * blocks_per_row + blk_i];
+        const int s = t / kv_slab;
+        const int lt = t - s * kv_slab;
+        device const qw35_block_q8_0 * kb = &k_slabs.slab[s][layer_base + lt * blocks_per_row + blk_i];
         const float kd = float(kb->d);
         float dot = 0.0f;
         for (int i = 0; i < 8; i++) dot += qv[i] * qw35_q8_0_dequant_qi(kb, e0 + i);
@@ -631,7 +672,7 @@ kernel void qw35_attention_gqa_prefill_q8_0_f32(
         const float next_m = max(m, score);
         const float old_scale = isinf(m) ? 0.0f : exp(m - next_m);
         const float score_scale = exp(score - next_m);
-        device const qw35_block_q8_0 * vb = &v_cache[t * blocks_per_row + blk_i];
+        device const qw35_block_q8_0 * vb = &v_slabs.slab[s][layer_base + lt * blocks_per_row + blk_i];
         const float vd = float(vb->d);
         for (int i = 0; i < 8; i++)
             acc[i] = acc[i] * old_scale + score_scale * vd * qw35_q8_0_dequant_qi(vb, e0 + i);

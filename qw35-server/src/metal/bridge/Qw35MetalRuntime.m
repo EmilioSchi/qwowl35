@@ -18,12 +18,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Positions allocated for the KV cache at model load, and the granularity by
-// which it grows (in slab-sized steps, capped at --ctx) as the live context
-// advances. A short chat keeps only a slab resident — a few hundred MiB instead
-// of the full --ctx worth of cache (Metal makes the whole buffer resident on
-// first use, so a smaller buffer is a real physical-memory saving).
+// KV cache slab size: the per-layer stride and the granularity by which the
+// cache grows (one slab appended per crossing; see -ensureKvCapacityForPositions:).
+// The cache is a list of fixed-size slab buffers rather than one buffer that
+// reallocates on growth, so a crossing never copies, never doubles the transient
+// footprint, and never re-pins the whole cache — it just wires one fresh slab.
+// A short chat keeps only the slabs it touches resident (one slab ~= 142 MiB of
+// q8_0 KV across the 8 attention layers), not the full --ctx worth.
+//
+// 8192 is chosen by measurement: decode tok/s is independent of slab size across
+// 1024..32768 (weight-bandwidth bound; the per-layer stride does not move it), so
+// the size is set by other concerns — 8192 holds a typical large first prompt in
+// one slab (few prefill-time crossings) and yields a small slab count (<=32 even
+// at the largest supported --ctx 262144), keeping the read-path slab array tiny.
 #define QW35_KV_INITIAL_SLAB 8192u
+// QW35_MAX_SLABS is defined in Qw35MetalRuntime+Internal.h (it sizes the ivar
+// slab arrays) and must match QW35_MAX_SLABS in qw35_attention.metal.
 
 @implementation Qw35LayerTensors
 @end
@@ -87,11 +97,23 @@
     }
 
     _h = *hparams;
-    _ctxSize = ctxSize;
-    // Start with a slab and grow on demand; never reserve more than the ceiling.
     const uint32_t slab = QW35_KV_INITIAL_SLAB;
+    // The segmented KV cache addresses at most QW35_MAX_SLABS slabs. Reject a
+    // larger --ctx outright rather than clamping silently: the Rust layer admits
+    // prompts against its own ctx, so a cache that quietly held fewer positions
+    // would let a request reach a slab index past the array (out of bounds).
+    // QW35_MAX_SLABS * slab = 64 * 8192 = 524288, double the model's 262144
+    // trained window, so this only ever rejects an unsupported oversize ctx.
+    const uint64_t maxCtx = (uint64_t)QW35_MAX_SLABS * slab;
+    if ((uint64_t)ctxSize > maxCtx) {
+        if (error) *error = qw35_error(@"--ctx %u exceeds the maximum %llu tokens the KV cache can address (%u slabs x %u)",
+                                       ctxSize, maxCtx, (unsigned)QW35_MAX_SLABS, slab);
+        return nil;
+    }
+    _ctxSize = ctxSize;
+    // Start with a single slab and grow on demand; never reserve past the ceiling.
     _kvSlab = slab;
-    _kvCapacity = ctxSize < slab ? ctxSize : slab;
+    _kvCapacity = _ctxSize < slab ? _ctxSize : slab;
     _vocabSize = vocabSize;
     _maxPrefillChunk = prefillChunk ? prefillChunk : 1;
     _kvQ8 = kvCacheType == 1;
@@ -161,13 +183,22 @@
     NSMutableArray<id<MTLBuffer>> *bufs = [NSMutableArray array];
     [bufs addObjectsFromArray:[_tensorStore allBuffers]];
     id<MTLBuffer> scratch[] = {
-        _k_cache, _v_cache, _conv_state, _ssm_state, _act_a, _act_b, _norm,
+        _conv_state, _ssm_state, _act_a, _act_b, _norm,
         _qkv, _z_gate, _q_rep, _k_rep, _core, _ffn_gate, _ffn_up, _logits, _rope_freq,
         _beta, _alpha, _argmax_partial_token, _argmax_partial_logit,
     };
     for (size_t i = 0; i < sizeof(scratch) / sizeof(scratch[0]); i++) {
         if (scratch[i]) [bufs addObject:scratch[i]];
     }
+    // Segmented KV: pin every live slab buffer (more are added on growth, see
+    // -ensureKvCapacityForPositions:). The ptr arg buffers are small but pinned
+    // too so the bindless read can fetch slab addresses.
+    for (uint32_t i = 0; i < _kvSlabCount; i++) {
+        if (_kSlabs[i]) [bufs addObject:_kSlabs[i]];
+        if (_vSlabs[i]) [bufs addObject:_vSlabs[i]];
+    }
+    if (_kSlabPtrs) [bufs addObject:_kSlabPtrs];
+    if (_vSlabPtrs) [bufs addObject:_vSlabPtrs];
     uint64_t total = 0;
     for (id<MTLBuffer> b in bufs) {
         [rs addAllocation:b];
@@ -291,16 +322,25 @@
     _ffn_gate = [self newFloatBuffer:ffn_max * chunk label:@"ffn_gate"];
     _ffn_up = [self newFloatBuffer:ffn_max * chunk label:@"ffn_up"];
     _logits = [self newFloatBuffer:_vocabSize label:@"logits"];
-    // KV cache: f16 rows (2 bytes/element) or q8_0 rows (34-byte blocks of 32).
-    // Sized to the current capacity (a slab), not the full --ctx ceiling;
-    // -ensureKvCapacityForPositions: grows it as the live context advances.
-    const uint64_t kv_bytes = (uint64_t)_attentionLayerCount * _kvCapacity * _kvRowBytes;
-    _k_cache = [_device newBufferWithLength:(NSUInteger)kv_bytes
-                                    options:MTLResourceStorageModeShared];
-    _k_cache.label = @"k_cache";
-    _v_cache = [_device newBufferWithLength:(NSUInteger)kv_bytes
-                                    options:MTLResourceStorageModeShared];
-    _v_cache.label = @"v_cache";
+    // Segmented KV cache: allocate only the first slab. Each slab buffer holds
+    // all attention layers for one slab-window of positions, with a fixed
+    // per-layer stride of _kvSlab. -ensureKvCapacityForPositions: appends more
+    // slabs (no restride/copy) as the live context advances.
+    const uint64_t slab_bytes = (uint64_t)_attentionLayerCount * (uint64_t)_kvSlab * _kvRowBytes;
+    _kSlabs[0] = [_device newBufferWithLength:(NSUInteger)slab_bytes
+                                      options:MTLResourceStorageModeShared];
+    _kSlabs[0].label = @"k_cache";
+    _vSlabs[0] = [_device newBufferWithLength:(NSUInteger)slab_bytes
+                                      options:MTLResourceStorageModeShared];
+    _vSlabs[0].label = @"v_cache";
+    _kvSlabCount = 1;
+    _kSlabPtrs = [_device newBufferWithLength:(NSUInteger)(QW35_MAX_SLABS * sizeof(uint64_t))
+                                      options:MTLResourceStorageModeShared];
+    _kSlabPtrs.label = @"k_slab_ptrs";
+    _vSlabPtrs = [_device newBufferWithLength:(NSUInteger)(QW35_MAX_SLABS * sizeof(uint64_t))
+                                      options:MTLResourceStorageModeShared];
+    _vSlabPtrs.label = @"v_slab_ptrs";
+    if (_kSlabs[0] && _vSlabs[0] && _kSlabPtrs && _vSlabPtrs) [self updateSlabPtrs];
     _conv_state = [self newFloatBuffer:(uint64_t)_deltaLayerCount * ssm_conv_channels * (_h.ssm_conv_kernel - 1) label:@"conv_state"];
     _ssm_state = [self newFloatBuffer:(uint64_t)_deltaLayerCount * _h.ssm_time_step_rank * _h.ssm_state_size * _h.ssm_state_size label:@"ssm_state"];
     _argmax_token = [_device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
@@ -319,7 +359,8 @@
     _rope_freq.label = @"rope_freq";
 
     if (!_act_a || !_act_b || !_norm || !_qkv || !_z_gate || !_beta || !_alpha || !_q_rep ||
-        !_k_rep || !_core || !_ffn_gate || !_ffn_up || !_logits || !_k_cache || !_v_cache ||
+        !_k_rep || !_core || !_ffn_gate || !_ffn_up || !_logits || !_kSlabs[0] || !_vSlabs[0] ||
+        !_kSlabPtrs || !_vSlabPtrs ||
         !_conv_state || !_ssm_state || !_argmax_token || !_argmax_logit ||
         !_argmax_partial_token || !_argmax_partial_logit || !_prefill_tokens || !_rope_freq) {
         if (error) *error = qw35_error(@"failed to allocate Qw35 Metal decode buffers");
@@ -329,83 +370,81 @@
     return YES;
 }
 
-// Ensure the KV cache can address `positions` positions per layer, growing it
-// if needed. The per-layer stride is _kvCapacity, so growth re-lays-out every
-// layer's slice into a wider buffer; callers have already verified
-// `positions <= _ctxSize`. No-op once the cache has reached the ceiling or the
-// slab still has room.
-//
-// Growth is by whole slabs (not doubling): doubling over-reserves up to ~2x and
-// maximizes the transient old+new peak, which on unified memory can evict the
-// model's weight pages — and decode here is weight-bandwidth bound, so that
-// shows up as a *sustained* tok/s drop, not just a hitch. Slab-stepping keeps
-// the spike bounded while staying amortized.
-//
-// Growth is rare (once per slab crossed) so the brief drain below is cheap; the
-// expensive part the old code got wrong was doubling, not the wait.
+// Write each live slab's gpuAddress into the bindless pointer arg buffers, so
+// the read kernels (which take the slabs as an argument-buffer struct) can fetch
+// slab base pointers by index. Call after every slab append.
+- (void)updateSlabPtrs {
+    uint64_t *kp = (uint64_t *)[_kSlabPtrs contents];
+    uint64_t *vp = (uint64_t *)[_vSlabPtrs contents];
+    for (uint32_t i = 0; i < _kvSlabCount; i++) {
+        kp[i] = _kSlabs[i].gpuAddress;
+        vp[i] = _vSlabs[i].gpuAddress;
+    }
+}
+
+// The attention read kernels reach the slab buffers via raw gpuAddress through a
+// bindless argument-buffer struct, which Metal does NOT hazard-track or keep
+// resident automatically (unlike a setBuffer-bound resource). Declare every live
+// slab as used-for-read on the encoder so the driver (1) keeps the slabs
+// resident for the bindless fetch and (2) tracks the preceding current-token
+// write (a setBuffer-bound access to the same slab) -> read dependency. Without
+// this, slabs appended after setup (index >= 2) are read before they are
+// reliably resident/ordered, perturbing attention from the 2nd crossing on.
+- (void)useKvSlabsForRead:(id<MTLComputeCommandEncoder>)enc {
+    for (uint32_t i = 0; i < _kvSlabCount; i++) {
+        if (_kSlabs[i]) [enc useResource:_kSlabs[i] usage:MTLResourceUsageRead];
+        if (_vSlabs[i]) [enc useResource:_vSlabs[i] usage:MTLResourceUsageRead];
+    }
+}
+
+// Ensure the KV cache can address `positions` positions, growing it if needed.
+// The cache is a list of fixed-stride slab buffers, so growth is append-only:
+// each crossing allocates one fresh slab and pins it — no memcpy, no re-layout,
+// no transient old+new doubling, and the residency set only ADDS the new slab
+// (never re-pins the whole cache). That keeps a crossing to a fraction of a
+// millisecond and, crucially, avoids the transient footprint spike that would
+// otherwise evict the weight-bandwidth-bound model's pages on unified memory.
 - (BOOL)ensureKvCapacityForPositions:(uint64_t)positions error:(NSError **)error {
     if (positions <= (uint64_t)_kvCapacity) return YES;
 
-    // Round up to the next slab boundary, clamped to the --ctx ceiling.
     const uint64_t slab = _kvSlab ? (uint64_t)_kvSlab : 1;
-    uint64_t newCap = ((positions + slab - 1) / slab) * slab;
-    if (newCap > (uint64_t)_ctxSize) newCap = _ctxSize;
-    if (newCap <= (uint64_t)_kvCapacity) return YES; // already at the ceiling
+    uint64_t target = positions;
+    if (target > (uint64_t)_ctxSize) target = _ctxSize;
+    if (target <= (uint64_t)_kvCapacity) return YES;
 
-    const uint64_t rowBytes = _kvRowBytes;
-    const uint64_t oldStride = (uint64_t)_kvCapacity * rowBytes;
-    const uint64_t newStride = newCap * rowBytes;
-    const uint64_t newBytes = (uint64_t)_attentionLayerCount * newStride;
-
-    id<MTLBuffer> newK = [_device newBufferWithLength:(NSUInteger)newBytes
-                                              options:MTLResourceStorageModeShared];
-    id<MTLBuffer> newV = [_device newBufferWithLength:(NSUInteger)newBytes
-                                              options:MTLResourceStorageModeShared];
-    if (!newK || !newV) {
-        if (error) *error = qw35_error(@"failed to grow Qw35 KV cache to %llu positions", newCap);
-        return NO;
-    }
-    newK.label = @"k_cache";
-    newV.label = @"v_cache";
-
-    // The old buffers may still be read/written by an in-flight command buffer
-    // (built with commandBufferWithUnretainedReferences). Drain it before
-    // copying so the snapshot is consistent and the old buffers are safe to
-    // release via ARC when the ivars are reassigned below.
+    // Drain in-flight work before appending: a still-in-flight command buffer
+    // may be reading the residency set / pointer table for the previous token.
+    // Draining once here (growth is rare — once per slab crossed) establishes the
+    // new slab and its gpuAddress entry before any command buffer references it,
+    // complementing the per-encoder -useKvSlabsForRead: hazard tracking.
     if (![self waitForLastCommand:error]) return NO;
 
-    // Re-lay-out each layer's existing rows at the new (wider) per-layer stride.
-    // Copying the full old slab is safe: rows beyond the live position are never
-    // read (the attention loop is bounded by seq_len).
-    const uint8_t *oldK = (const uint8_t *)[_k_cache contents];
-    const uint8_t *oldV = (const uint8_t *)[_v_cache contents];
-    uint8_t *dstK = (uint8_t *)[newK contents];
-    uint8_t *dstV = (uint8_t *)[newV contents];
-    for (uint64_t slot = 0; slot < _attentionLayerCount; slot++) {
-        memcpy(dstK + slot * newStride, oldK + slot * oldStride, (size_t)oldStride);
-        memcpy(dstV + slot * newStride, oldV + slot * oldStride, (size_t)oldStride);
+    const uint64_t slabBytes = (uint64_t)_attentionLayerCount * slab * _kvRowBytes;
+    while ((uint64_t)_kvCapacity < target &&
+           (uint64_t)_kvCapacity < (uint64_t)_ctxSize &&
+           _kvSlabCount < QW35_MAX_SLABS) {
+        id<MTLBuffer> nk = [_device newBufferWithLength:(NSUInteger)slabBytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> nv = [_device newBufferWithLength:(NSUInteger)slabBytes options:MTLResourceStorageModeShared];
+        if (!nk || !nv) {
+            if (error) *error = qw35_error(@"failed to grow Qw35 KV cache (slab %u)", _kvSlabCount);
+            return NO;
+        }
+        nk.label = @"k_cache";
+        nv.label = @"v_cache";
+        _kSlabs[_kvSlabCount] = nk;
+        _vSlabs[_kvSlabCount] = nv;
+        _kvSlabCount++;
+        uint64_t cap = (uint64_t)_kvSlabCount * slab;
+        if (cap > (uint64_t)_ctxSize) cap = _ctxSize;
+        _kvCapacity = (uint32_t)cap;
+        if (_residencySet) {
+            [_residencySet addAllocation:nk];
+            [_residencySet addAllocation:nv];
+            [_residencySet commit];
+            [_residencySet requestResidency];
+        }
     }
-
-    id<MTLBuffer> oldKBuf = _k_cache;
-    id<MTLBuffer> oldVBuf = _v_cache;
-    _k_cache = newK;
-    _v_cache = newV;
-    _kvCapacity = (uint32_t)newCap;
-
-    // Keep the grown KV cache pinned: swap the old buffers out of the residency
-    // set for the new ones and re-commit. Without this the KV cache silently
-    // leaves residency the first time a session crosses a slab boundary (past
-    // QW35_KV_INITIAL_SLAB), re-introducing the long-session decode droop the
-    // set exists to prevent. The set stays associated with the queue, so no
-    // re-addResidencySet: is needed. Nil on older OSes -> no-op.
-    if (_residencySet) {
-        [_residencySet removeAllocation:oldKBuf];
-        [_residencySet removeAllocation:oldVBuf];
-        [_residencySet addAllocation:newK];
-        [_residencySet addAllocation:newV];
-        [_residencySet commit];
-        [_residencySet requestResidency];
-    }
+    [self updateSlabPtrs];
     return YES;
 }
 
@@ -991,6 +1030,28 @@
              error:(NSError **)error {
     if (!tokens || count == 0) return YES;
     if (count == 1) return [self evalToken:tokens[0] pos:pos0 logitsMode:logitsMode error:error];
+
+    // Segmented KV cache: a prefill batch's writes must land in a single slab
+    // (the per-token write binds one slab buffer). Split a batch that straddles
+    // a slab boundary into slab-aligned sub-batches; only the final sub-batch
+    // emits logits. Reads span slabs via the bindless slab array, so they are
+    // unaffected. With the default slab (8192) this never triggers.
+    const uint32_t slabSize = _kvSlab ? _kvSlab : 1;
+    if (pos0 / slabSize != (uint32_t)((uint64_t)pos0 + count - 1) / slabSize) {
+        uintptr_t off = 0;
+        uint32_t p = pos0;
+        while (off < count) {
+            uint32_t boundary = (p / slabSize + 1) * slabSize;
+            uintptr_t chunk = (uintptr_t)(boundary - p);
+            if (chunk > count - off) chunk = count - off;
+            qw35_logits_mode subMode = (off + chunk >= count) ? logitsMode : QW35_LOGITS_NONE;
+            if (![self evalTokens:tokens + off count:chunk pos0:p logitsMode:subMode error:error]) return NO;
+            off += chunk;
+            p += (uint32_t)chunk;
+        }
+        return YES;
+    }
+
     if (count > _maxPrefillChunk) {
         if (error) *error = qw35_error(@"requested prefill chunk exceeds configured --prefill-chunk");
         return NO;
