@@ -66,8 +66,10 @@ way turn out to be useful to other programmers.
   Running a restricted bash, combined with a policy that parses commands to
   separate the suspicious from the benign, seems to be an effective first line
   of defense.
-- **An adaptive KV-cache window pays off.** Growing the cache to fit the context
-  rather than preallocating it saves a meaningful amount of memory.
+- **An adaptive KV-cache window pays off.** Letting the cache grow to fit the
+  context instead of preallocating it saves a meaningful amount of memory. The
+  cache grows by adding room in fixed chunks that are left in place, so long
+  sessions stay smooth and fast.
 - **`q8_0` is the smallest quantization I'd actually trust** — and even then I
   still have doubts about what that numerical compression really costs.
 - **The MacBook runs *hot*.** Sustained inference heats it up enough that an
