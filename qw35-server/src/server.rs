@@ -934,16 +934,21 @@ pub async fn serve_listener(
 
     let app = build_router(engine, defaults);
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             match shutdown {
+                // Tests drive shutdown via this oneshot; keep the graceful drain
+                // path intact for them (no SIGINT involved).
                 Some(rx) => {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = rx => {}
-                    }
+                    let _ = rx.await;
                 }
+                // Real server: Ctrl+C must kill immediately, even mid
+                // prefill/decode. Generation runs on a spawn_blocking thread with
+                // no cancellation hook, so a graceful drain would hang until it
+                // finishes. process::exit(130) (128 + SIGINT) terminates now; the
+                // OS reclaims the Metal command queue / GPU buffers on exit.
                 None => {
                     tokio::signal::ctrl_c().await.ok();
+                    std::process::exit(130);
                 }
             }
         })
