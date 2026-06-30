@@ -135,8 +135,8 @@ In another terminal, launch the **qwowl35** TUI agent (it talks to the server on
 `127.0.0.1:8080`):
 
 ```bash
-pip install -r qw35-tui/requirements.txt    # textual, rich, httpx, xxhash
-cd qw35-tui && python -m qwowl35
+pip install -r qw35-agent/requirements.txt    # textual, rich, httpx, xxhash
+cd qw35-agent && python -m qwowl35
 ```
 
 ## Cook by yourself (optional)
@@ -161,7 +161,7 @@ base model over a calibration corpus):
 cargo test -p qw35-server --lib real_model_capture_activations -- --ignored
 
 # then cook (this is what `download_model.sh cook` invokes)
-python3 qw35-tool/qw35_tool/cook_qw35_awq_gf4.py \
+python3 tools/cook_qw35_awq_gf4.py \
     .gguf/Qwen3.5-9B-Q4_K_M.gguf .gguf/Qwowl3.5-9B.gguf --awq .gguf/act-stats.bin
 ```
 

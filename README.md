@@ -83,9 +83,9 @@ way turn out to be useful to other programmers.
   `http`, `direct`, and `host` subcommands. Depends on `qw35-server`.
 - `qw35-client/` — Python. Interactive REPL that talks to the server
   (`python -m qw35_client`).
-- `qw35-tool/` — Python. Offline utilities: GGUF metadata dumper and
+- `tools/` — Python. Offline utilities: GGUF metadata dumper and
   the unified-model cooker (bakes GF4 FFN + AWQ into the `.gguf`).
-- `qw35-tui/` — Python. `qwowl35`, a Textual terminal coding agent that
+- `qw35-agent/` — Python. `qwowl35`, a Textual terminal coding agent that
   drives the server in a tool-calling loop (`python -m qwowl35`).
 - `.gguf/` — The base GGUF and the cooked unified model (kept at the repo
   root so the server's cwd-relative default path resolves).
@@ -110,7 +110,7 @@ fetched two ways:
   on Hugging Face — no cooking needed.
 
 - **Cook it locally** with `./download_model.sh cook`, which bakes it from the
-  base GGUF with `qw35-tool` (needs `python3` + `numpy` + `gguf`, and the AWQ
+  base GGUF with `tools` (needs `python3` + `numpy` + `gguf`, and the AWQ
   activation stats — see the section below).
 
 The base GGUF (`./download_model.sh model`) comes from `unsloth/Qwen3.5-9B-GGUF`
@@ -129,8 +129,8 @@ With the model in place (see above), start the server, then drive it from the
 make run                                    # or: cargo run --release -p qw35-server --bin qw35
 
 # 2. in another terminal, launch the TUI agent
-pip install -r qw35-tui/requirements.txt    # textual, rich, httpx, xxhash
-cd qw35-tui && python -m qwowl35
+pip install -r qw35-agent/requirements.txt    # textual, rich, httpx, xxhash
+cd qw35-agent && python -m qwowl35
 ```
 
 Type a request (e.g. *"write a quicksort in Python and run it"*) and the agent
@@ -143,7 +143,7 @@ flags and the full picture.
 
 ## qwowl35: the terminal agent
 
-`qw35-tui/` ships **qwowl35**, a minimal terminal coding agent built on
+`qw35-agent/` ships **qwowl35**, a minimal terminal coding agent built on
 [Textual](https://github.com/Textualize/textual) that drives the server in a
 streaming tool-calling loop. It has a safety-aware **bash** tool and
 anchor-backed **file** read/edit tools, gates risky commands behind a keyboard
@@ -155,14 +155,14 @@ agent's live state (prefill → thinking → inference → bash → edit → don
 </p>
 
 ```bash
-pip install -r qw35-tui/requirements.txt   # textual, rich, httpx, xxhash
-cd qw35-tui && python -m qwowl35           # server must listen on 127.0.0.1:8080
+pip install -r qw35-agent/requirements.txt   # textual, rich, httpx, xxhash
+cd qw35-agent && python -m qwowl35           # server must listen on 127.0.0.1:8080
 python -m qwowl35 --think auto --reasoning-effort high   # --think auto is the default
 ```
 
 Configuration is CLI-only (`--base-url`, `--think auto|on|off`,
 `--reasoning-effort`, `--restricted-bash`). See
-[`qw35-tui/qwowl35/README.md`](qw35-tui/qwowl35/README.md) for the design notes,
+[`qw35-agent/qwowl35/README.md`](qw35-agent/qwowl35/README.md) for the design notes,
 key bindings, and the headless debug runners.
 
 ## Context window
@@ -186,7 +186,7 @@ gate/up/down tensors baked as **GF4** (eight 3-bit quants plus an fp8 scale per
 post-attention norms. GF4 drives both the single-token decode matvec and the
 tiled multi-token prefill matmul, so there is no separate sidecar, no duplicate
 Q4_K FFN, and one mmap (~4.8 GiB). The cooker is
-`qw35-tool/qw35_tool/cook_qw35_awq_gf4.py MODEL.gguf OUT.gguf --awq act-stats.bin`.
+`tools/cook_qw35_awq_gf4.py MODEL.gguf OUT.gguf --awq act-stats.bin`.
 
 The canonical build is **`Qwowl3.5-9B.gguf`**, cooked with the AWQ-GF4 approach.
 It was chosen by cooking

@@ -15,7 +15,7 @@ top-left that reflects the agent's live state.
 ## Install & run
 
 ```bash
-pip install -r ../requirements.txt       # textual, rich, httpx, xxhash (at the qw35-tui root)
+pip install -r ../requirements.txt       # textual, rich, httpx, xxhash (at the qw35-agent root)
 python -m qwowl35                         # qw35-server must listen on 127.0.0.1:8080
 python -m qwowl35 --base-url http://127.0.0.1:8080 --reasoning-effort xhigh
 ```

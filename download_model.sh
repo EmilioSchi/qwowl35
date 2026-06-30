@@ -26,7 +26,7 @@ case "$OUT_DIR" in
     *) OUT_DIR="$ROOT/$OUT_DIR" ;;
 esac
 TOKEN=${HF_TOKEN:-}
-COOK="$ROOT/qw35-tool/qw35_tool/cook_qw35_awq_gf4.py"
+COOK="$ROOT/tools/cook_qw35_awq_gf4.py"
 
 usage() {
     cat <<EOF
@@ -47,7 +47,7 @@ Targets:
             cook input and the quality-comparison reference.
 
   cook      Cook the canonical unified model $CANON_FILE from the
-            downloaded base GGUF using qw35-tool (FFN baked as GF4 + AWQ norm
+            downloaded base GGUF using tools (FFN baked as GF4 + AWQ norm
             fold). An alternative to 'download'. Needs the AWQ activation stats
             $ACT_STATS_FILE; if absent, capture them first with:
               cargo test -p qw35-server --lib real_model_capture_activations -- --ignored

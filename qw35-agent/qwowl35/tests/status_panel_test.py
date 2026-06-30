@@ -56,9 +56,9 @@ def test_effort_cap_mapping_matches_server() -> None:
 
 
 def test_display_path_normalizes_home_and_crops_from_left() -> None:
-    home_path = str(Path.home() / "projects/qw35/qw35-tui")
+    home_path = str(Path.home() / "projects/qw35/qw35-agent")
     assert_true(display_path(home_path).startswith("~/"), "home path uses tilde")
-    path = str(Path.home() / "projects/qw35/qw35-tui/qwowl35/widgets/status_panel.py")
+    path = str(Path.home() / "projects/qw35/qw35-agent/qwowl35/widgets/status_panel.py")
     cropped = display_path(path, max_len=24)
     assert_true(cropped.startswith("..."), "uses ascii crop marker")
     assert_true(cropped.endswith("status_panel.py"), "keeps useful suffix")

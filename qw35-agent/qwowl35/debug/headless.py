@@ -50,7 +50,7 @@ from client import Qw35Client  # noqa: E402
 from config import load_config  # noqa: E402
 from tools_registry import ToolRegistry  # noqa: E402
 
-# Default task: the cal.py benchmark shipped alongside the repo (qw35-tui/benchmark).
+# Default task: the cal.py benchmark shipped alongside the repo (qw35-agent/benchmark).
 DEFAULT_TASK = Path(_PKG).parent / "benchmark" / "cal_task.md"
 
 # stdout echo truncates long fields; the JSONL file always keeps them in full.

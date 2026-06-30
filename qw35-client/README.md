@@ -36,7 +36,7 @@ python -m qw35_client --base-url http://127.0.0.1:8080 --model qwen35-9b
 python -m qw35_client --no-stream --max-tokens 256
 ```
 
-Thinking is hidden by default and aligned with the `qw35-tui` (`qwowl35`):
+Thinking is hidden by default and aligned with the `qw35-agent` (`qwowl35`):
 
 ```sh
 python -m qw35_client --think auto            # defer to the server --mode preset (default)
@@ -62,4 +62,4 @@ Commands inside chat:
 
 This client is a one-shot / REPL chat — it has no tools or agent loop. For an
 agentic coding experience (bash + file tools, tool-call loop, mascot) use the
-`qw35-tui` (`qwowl35`).
+`qw35-agent` (`qwowl35`).

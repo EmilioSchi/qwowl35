@@ -32,7 +32,7 @@ DEFAULT_MODEL = "qwen3.5-9b"
 HISTORY_FILE = os.path.expanduser("~/.qw35_client_history")
 HISTORY_LENGTH = 1000
 
-# Thinking control, mirroring qw35-tui (qwowl35) and llama.cpp's reasoning flag:
+# Thinking control, mirroring qw35-agent (qwowl35) and llama.cpp's reasoning flag:
 #   auto → send nothing; defer to the server's `--mode` default
 #   on   → request thinking (enable_thinking=true) + optional reasoning_effort
 #   off  → explicitly disable thinking (enable_thinking=false). Qwen3.5 "thinks
@@ -253,7 +253,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         choices=ALLOWED_THINK,
         default="auto",
         help="thinking mode: auto defers to the server --mode default, on requests "
-        "thinking, off disables it (default auto). Same semantics as qw35-tui.",
+        "thinking, off disables it (default auto). Same semantics as qw35-agent.",
     )
     parser.add_argument(
         "--reasoning-effort",
