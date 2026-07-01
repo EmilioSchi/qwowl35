@@ -63,6 +63,12 @@ class ApprovalModal(ModalScreen[ApprovalDecision]):
     ApprovalModal #alt-input {
         display: none;
         width: 1fr;
+        height: 3;
+        /* Input's default keeps height 3 but centers its text via the top/bottom
+           border rows. We drop the border, so restore that centering with 1 row
+           of vertical padding — otherwise the text sits on the top row with two
+           blank rows below it. Horizontal 2 matches Input's default inset. */
+        padding: 1 2;
         margin-top: 1;
         border: none;
         background: $bg-surface;
