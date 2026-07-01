@@ -1,0 +1,56 @@
+{
+  "questions": [
+    {
+      "question": "Plants liberate some carbon dioxide when in darkness, but the amount they absorb in sunlight exceeds their nocturnal yield.",
+      "answer": "True"
+    },
+    {
+      "question": "An ocean of mercury 30 inches deep all over the earth would have the same weight as the atmosphere.",
+      "answer": "True"
+    },
+    {
+      "question": "Five straight lines (none parallel) have as many intersections as they form triangles.",
+      "answer": "True"
+    },
+    {
+      "question": "If g (acceleration of gravity) on the moon is roughly one-sixth that on the earth, on the moon a body requires the square root of 6 times as long to fall from a given height.",
+      "answer": "True"
+    },
+    {
+      "question": "The stalactite grows down from the ceiling; the stalagmite rises up from the floor.",
+      "answer": "True"
+    },
+    {
+      "question": "10^19 < 2^64 < 2*10^19",
+      "answer": "True"
+    },
+    {
+      "question": "All solids are more soluble with rise in temperature.",
+      "answer": "False"
+    },
+    {
+      "question": "Over long timescales (thousands of years), the shape of the Big Dipper remains constant and fixed.",
+      "answer": "False"
+    },
+    {
+      "question": "Neutrons can be accelerated by an electrostatic field.",
+      "answer": "False"
+    },
+    {
+      "question": "The primary bow (of the rainbow) is red on its outer side.",
+      "answer": "True"
+    },
+    {
+      "question": "Pi does not satisfy any polynomial equation with integral coefficients.",
+      "answer": "True"
+    },
+    {
+      "question": "The logarithm of 1 to any base is zero.",
+      "answer": "True"
+    },
+    {
+      "question": "Rodents are gnawing animals.",
+      "answer": "True"
+    }
+  ]
+}

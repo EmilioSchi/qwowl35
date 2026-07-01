@@ -1,0 +1,124 @@
+{
+  "questions": [
+    {
+      "question": "What prompted the following observation: Dis aliter visum? Choose one of: The death of Rhipeus, Dido's temple frescoes, The treachery of Sinon.",
+      "answer": "The death of Rhipeus"
+    },
+    {
+      "question": "What prompted the following observation: Sunt lacrimae rerum? Choose one of: The death of Rhipeus, Dido's temple frescoes, The treachery of Sinon.",
+      "answer": "Dido's temple frescoes"
+    },
+    {
+      "question": "What prompted the following observation: Ab uno disce omnes? Choose one of: The death of Rhipeus, Dido's temple frescoes, The treachery of Sinon.",
+      "answer": "The treachery of Sinon"
+    },
+    {
+      "question": "Where do we first meet Aeneas? Choose one of: In the storm off Carthage, In the temple of Juno, Asleep in Ardea.",
+      "answer": "In the storm off Carthage"
+    },
+    {
+      "question": "Where do we first meet Dido? Choose one of: In the storm off Carthage, In the temple of Juno, Asleep in Ardea.",
+      "answer": "In the temple of Juno"
+    },
+    {
+      "question": "Where do we first meet Turnus? Choose one of: In the storm off Carthage, In the temple of Juno, Asleep in Ardea.",
+      "answer": "Asleep in Ardea"
+    },
+    {
+      "question": "Who was the priest of Apollo at Delos? Choose one of: Anius, Deiphobe, Calybe.",
+      "answer": "Anius"
+    },
+    {
+      "question": "Who was the priestess of Apollo at Cumae? Choose one of: Anius, Deiphobe, Calybe.",
+      "answer": "Deiphobe"
+    },
+    {
+      "question": "Who was the priestess of Juno at Ardea? Choose one of: Anius, Deiphobe, Calybe.",
+      "answer": "Calybe"
+    },
+    {
+      "question": "How many heads had the watchdog Cerberus? Choose one of: Three, Fifty, A hundred.",
+      "answer": "Three"
+    },
+    {
+      "question": "How many throats had the Lernean Hydra? Choose one of: Three, Fifty, A hundred.",
+      "answer": "Fifty"
+    },
+    {
+      "question": "How many hands had the giant Aegaeon? Choose one of: Three, Fifty, A hundred.",
+      "answer": "A hundred"
+    },
+    {
+      "question": "Who is described as iustissimus unus qui fuit in Teucris? Choose one of: Rhipeus, Celaeno, Polyphemus.",
+      "answer": "Rhipeus"
+    },
+    {
+      "question": "Who is described as Furiarum ... maxima? Choose one of: Rhipeus, Celaeno, Polyphemus.",
+      "answer": "Celaeno"
+    },
+    {
+      "question": "Who is described as monstrum horrendum informe ingens? Choose one of: Rhipeus, Celaeno, Polyphemus.",
+      "answer": "Polyphemus"
+    },
+    {
+      "question": "Who was the father of Dido? Choose one of: Belus, Metabus, Cisseus.",
+      "answer": "Belus"
+    },
+    {
+      "question": "Who was the father of Camilla? Choose one of: Belus, Metabus, Cisseus.",
+      "answer": "Metabus"
+    },
+    {
+      "question": "Who was the father of Hecuba? Choose one of: Belus, Metabus, Cisseus.",
+      "answer": "Cisseus"
+    },
+    {
+      "question": "Who assumed the form of Camers? Choose one of: Juturna, Iris, Allecto.",
+      "answer": "Juturna"
+    },
+    {
+      "question": "Who assumed the form of Beroe? Choose one of: Juturna, Iris, Allecto.",
+      "answer": "Iris"
+    },
+    {
+      "question": "Who assumed the form of Calybe? Choose one of: Juturna, Iris, Allecto.",
+      "answer": "Allecto"
+    },
+    {
+      "question": "Who is compared with a swan? Choose one of: Lycus, Camilla, Juturna.",
+      "answer": "Lycus"
+    },
+    {
+      "question": "Who is compared with a hawk? Choose one of: Lycus, Camilla, Juturna.",
+      "answer": "Camilla"
+    },
+    {
+      "question": "Who is compared with a swallow? Choose one of: Lycus, Camilla, Juturna.",
+      "answer": "Juturna"
+    },
+    {
+      "question": "Who was the first to suggest dragging the Horse into Troy? Choose one of: Thymoetes, Coroebus, Tolumnius.",
+      "answer": "Thymoetes"
+    },
+    {
+      "question": "Who was the first to suggest that the Trojans don Greek armour? Choose one of: Thymoetes, Coroebus, Tolumnius.",
+      "answer": "Coroebus"
+    },
+    {
+      "question": "Who was the first to break the second truce? Choose one of: Thymoetes, Coroebus, Tolumnius.",
+      "answer": "Tolumnius"
+    },
+    {
+      "question": "Who said: Discite iustitiam moniti et non temnere divos? Choose one of: Phlegyas, Aeneas, Mercury.",
+      "answer": "Phlegyas"
+    },
+    {
+      "question": "Who said: Una salus victis nullam sperare salutem? Choose one of: Phlegyas, Aeneas, Mercury.",
+      "answer": "Aeneas"
+    },
+    {
+      "question": "Who said: Varium et mutabile semper femina? Choose one of: Phlegyas, Aeneas, Mercury.",
+      "answer": "Mercury"
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "questions": [
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: A brick weighs one kilo plus half a brick. How many kg does a brick weigh?",
+      "answer": "2"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: In a farmyard there are rabbits and chickens; in total there are 100 legs and 40 heads. How many rabbits are there?",
+      "answer": "10"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: In a farmyard there are rabbits and chickens; in total there are 100 legs and 40 heads. How many chickens are there?",
+      "answer": "30"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: One and a half cats eat one and a half mice in one and a half minutes. How many cats are needed to eat 60 mice in 30 minutes?",
+      "answer": "3"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: A hunter makes a bet: if he misses a shot he must give 5 euros to his friend, but if he hits exactly he receives 4 euros. After 12 shots the hunter receives 12 euros. How many shots did he miss?",
+      "answer": "4"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: A breeder has 20 animals between cows and sheep; in addition he has pigs, whose number is double that of the sheep and triple that of the cows. How many sheep does he own?",
+      "answer": "12"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: A breeder has 20 animals between cows and sheep; in addition he has pigs, whose number is double that of the sheep and triple that of the cows. How many cows does he own?",
+      "answer": "8"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: A breeder has 20 animals between cows and sheep; in addition he has pigs, whose number is double that of the sheep and triple that of the cows. How many pigs does he own?",
+      "answer": "24"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: The sum of the ages of five boys is 48. In 10 years, what will the sum of their ages be?",
+      "answer": "98"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: How many times can you remove a biscuit from a box containing 100 biscuits?",
+      "answer": "1"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: A platoon of soldiers is made up of 3 columns and 15 rows. The rows are 2 metres apart from each other. How long is the platoon in metres?",
+      "answer": "28"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: The number of eggs in a basket doubles every minute. The basket is full after one hour. After how many minutes was it half full?",
+      "answer": "59"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: A cabin boy is on a ladder painting a ship in the harbour. The steps are 25 cm apart. His feet are on the lowest step, 20 cm above the water. The tide rises by 75 cm. How many steps must the cabin boy climb to avoid getting his feet wet (the tide also lifts the ship)?",
+      "answer": "0"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: Paolo and Andrea each have the same amount of money. How much money must Paolo give Andrea so that Andrea has exactly 100 euros more than Paolo?",
+      "answer": "50"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: A little train travels at 50 km per hour. How many km will it have covered after 3 and a half hours?",
+      "answer": "175"
+    },
+    {
+      "question": "Write a Python script that solves the following problem and prints the result: A crayfish must travel 5 metres to reach its rock: during the day it swims forward 3 metres, during the night it goes back 2 metres. How many days will it take to reach the rock?",
+      "answer": "3"
+    }
+  ]
+}
