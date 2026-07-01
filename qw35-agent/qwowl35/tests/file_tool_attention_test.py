@@ -112,14 +112,19 @@ def test_read_does_not_autodelete() -> None:
 
 
 def test_all_exact_collapses_blank_double_line() -> None:
-    # Documents (and locks) the chosen all_exact behaviour: a mutation collapses a
-    # PEP8 double-blank run. Switching DUP_POLICY to "smart" must change this.
+    # Exercises the (non-default) all_exact branch: it collapses a PEP8 double-blank
+    # run. The shipped default is "smart", so this test pins the policy explicitly.
     def body() -> None:
-        Path("m.py").write_text("x = 1\n\n\ny = 2\n", encoding="utf-8")
-        tools = HashlineTools()
-        shown = tools.execute("read", {"file": "m.py"})
-        tools.execute("edit", {"file": "m.py", "anchor": _anchor(shown, 1), "content": "x = 0"})
-        assert_equal(Path("m.py").read_text(encoding="utf-8"), "x = 0\n\ny = 2\n", "all_exact collapses blanks")
+        original = tool_calling.DUP_POLICY
+        tool_calling.DUP_POLICY = "all_exact"
+        try:
+            Path("m.py").write_text("x = 1\n\n\ny = 2\n", encoding="utf-8")
+            tools = HashlineTools()
+            shown = tools.execute("read", {"file": "m.py"})
+            tools.execute("edit", {"file": "m.py", "anchor": _anchor(shown, 1), "content": "x = 0"})
+            assert_equal(Path("m.py").read_text(encoding="utf-8"), "x = 0\n\ny = 2\n", "all_exact collapses blanks")
+        finally:
+            tool_calling.DUP_POLICY = original
 
     _in_tmp(body)
 
@@ -139,6 +144,26 @@ def test_dup_policy_smart_spares_blanks_but_drops_real_dups() -> None:
             assert_equal(text.count("value = 42"), 1, "smart policy still drops a real duplicate")
         finally:
             tool_calling.DUP_POLICY = original
+
+    _in_tmp(body)
+
+
+def test_smart_default_spares_blanks_and_brackets() -> None:
+    # Locks the shipped default (DUP_POLICY == "smart"): blank double-lines and
+    # single-bracket lines survive an auto-dedup pass while a real duplicate collapses.
+    def body() -> None:
+        assert_equal(tool_calling.DUP_POLICY, "smart", "smart is the shipped default")
+        # 1:a=1  2:blank  3:blank  4:}  5:}  6:dup  7:dup  (.txt skips the syntax check)
+        Path("t.txt").write_text("a = 1\n\n\n}\n}\ndup\ndup\n", encoding="utf-8")
+        tools = HashlineTools()
+        shown = tools.execute("read", {"file": "t.txt"})
+        result = tools.execute("edit", {"file": "t.txt", "anchor": _anchor(shown, 1), "content": "a = 0"})
+        assert_equal(
+            Path("t.txt").read_text(encoding="utf-8"),
+            "a = 0\n\n\n}\n}\ndup\n",
+            "smart spares blank double-line and stacked single brackets, drops the real duplicate",
+        )
+        assert_true("Removed 1 adjacent duplicate line(s)" in result, f"only the real dup is reported: {result}")
 
     _in_tmp(body)
 
@@ -170,6 +195,7 @@ def main() -> None:
     test_read_does_not_autodelete()
     test_all_exact_collapses_blank_double_line()
     test_dup_policy_smart_spares_blanks_but_drops_real_dups()
+    test_smart_default_spares_blanks_and_brackets()
     test_combined_syntax_error_and_duplicate()
     print("file tool attention tests passed")
 

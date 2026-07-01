@@ -47,10 +47,14 @@ MAX_READ_CHARS = 24_000
 REDUNDANT_READ_SIZE_DELTA = 0.40
 
 # F3: which consecutive-identical-line pairs the post-mutation pass auto-deletes.
-# "all_exact" removes EVERY consecutive identical pair, including blank/whitespace
-# and bracket-only lines (this WILL collapse PEP8 double-blank lines and repeated
-# ``}``/``);`` — see ``_dup_should_drop`` to switch to a smarter predicate).
-DUP_POLICY = "all_exact"
+# "smart" (default) spares lines that legitimately repeat — blank/whitespace lines,
+# single-character lines (incl. the brackets ``{`` ``}`` ``[`` ``]`` ``(`` ``)``),
+# and common stacked closers (``_TRIVIAL_DUP_EXEMPT``) — and only collapses
+# substantive duplicate content lines. "all_exact" is the alternative branch: it
+# removes EVERY consecutive identical pair, including blanks and bracket-only lines
+# (WILL collapse PEP8 double-blank lines and repeated ``}``/``);``). See
+# ``_dup_should_drop`` for the single decision point.
+DUP_POLICY = "smart"
 
 # F2: how many error rows the syntax block lists in full before summarising.
 MAX_SHOWN_SYNTAX_ANCHORS = 5
@@ -77,11 +81,12 @@ def mark_attention(text: str) -> str:
 def _dup_should_drop(prev: str, curr: str) -> bool:
     """Whether the adjacent identical pair (``prev`` == ``curr``) is auto-deleted.
 
-    Policy is :data:`DUP_POLICY`. "all_exact" drops every consecutive identical
-    line, including blanks and bracket-only lines (the user's explicit choice). To
-    soften this later, add a branch here — this is the single decision point, e.g.
-    ``stripped = curr.strip(); return bool(stripped) and len(stripped) > 1 and
-    stripped not in {"}", ");", "})", "],"}``.
+    Policy is :data:`DUP_POLICY` and this is the single decision point. "smart"
+    (the shipped default) spares lines that legitimately repeat — blanks/whitespace,
+    single-character lines (incl. brackets ``{}[]()``), and common stacked closers —
+    and only collapses substantive duplicate content. "all_exact" remains selectable
+    and drops every consecutive identical line, blanks and bracket-only lines
+    included.
     """
     if prev != curr:
         return False
