@@ -17,6 +17,7 @@ from tools.files.adapter import (  # noqa: E402
     SearchDocument,
     byte_len,
     find_line_by_query,
+    format_line_ref,
     format_short_hash,
     parse_anchor,
     resolve_query_region,
@@ -36,11 +37,16 @@ def assert_true(value, label: str) -> None:
         raise AssertionError(label)
 
 
-def _anchor(output: str, line_no: int) -> str:
-    match = re.search(rf"^{line_no}:([0-9a-f]{{2}})\|", output, re.MULTILINE)
+def _line_id(output: str, line_no: int) -> str:
+    """Extract the ``<line><hash>`` id for ``line_no`` from a beginTransaction body.
+
+    The id has no separator (the ``:`` was dropped for token efficiency); the hash
+    is the fixed final two hex chars, so the line is the leading digits.
+    """
+    match = re.search(rf"^{line_no}([0-9a-f]{{2}})\|", output, re.MULTILINE)
     if not match:
-        raise AssertionError(f"anchor for line {line_no} not found in:\n{output}")
-    return f"{line_no}:{match.group(1)}"
+        raise AssertionError(f"id for line {line_no} not found in:\n{output}")
+    return f"{line_no}{match.group(1)}"
 
 
 def test_xxh32_matches_hashline_reference_values() -> None:
@@ -50,56 +56,89 @@ def test_xxh32_matches_hashline_reference_values() -> None:
     assert_equal(short_hash_value("abc   "), short_hash_value("abc"), "trailing whitespace ignored")
 
 
-def test_read_edit_insert_delete_flow() -> None:
+def test_line_ref_has_no_separator_and_round_trips() -> None:
+    # The rendered id is line digits + 2-hex hash with NO separator, and it parses
+    # back to the same line + hash (an optional ':' is still accepted).
+    short = short_hash_value("    return 1")
+    ref = format_line_ref(12, short)
+    assert_equal(ref, f"12{format_short_hash(short)}", "no separator in id")
+    parsed = parse_anchor(ref)
+    assert_equal(parsed.line, 12, "id parses back to line")
+    assert_equal(parsed.short, short & 0xFF, "id parses back to hash")
+    assert_equal(parse_anchor("12:af").line, 12, "optional ':' still parses (line)")
+    assert_equal(parse_anchor("12:af").short, 0xAF, "optional ':' still parses (hash)")
+
+
+def test_schema_advertises_begin_transaction_only() -> None:
+    tools = HashlineTools()
+    schemas = {s["function"]["name"]: s["function"] for s in tools.schemas()}
+    assert_true("beginTransaction" in schemas, "beginTransaction advertised")
+    assert_true("read" not in schemas, "old 'read' name gone")
+    props = schemas["beginTransaction"]["parameters"]["properties"]
+    assert_equal(sorted(props), ["file"], "beginTransaction takes only 'file'")
+    for name in ("edit", "insert", "delete"):
+        assert_true("id" in schemas[name]["parameters"]["properties"], f"{name} uses 'id'")
+        assert_true("anchor" not in schemas[name]["parameters"]["properties"], f"{name} has no 'anchor'")
+    # The retired tool name is not dispatchable.
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "m.py").write_text("x = 1\n", encoding="utf-8")
+        assert_true(
+            tools.execute("read", {"file": str(Path(tmp, "m.py"))}).startswith("Error: unknown tool"),
+            "execute('read') is now unknown",
+        )
+
+
+def test_begin_transaction_edit_insert_delete_flow() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = os.getcwd()
         os.chdir(tmp)
         try:
             Path("m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("read", {"file": "m.py"})
-            return_anchor = _anchor(shown, 2)
+            shown = tools.execute("beginTransaction", {"file": "m.py"})
+            return_id = _line_id(shown, 2)
 
-            edited = tools.execute("edit", {"file": "m.py", "anchor": return_anchor, "content": "    return 2"})
+            edited = tools.execute("edit", {"file": "m.py", "id": return_id, "content": "    return 2"})
             assert_true(edited.startswith("Edited line 2"), f"edit result: {edited}")
-            assert_true("2:" in edited and "|    return 2" in edited, "fresh anchors after edit")
+            assert_true("|    return 2" in edited, "fresh ids after edit")
+            assert_true(_line_id(edited, 2), "edit snippet shows a line-2 id")
             assert_equal(Path("m.py").read_text(encoding="utf-8"), "def f():\n    return 2\n", "file edited")
 
-            reread = tools.execute("read", {"file": "m.py"})
-            def_anchor = _anchor(reread, 1)
-            inserted = tools.execute("insert", {"file": "m.py", "anchor": def_anchor, "position": "before", "content": "import os"})
+            reread = tools.execute("beginTransaction", {"file": "m.py"})
+            def_id = _line_id(reread, 1)
+            inserted = tools.execute("insert", {"file": "m.py", "id": def_id, "position": "before", "content": "import os"})
             assert_true(inserted.startswith("Inserted line 1"), f"insert result: {inserted}")
             assert_true(Path("m.py").read_text(encoding="utf-8").startswith("import os\n"), "file inserted")
 
-            after_insert = tools.execute("read", {"file": "m.py"})
-            import_anchor = _anchor(after_insert, 1)
-            deleted = tools.execute("delete", {"file": "m.py", "anchor": import_anchor})
+            after_insert = tools.execute("beginTransaction", {"file": "m.py"})
+            import_id = _line_id(after_insert, 1)
+            deleted = tools.execute("delete", {"file": "m.py", "id": import_id})
             assert_true(deleted.startswith("Deleted line 1"), f"delete result: {deleted}")
             assert_equal(Path("m.py").read_text(encoding="utf-8"), "def f():\n    return 2\n", "file deleted")
         finally:
             os.chdir(cwd)
 
 
-def test_insert_range_anchor_reports_single_anchor_guidance() -> None:
+def test_insert_range_id_reports_single_id_guidance() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = os.getcwd()
         os.chdir(tmp)
         try:
             Path("m.py").write_text("import math\n\ndef f():\n    return 1\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("read", {"file": "m.py"})
-            import_anchor = _anchor(shown, 1)
-            def_anchor = _anchor(shown, 3)
+            shown = tools.execute("beginTransaction", {"file": "m.py"})
+            import_id = _line_id(shown, 1)
+            def_id = _line_id(shown, 3)
             result = tools.execute(
                 "insert",
                 {
                     "file": "m.py",
-                    "anchor": f"{import_anchor}..{def_anchor}",
+                    "id": f"{import_id}..{def_id}",
                     "content": "import os",
                 },
             )
             assert_true(
-                "requires one line:hash anchor, not a range" in result,
+                "requires one line id, not a range" in result,
                 f"range insert guidance: {result}",
             )
             assert_true("position='after'" in result and "position='before'" in result, f"range insert repair hints: {result}")
@@ -108,26 +147,29 @@ def test_insert_range_anchor_reports_single_anchor_guidance() -> None:
             os.chdir(cwd)
 
 
-def test_stale_anchor_reports_context() -> None:
+def test_stale_id_reports_context_and_flips_on_edit() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = os.getcwd()
         os.chdir(tmp)
         try:
             Path("m.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("read", {"file": "m.txt"})
-            beta_anchor = _anchor(shown, 2)
+            shown = tools.execute("beginTransaction", {"file": "m.txt"})
+            beta_id = _line_id(shown, 2)
+            # The content cross-check must flip when the line content changes.
             Path("m.txt").write_text("alpha\nchanged\ngamma\n", encoding="utf-8")
-            result = tools.execute("edit", {"file": "m.txt", "anchor": beta_anchor, "content": "new"})
+            reopened = tools.execute("beginTransaction", {"file": "m.txt", "_force": True})
+            assert_true(_line_id(reopened, 2) != beta_id, "id flips when line content changes")
+            result = tools.execute("edit", {"file": "m.txt", "id": beta_id, "content": "new"})
             assert_true(result.startswith("Error: stale anchor"), f"stale result: {result}")
-            assert_true(">>> 2:" in result, "stale context points at current line")
+            assert_true(">>> 2" in result, "stale context points at current line")
         finally:
             os.chdir(cwd)
 
 
-def test_anchor_parser_rejects_copied_line_rows() -> None:
+def test_id_parser_rejects_copied_line_rows() -> None:
     try:
-        parse_anchor("1:aa|content")
+        parse_anchor("1aa|content")
     except Exception:
         return
     raise AssertionError("parse_anchor accepted a copied read row")
@@ -168,9 +210,9 @@ def test_document_content_len_uses_utf8_bytes_and_loads_meta() -> None:
         assert_true(doc.file_meta is not None, "file_meta loaded")
 
 
-def test_start_end_keyword_anchors_resolve_positionally() -> None:
-    # The model emits bare "start"/"end" anchors by nature; they must resolve to
-    # the first/last line without any hash, across all four tools.
+def test_start_end_keyword_ids_resolve_positionally() -> None:
+    # The model emits bare "start"/"end" ids by nature; they must resolve to the
+    # first/last line without any hash, across all four tools.
     with tempfile.TemporaryDirectory() as tmp:
         cwd = os.getcwd()
         os.chdir(tmp)
@@ -180,7 +222,7 @@ def test_start_end_keyword_anchors_resolve_positionally() -> None:
 
             appended = tools.execute(
                 "insert",
-                {"file": "m.py", "anchor": "end", "position": "after", "content": "d = 4"},
+                {"file": "m.py", "id": "end", "position": "after", "content": "d = 4"},
             )
             assert_true(appended.startswith("Inserted line 4"), f"append at end: {appended}")
             assert_equal(
@@ -191,7 +233,7 @@ def test_start_end_keyword_anchors_resolve_positionally() -> None:
 
             prepended = tools.execute(
                 "insert",
-                {"file": "m.py", "anchor": "start", "position": "before", "content": "import x"},
+                {"file": "m.py", "id": "start", "position": "before", "content": "import x"},
             )
             assert_true(prepended.startswith("Inserted line 1"), f"prepend at start: {prepended}")
             assert_true(
@@ -200,7 +242,7 @@ def test_start_end_keyword_anchors_resolve_positionally() -> None:
             )
 
             edited = tools.execute(
-                "edit", {"file": "m.py", "anchor": "END", "content": "d = 40"}
+                "edit", {"file": "m.py", "id": "END", "content": "d = 40"}
             )
             assert_true(edited.startswith("Edited line 5"), f"edit end (caps): {edited}")
             assert_true(
@@ -209,7 +251,7 @@ def test_start_end_keyword_anchors_resolve_positionally() -> None:
             )
 
             deleted = tools.execute(
-                "delete", {"file": "m.py", "anchor": "start"}
+                "delete", {"file": "m.py", "id": "start"}
             )
             assert_true(deleted.startswith("Deleted line 1"), f"delete start: {deleted}")
             assert_true(
@@ -217,11 +259,11 @@ def test_start_end_keyword_anchors_resolve_positionally() -> None:
                 "start deletes the first line",
             )
 
-            shown = tools.execute("read", {"file": "m.py", "anchor": "end", "context": 1})
-            assert_true("d = 40" in shown, f"read end shows the tail: {shown}")
+            shown = tools.execute("beginTransaction", {"file": "m.py"})
+            assert_true("d = 40" in shown, f"beginTransaction shows the tail: {shown}")
 
-            bogus = tools.execute("edit", {"file": "m.py", "anchor": "nope", "content": "x"})
-            assert_true(bogus.startswith("Error: invalid anchor"), f"bogus anchor still errors: {bogus}")
+            bogus = tools.execute("edit", {"file": "m.py", "id": "nope", "content": "x"})
+            assert_true(bogus.startswith("Error: invalid anchor"), f"bogus id still errors: {bogus}")
         finally:
             os.chdir(cwd)
 
@@ -235,11 +277,11 @@ def test_noop_edit_reports_no_changes() -> None:
         try:
             Path("m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("read", {"file": "m.py"})
-            return_anchor = _anchor(shown, 2)
+            shown = tools.execute("beginTransaction", {"file": "m.py"})
+            return_id = _line_id(shown, 2)
 
             # Resend the exact existing content: a byte-identical no-op edit.
-            result = tools.execute("edit", {"file": "m.py", "anchor": return_anchor, "content": "    return 1"})
+            result = tools.execute("edit", {"file": "m.py", "id": return_id, "content": "    return 1"})
             assert_true("No changes were made" in result, f"no-op edit must say so: {result}")
             assert_true("byte-identical" in result, f"no-op note explains why: {result}")
             assert_true("Diff:" not in result, f"no-op edit has no diff: {result}")
@@ -250,15 +292,17 @@ def test_noop_edit_reports_no_changes() -> None:
 
 def main() -> None:
     test_xxh32_matches_hashline_reference_values()
-    test_read_edit_insert_delete_flow()
+    test_line_ref_has_no_separator_and_round_trips()
+    test_schema_advertises_begin_transaction_only()
+    test_begin_transaction_edit_insert_delete_flow()
     test_noop_edit_reports_no_changes()
-    test_insert_range_anchor_reports_single_anchor_guidance()
-    test_stale_anchor_reports_context()
-    test_anchor_parser_rejects_copied_line_rows()
+    test_insert_range_id_reports_single_id_guidance()
+    test_stale_id_reports_context_and_flips_on_edit()
+    test_id_parser_rejects_copied_line_rows()
     test_query_region_and_search_document_match_hashline_names()
     test_document_stats_and_stream_replace_line()
     test_document_content_len_uses_utf8_bytes_and_loads_meta()
-    test_start_end_keyword_anchors_resolve_positionally()
+    test_start_end_keyword_ids_resolve_positionally()
     print("hashline tool tests passed")
 
 

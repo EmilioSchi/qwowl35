@@ -10,7 +10,7 @@ from typing import Iterable
 
 from .anchor import ResolvedLine
 from .document import Document, FileStats, LineRecord, LineView, NewlineStyle
-from .hash import format_short_hash, write_short_hash_bytes
+from .hash import format_line_ref, format_short_hash, write_short_hash_bytes
 
 MAX_DIFF_CHARS = 12_000
 
@@ -74,7 +74,7 @@ def print_read(doc: Document) -> str:
 
 
 def print_compact_read(doc: Document, anchors: list[str] | None = None, context: int = 5) -> str:
-    return "\n".join(f"{idx + 1}:{format_short_hash(line.short_hash)}" for idx, line in enumerate(doc.lines)) + ("\n" if doc.lines else "")
+    return "\n".join(format_line_ref(idx + 1, line.short_hash) for idx, line in enumerate(doc.lines)) + ("\n" if doc.lines else "")
 
 
 def print_read_json(doc: Document, style: str = JsonStyle.Compact, compact: bool = False) -> str:
@@ -117,7 +117,7 @@ def print_read_context(
 def print_index(doc: Document, compact: bool = False) -> str:
     if compact:
         return "\n".join(str(idx + 1) for idx, _line in enumerate(doc.lines)) + ("\n" if doc.lines else "")
-    return "\n".join(f"{idx + 1}:{format_short_hash(line.short_hash)}" for idx, line in enumerate(doc.lines)) + ("\n" if doc.lines else "")
+    return "\n".join(format_line_ref(idx + 1, line.short_hash) for idx, line in enumerate(doc.lines)) + ("\n" if doc.lines else "")
 
 
 def print_index_json(doc: Document, compact: bool = False, style: str = JsonStyle.Compact) -> str:
@@ -180,7 +180,7 @@ def print_grep_pretty_streaming(search_doc, pattern: str, invert: bool = False) 
 
 
 def print_line_views(lines: list[LineView]) -> str:
-    return "\n".join(f"{line.n}:{line.hash}|{line.content}" for line in lines) + ("\n" if lines else "")
+    return "\n".join(f"{line.n}{line.hash}|{line.content}" for line in lines) + ("\n" if lines else "")
 
 
 def write_grep_json(lines: list[LineView], style: str = JsonStyle.Compact) -> str:
@@ -204,7 +204,7 @@ def write_json_success(value, style: str = JsonStyle.Compact) -> str:
 
 
 def line_view(line_no: int, line: LineRecord) -> str:
-    return f"{line_no}:{format_short_hash(line.short_hash)}|{line.content}"
+    return f"{format_line_ref(line_no, line.short_hash)}|{line.content}"
 
 
 def render_lines(doc: Document, indexes: Iterable[int]) -> str:

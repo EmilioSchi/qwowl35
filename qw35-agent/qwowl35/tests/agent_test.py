@@ -246,8 +246,8 @@ def test_file_edits_are_not_deduped() -> None:
     # Edit tools must always re-run: a content-free "already did that" denial can
     # mislead the model into thinking a failed edit landed.
     turns = [
-        AssistantTurn(tool_calls=[call("edit", {"path": "a.py", "anchor": "1:af", "text": "x"})]),
-        AssistantTurn(tool_calls=[call("edit", {"path": "a.py", "anchor": "1:af", "text": "x"})]),  # identical
+        AssistantTurn(tool_calls=[call("edit", {"file": "a.py", "id": "1af", "content": "x"})]),
+        AssistantTurn(tool_calls=[call("edit", {"file": "a.py", "id": "1af", "content": "x"})]),  # identical
         AssistantTurn(content="done"),
     ]
     agent, registry, _ = make_agent(turns)
@@ -328,7 +328,7 @@ def test_completed_tool_history_is_compacted() -> None:
                         "arguments": json.dumps(
                             {
                                 "file": "m.py",
-                                "anchor": "2:aa",
+                                "id": "2aa",
                                 "content": huge,
                             }
                         ),
@@ -345,7 +345,7 @@ def test_completed_tool_history_is_compacted() -> None:
     serialized = json.dumps(agent.messages)
     assert_true(huge not in serialized, "large payload removed")
     assert_true("tool_calls" not in serialized, "tool-call objects removed")
-    assert_true("edit on m.py at 2:aa" in serialized, "summary keeps locator")
+    assert_true("edit on m.py at 2aa" in serialized, "summary keeps locator")
     assert_equal(agent.messages[-1]["content"], "done", "final assistant text kept")
 
 
@@ -494,7 +494,7 @@ def test_repeated_rewrite_escalates() -> None:
         firm = results[i].split("\n\n", 1)[1]
         assert_true(firm not in pool, "third+ write escalates beyond the soft pool")
         assert_true("STOP" in firm, "escalation is firm")
-        assert_true("read" in firm and "edit" in firm,
+        assert_true("beginTransaction" in firm and "edit" in firm,
                     "escalation names the edit tools")
     # The escalated rewrites are flagged as errors (not appended to a success).
     bash_errors = [is_err for name, _, is_err in ui.chat.tool_results if name == "bash"]
@@ -646,7 +646,7 @@ def test_model_sees_raw_tool_result_not_the_rendered_view() -> None:
 
             # The model sees the raw advisory text and raw pipe anchors...
             assert_true("You just wrote `app.py`" in model_content, "advisory text is model-facing")
-            assert_true(re.search(r"\d+:[0-9a-f]{2}\|def f", model_content), "raw pipe anchors present")
+            assert_true(re.search(r"\d+[0-9a-f]{2}\|def f", model_content), "raw pipe ids present")
             # ...and NONE of the render-only decoration.
             assert_true("Model also received" not in model_content, "preview label must not reach the model")
             assert_true(">_" not in model_content and "<>" not in model_content, "badges must not reach the model")
@@ -672,7 +672,7 @@ def test_auto_read_suppressed_after_model_read_unchanged_file() -> None:
         try:
             Path("util.py").write_text("x = 1\n", encoding="utf-8")
             tools = HashlineTools()
-            tools.execute("read", {"file": "util.py"})  # model already has anchors
+            tools.execute("beginTransaction", {"file": "util.py"})  # model already has ids
             # The file is unchanged, so a write command that does not alter it is
             # suppressed (model already holds the current anchors).
             assert_equal(
@@ -699,7 +699,7 @@ def test_attention_marker_is_stripped_and_flags_error() -> None:
             return TOOL_ATTENTION_MARKER + "Edited line 1.\n\nSyntax check (python) — 1 issue(s):"
 
     turns = [
-        AssistantTurn(tool_calls=[call("edit", {"file": "a.py", "anchor": "1:af", "content": "x"})]),
+        AssistantTurn(tool_calls=[call("edit", {"file": "a.py", "id": "1af", "content": "x"})]),
         AssistantTurn(content="done"),
     ]
     agent, _registry, ui = make_agent(turns)

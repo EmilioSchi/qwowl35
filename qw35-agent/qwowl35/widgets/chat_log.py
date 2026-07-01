@@ -54,7 +54,7 @@ def _code_theme() -> str:
 def _markdown(text: str) -> Markdown:
     """Markdown renderable using the mode-appropriate code-block theme."""
     return Markdown(text, code_theme=_code_theme())
-_HASHLINE_ANCHOR_LINE = re.compile(r"^\s*(\d+:[0-9a-f]{2})\|(.*)$", re.IGNORECASE)
+_HASHLINE_ANCHOR_LINE = re.compile(r"^\s*(\d+:?[0-9a-f]{2})\|(.*)$", re.IGNORECASE)
 _DIFF_HUNK = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
 # First lines of the advisory blocks the agent appends to a tool result for the
 # model (post-write anchor reads, syntax-check notes). Used to peel them off the
@@ -65,7 +65,7 @@ _FILE_CHANGE_TOOLS = {
     "insert",
     "delete",
 }
-_FILE_READ_TOOLS = {"read"}
+_FILE_READ_TOOLS = {"beginTransaction"}
 _FILE_VIEW_TOOLS = _FILE_READ_TOOLS | _FILE_CHANGE_TOOLS
 _CURSOR = "▋"  # trailing block cursor while a command types out
 # Shell / code / diff colors are read from ``theme.*`` at render time (below) so
@@ -188,7 +188,7 @@ def _compact_args(args: dict[str, Any]) -> str:
     if not args:
         return ""
     parts: list[str] = []
-    for key in ("file", "path", "pattern", "symbol", "anchor", "position", "mode", "from", "to"):
+    for key in ("file", "pattern", "symbol", "id", "position", "mode", "from", "to"):
         value = args.get(key)
         if value not in (None, ""):
             parts.append(f"{key}={value!r}")
@@ -219,7 +219,7 @@ def _command_from_args(buffer: str) -> str:
 
 _TOOL_BADGES = {
     "bash": ">_",
-    "read": "<>",
+    "beginTransaction": "<>",
     "insert": "++",
     "delete": "--",
     "edit": "~~",
@@ -384,9 +384,9 @@ def _path_from_args(args: dict[str, Any]) -> str:
 
 
 def _anchor_header(path: str) -> str:
-    """The anchors header the read tool emits on a file's first read."""
+    """The ids header the beginTransaction tool emits on a file's first open."""
     label = path or "file"
-    return f"{label} (anchors: each line is '<line>:<hash>|<content>'):"
+    return f"{label} (ids: each line is '<line><hash>|<content>'):"
 
 
 def _partition_anchored(lines: list[str]) -> tuple[list[str], list[str]]:
@@ -415,7 +415,7 @@ def _parse_file_view(body: str, fallback_path: str = "") -> tuple[str, str, list
     path = fallback_path
 
     for i, line in enumerate(lines):
-        if "(anchors" in line or "(hashline anchors" in line:
+        if "(ids" in line or "(anchors" in line or "(hashline anchors" in line:
             header_index = i
             head = line[len("Current "):] if line.startswith("Current ") else line
             path = head.split(" (", 1)[0].strip() or path

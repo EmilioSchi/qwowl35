@@ -7,7 +7,7 @@ from pathlib import Path
 from .commands.common import atomic_write
 from .document import Document, LineRecord, byte_len
 from .error import HashlineError
-from .hash import ShortHash, format_short_hash, full_hash, short_from_full, short_hash_value
+from .hash import ShortHash, format_line_ref, format_short_hash, full_hash, short_from_full, short_hash_value
 from .document import NewlineStyle
 
 
@@ -159,7 +159,7 @@ def stream_replace_line(
     actual_hash = short_hash_value(lines[target_line])
     if actual_hash != expected_hash:
         raise HashlineError(
-            f"stale anchor {target_line + 1}:{format_short_hash(expected_hash)} in {file_path}; "
+            f"stale anchor {format_line_ref(target_line + 1, expected_hash)} in {file_path}; "
             f"current line hash is {format_short_hash(actual_hash)}."
         )
     lines[target_line] = new_content

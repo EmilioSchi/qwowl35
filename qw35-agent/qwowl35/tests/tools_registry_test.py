@@ -40,7 +40,7 @@ def test_registry_exposes_only_active_tools() -> None:
     names = [schema["function"]["name"] for schema in ToolRegistry().schemas()]
     assert_true(
         names == [
-            "read",
+            "beginTransaction",
             "edit",
             "insert",
             "delete",
@@ -50,7 +50,7 @@ def test_registry_exposes_only_active_tools() -> None:
     )
 
 
-def test_file_mutation_schemas_are_anchor_only() -> None:
+def test_file_mutation_schemas_are_id_only() -> None:
     schemas = {
         schema["function"]["name"]: schema["function"]["parameters"]
         for schema in ToolRegistry().schemas()
@@ -61,25 +61,27 @@ def test_file_mutation_schemas_are_anchor_only() -> None:
             "delete",
         }
     }
-    assert_true(schemas["edit"]["required"] == ["file", "anchor", "content"], "edit required args")
-    assert_true(schemas["insert"]["required"] == ["file", "anchor", "content"], "insert required args")
-    assert_true(schemas["delete"]["required"] == ["file", "anchor"], "delete required args")
+    assert_true(schemas["edit"]["required"] == ["file", "id", "content"], "edit required args")
+    assert_true(schemas["insert"]["required"] == ["file", "id", "content"], "insert required args")
+    assert_true(schemas["delete"]["required"] == ["file", "id"], "delete required args")
     for name, params in schemas.items():
         props = params["properties"]
         assert_true("start_query" not in props and "end_query" not in props, f"{name} hides query args")
-    insert_anchor_description = schemas["insert"]["properties"]["anchor"]["description"].lower()
-    assert_true("range" not in insert_anchor_description, "insert anchor schema must not advertise ranges")
-    edit_anchor_description = schemas["edit"]["properties"]["anchor"]["description"].lower()
-    delete_anchor_description = schemas["delete"]["properties"]["anchor"]["description"].lower()
-    assert_true("range" in edit_anchor_description, "edit anchor schema advertises ranges")
-    assert_true("range" in delete_anchor_description, "delete anchor schema advertises ranges")
+        assert_true("anchor" not in props, f"{name} uses 'id', not 'anchor'")
+    insert_id_description = schemas["insert"]["properties"]["id"]["description"].lower()
+    assert_true("range" not in insert_id_description, "insert id schema must not advertise ranges")
+    edit_id_description = schemas["edit"]["properties"]["id"]["description"].lower()
+    delete_id_description = schemas["delete"]["properties"]["id"]["description"].lower()
+    assert_true("range" in edit_id_description, "edit id schema advertises ranges")
+    assert_true("range" in delete_id_description, "delete id schema advertises ranges")
 
 
-def test_read_schema_does_not_advertise_large_file_workflow() -> None:
-    read = next(schema["function"] for schema in ToolRegistry().schemas() if schema["function"]["name"] == "read")
-    serialized = json.dumps(read)
-    assert_true("large" not in serialized.lower(), "read schema avoids large-file workflow")
-    assert_true("bash/rg" not in serialized, "read schema avoids bash/rg handoff")
+def test_begin_transaction_schema_does_not_advertise_large_file_workflow() -> None:
+    begin = next(schema["function"] for schema in ToolRegistry().schemas() if schema["function"]["name"] == "beginTransaction")
+    serialized = json.dumps(begin)
+    assert_true("large" not in serialized.lower(), "beginTransaction schema avoids large-file workflow")
+    assert_true("bash/rg" not in serialized, "beginTransaction schema avoids bash/rg handoff")
+    assert_true(sorted(begin["parameters"]["properties"]) == ["file"], "beginTransaction takes only 'file'")
 
 
 def test_old_mutation_tool_names_are_not_accepted() -> None:
@@ -146,8 +148,8 @@ def test_bash_runs_recovered_dangling_quote_command() -> None:
 def main() -> None:
     test_bash_can_write_files()
     test_registry_exposes_only_active_tools()
-    test_file_mutation_schemas_are_anchor_only()
-    test_read_schema_does_not_advertise_large_file_workflow()
+    test_file_mutation_schemas_are_id_only()
+    test_begin_transaction_schema_does_not_advertise_large_file_workflow()
     test_old_mutation_tool_names_are_not_accepted()
     test_bash_reports_invalid_json_before_missing_command()
     test_bash_reports_non_object_json_args()

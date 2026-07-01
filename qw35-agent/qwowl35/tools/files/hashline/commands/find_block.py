@@ -105,4 +105,4 @@ def find_block_payload(doc: Document, target_idx: int) -> FindBlockPayload:
 def run(cmd) -> str:
     doc = Document.load(cmd.file)
     payload = find_block_payload(doc, cmd.line - 1)
-    return "\n".join(f"{line.n}:{line.hash}|{line.content}" for line in payload.lines) + "\n"
+    return "\n".join(f"{line.n}{line.hash}|{line.content}" for line in payload.lines) + "\n"

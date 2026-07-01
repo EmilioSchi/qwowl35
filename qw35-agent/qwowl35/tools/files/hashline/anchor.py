@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from .document import Document, ShortHashIndex
 from .error import HashlineError
-from .hash import ShortHash, format_short_hash
+from .hash import ShortHash, format_line_ref, format_short_hash
 
 FUZZY_RELOCATE_RADIUS = 3
+
+# A qualified locator is line digits + a fixed 2-hex content hash with no
+# separator (e.g. "12af"). The former ":" was dropped for token efficiency; it
+# is still accepted as an OPTIONAL separator so a stray "12:af" from the model
+# still parses. The hash is always the final two hex chars, so the split is
+# unambiguous (line = the leading digits).
+_QUALIFIED_ANCHOR = re.compile(r"(\d+):?([0-9a-f]{2})")
 
 
 @dataclass(frozen=True)
@@ -55,10 +63,10 @@ def parse_anchor(s: str) -> Anchor:
     normalized = normalize_anchor_input(trimmed)
     if ".." in normalized:
         raise HashlineError(f"invalid anchor {trimmed!r}")
-    if ":" in normalized:
-        line_text, short_text = normalized.split(":", 1)
-        line = parse_line_number(line_text, s)
-        short = parse_short_hash(short_text, s)
+    qualified = _QUALIFIED_ANCHOR.fullmatch(normalized)
+    if qualified:
+        line = parse_line_number(qualified.group(1), s)
+        short = parse_short_hash(qualified.group(2), s)
         return Anchor(line=line, short=short)
     short = parse_short_hash(normalized, s)
     return Anchor(short=short)
@@ -184,7 +192,7 @@ def resolve_qualified(
     rendered_short = format_short_hash(short)
     idx = line - 1
     if idx < 0 or idx >= len(doc.lines):
-        raise HashlineError(f"invalid anchor {line}:{rendered_short}")
+        raise HashlineError(f"invalid anchor {line}{rendered_short}")
 
     actual = doc.lines[idx]
     if actual.short_hash == short:
@@ -208,7 +216,7 @@ def resolve_qualified(
 
     relocated_suffix = stale_anchor_context(doc, idx, rendered_short, candidates)
     raise HashlineError(
-        f"stale anchor {line}:{rendered_short} in {path}; current line hash is "
+        f"stale anchor {line}{rendered_short} in {path}; current line hash is "
         f"{format_short_hash(actual.short_hash)}.{relocated_suffix}"
     )
 
@@ -230,7 +238,7 @@ def stale_anchor_context(
         hash_text = format_short_hash(line_record.short_hash)
         content = line_record.content
         display = content[:80] + "..." if len(content) > 80 else content
-        context += f"{prefix}{line_no}:{hash_text}|{display}\n"
+        context += f"{prefix}{line_no}{hash_text}|{display}\n"
     if candidates:
         lines = ", ".join(str(idx + 1) for idx in candidates)
         context += f"(hash {rendered_short} also at line(s) {lines})\n"
@@ -346,4 +354,4 @@ def display_anchor(anchor: Anchor) -> str:
         return f"block {anchor.block_line}:"
     if anchor.line is None:
         return format_short_hash(anchor.short or 0)
-    return f"{anchor.line}:{format_short_hash(anchor.short or 0)}"
+    return format_line_ref(anchor.line, anchor.short or 0)

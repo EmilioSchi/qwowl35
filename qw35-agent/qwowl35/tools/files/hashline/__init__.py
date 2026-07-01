@@ -52,6 +52,7 @@ from .error import HashlineError
 from .hash import (
     ShortHash,
     collides,
+    format_line_ref,
     format_short_hash,
     full_hash,
     full_hash64,
@@ -108,6 +109,7 @@ __all__ = [
     "empty_index",
     "estimate_read_tokens",
     "find_line_by_query",
+    "format_line_ref",
     "format_short_hash",
     "full_hash",
     "full_hash64",

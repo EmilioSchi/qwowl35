@@ -25,9 +25,9 @@ relative paths. Platform: <<PLATFORM>>.
 
 Do not emit JSON inside <tool_call>. Use nested XML; do not put arguments as XML attributes.
 Each call has one <function=tool_name> element and child <parameter=name>value</parameter> elements.
-Do not wrap one tool inside bash; use read and edit tools directly.
+Do not wrap one tool inside bash; use the file tools directly.
 
-Work loop: search/read -> mutate by anchor -> verify with bash."""
+Work loop: beginTransaction -> mutate by id -> verify with bash."""
 
 # Default guidance order when no registry is supplied (matches ToolRegistry's
 # schemas() order: file tools first, then bash).

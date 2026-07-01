@@ -248,8 +248,8 @@ def test_bash_result_recovers_command_equals_typo() -> None:
 
 
 def test_tool_call_detail_pads_background_to_width() -> None:
-    block = ToolBlock("read")
-    block.args_buf = '{"path":"example.py"}'
+    block = ToolBlock("beginTransaction")
+    block.args_buf = '{"file":"example.py"}'
 
     ansi = _ansi(ChatView()._render_tool_call(block), width=40)
 
@@ -258,19 +258,19 @@ def test_tool_call_detail_pads_background_to_width() -> None:
 
 
 def test_read_result_keeps_anchors() -> None:
-    block = ToolBlock("read")
-    block.args_buf = '{"path":"example.py"}'
+    block = ToolBlock("beginTransaction")
+    block.args_buf = '{"file":"example.py"}'
     block.full_result = (
-        "example.py (anchors: each line is '<line>:<hash>|<content>'):\n"
-        "1:af|def f():\n"
-        "2:30|    return 1\n"
-        "3:b2|abc  = 2"
+        "example.py (ids: each line is '<line><hash>|<content>'):\n"
+        "1af|def f():\n"
+        "230|    return 1\n"
+        "3b2|abc  = 2"
     )
 
     text = _plain(ChatView()._render_tool_result(block))
 
     assert_true("<>  example.py" in text, "read badge includes path")
-    assert_true("1:af" in text, "anchor shown")
+    assert_true("1af" in text, "anchor shown")
     assert_true("def f():" in text and "    return 1" in text, "code content shown")
     assert_true("abc  = 2" in text, "plain source with two spaces is not parsed as a hidden anchor")
 
@@ -287,9 +287,9 @@ def test_edit_result_shows_diff_before_refreshed_labels() -> None:
         " def f():\n"
         "-    return 1\n"
         "+    return 2\n"
-        "Current example.py (anchors, lines 1-2: each line is '<line>:<hash>|<content>'):\n"
-        "1:af|def f():\n"
-        "2:92|    return 2"
+        "Current example.py (ids, lines 1-2: each line is '<line><hash>|<content>'):\n"
+        "1af|def f():\n"
+        "292|    return 2"
     )
 
     text = _plain(ChatView()._render_tool_result(block))
@@ -299,16 +299,16 @@ def test_edit_result_shows_diff_before_refreshed_labels() -> None:
     # context rows: "-" + " " + original "    return 1".
     assert_true("-     return 1" in text, "removed line shown")
     assert_true("+     return 2" in text, "added line shown")
-    assert_true("Current example.py" in text and "2:92" in text, "refreshed anchors shown")
+    assert_true("Current example.py" in text and "292" in text, "refreshed anchors shown")
 
 
 _AUTOREAD_RESULT = (
     "(no output)\n\n"
-    "You just wrote `greet.py`. Its current line anchors are below — edit it in "
-    "place with edit; no separate read needed:\n"
-    "greet.py (anchors: each line is '<line>:<hash>|<content>'):\n"
-    "1:7b|def greet():\n"
-    "2:a7|    return 1\n\n"
+    "You just wrote `greet.py`. Its current line ids are below — edit it in "
+    "place with edit; no separate beginTransaction needed:\n"
+    "greet.py (ids: each line is '<line><hash>|<content>'):\n"
+    "17b|def greet():\n"
+    "2a7|    return 1\n\n"
     "Syntax check (python): OK — no syntax errors."
 )
 
@@ -340,27 +340,27 @@ def test_bash_post_write_anchors_render_as_file_view() -> None:
     assert_true("You just wrote `greet.py`" in text, "auto-read intro shown")
     # The anchors render with the read file view (anchor gutter + code), so the
     # raw 'line:hash|content' text is gone.
-    assert_true("1:7b" in text and "def greet():" in text, "anchors rendered as code")
-    assert_true("1:7b|def greet():" not in text, "raw anchor pipe replaced by file view")
+    assert_true("17b" in text and "def greet():" in text, "anchors rendered as code")
+    assert_true("17b|def greet():" not in text, "raw anchor pipe replaced by file view")
     assert_true("Syntax check (python): OK" in text, "clean-file confirmation shown")
 
 
 def test_read_shows_syntax_status() -> None:
-    ok = ToolBlock("read")
+    ok = ToolBlock("beginTransaction")
     ok.args_buf = '{"file":"ok.py"}'
     ok.full_result = (
-        "ok.py (anchors: each line is '<line>:<hash>|<content>'):\n"
-        "1:7b|def g():\n2:a7|    return 1\n\n"
+        "ok.py (ids: each line is '<line><hash>|<content>'):\n"
+        "17b|def g():\n2a7|    return 1\n\n"
         "Syntax check (python): OK — no syntax errors."
     )
     assert_true("Syntax check (python): OK" in _plain(ChatView()._render_tool_result(ok)),
                 "read of a clean file shows the OK status")
 
-    bad = ToolBlock("read")
+    bad = ToolBlock("beginTransaction")
     bad.args_buf = '{"file":"bad.py"}'
     bad.full_result = (
-        "bad.py (anchors: each line is '<line>:<hash>|<content>'):\n"
-        "1:cc|def oops(\n\n"
+        "bad.py (ids: each line is '<line><hash>|<content>'):\n"
+        "1cc|def oops(\n\n"
         "Syntax check (python) — 1 issue(s):\n- line 1, col 1: unexpected 'def oops('"
     )
     assert_true("issue(s)" in _plain(ChatView()._render_tool_result(bad)),
@@ -382,22 +382,22 @@ def test_render_is_display_only_and_non_mutating() -> None:
     assert_true("Model also received" in text and "Model also received" not in source,
                 "preview label is render-only")
     assert_true(">_" in text and ">_" not in source, "bash badge is render-only")
-    assert_true("1:7b|def greet():" in source, "source keeps the raw pipe anchors")
-    assert_true("1:7b|def greet():" not in text, "render replaces the pipe with the file-view gutter")
-    assert_true("1:7b  def greet():" in text, "rendered anchors use the gutter form")
+    assert_true("17b|def greet():" in source, "source keeps the raw pipe anchors")
+    assert_true("17b|def greet():" not in text, "render replaces the pipe with the file-view gutter")
+    assert_true("17b  def greet():" in text, "rendered anchors use the gutter form")
 
     # Same separation for a plain read result.
-    rf = ToolBlock("read")
+    rf = ToolBlock("beginTransaction")
     rf.args_buf = '{"file":"app.py"}'
     rf.full_result = (
-        "app.py (anchors: each line is '<line>:<hash>|<content>'):\n"
-        "1:7b|def f():\n2:a7|    return 1"
+        "app.py (ids: each line is '<line><hash>|<content>'):\n"
+        "17b|def f():\n2a7|    return 1"
     )
     rf_source = rf.full_result
     rf_text = _plain(ChatView()._render_tool_result(rf))
     assert_true(rf.full_result == rf_source, "read render did not mutate full_result")
     assert_true("<>" in rf_text and "<>" not in rf_source, "read badge is render-only")
-    assert_true("1:7b|def f():" in rf_source and "1:7b|def f():" not in rf_text,
+    assert_true("17b|def f():" in rf_source and "17b|def f():" not in rf_text,
                 "read source keeps the pipe; render uses the gutter")
 
 

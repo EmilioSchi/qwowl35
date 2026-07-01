@@ -19,7 +19,7 @@ COMPACT_ARG_CHARS = 140
 COMPACT_RESULT_CHARS = 220
 MALFORMED_TOOL_CALL_MAX_RETRIES = 3
 MALFORMED_TOOL_CALL_PATTERN = re.compile(
-    r"<tool_call\b[\s\S]*?<\s*(?:function(?:\b|=)|bash|read|edit|insert|delete)\b",
+    r"<tool_call\b[\s\S]*?<\s*(?:function(?:\b|=)|bash|beginTransaction|edit|insert|delete)\b",
     re.IGNORECASE,
 )
 MALFORMED_TOOL_CALL_FEEDBACK = (
@@ -28,7 +28,7 @@ MALFORMED_TOOL_CALL_FEEDBACK = (
     "Use exactly one <function=tool_name> element inside <tool_call>. "
     "Put arguments in child <parameter=name>value</parameter> elements; do not use JSON or XML attributes for arguments. "
     "Escape XML text as &amp;, &lt;, and &gt; when those characters are literal content; raw quotes are okay in parameter text. "
-    "For creating or replacing a whole file, prefer a bash heredoc command; for editing an existing non-empty file, read anchors first and use edit/insert/delete."
+    "For creating or replacing a whole file, prefer a bash heredoc command; for editing an existing non-empty file, beginTransaction for line ids first and use edit/insert/delete."
 )
 
 # When a turn ends with no tool call but the text reads as if the model was still
@@ -40,7 +40,7 @@ CONTINUATION_FEEDBACK = (
     "You ended your turn without calling a tool, but your message reads as if you "
     "were still working — you described a next step and then stopped. If you are not "
     "finished, continue now by calling the next tool (run the program to check its "
-    "output, read for anchors, or edit to fix a line). If "
+    "output, beginTransaction for line ids, or edit to fix a line). If "
     "the task really is complete, reply with a brief explicit confirmation."
 )
 
@@ -114,12 +114,12 @@ def _bash_syntax_warning(arguments: object) -> str:
 # not read as a stuck loop. Each note names the file and points at read +
 # the edit family; none forbids the rewrite outright.
 REWRITE_ADVICE_NOTES = (
-    "Note: `{file}` was already written earlier in this session. To change it, read its anchors with `read` and apply `edit`/`insert`/`delete` instead of rewriting the whole file.",
-    "Heads up: that replaced all of `{file}` again. For a targeted change, prefer `read` plus the anchored edit tools over a full `cat >` rewrite.",
-    "`{file}` already exists from a previous write — editing it in place with `read` and `edit` is cheaper than re-emitting the entire file each time.",
-    "Reminder: you already created `{file}`. Land later edits via `read` for anchors, then `edit`/`insert`/`delete`, rather than overwriting it wholesale.",
-    "This rewrote `{file}` from scratch again. When a file already exists, read its anchors and use the line-edit tools so unrelated lines stay untouched.",
-    "Tip: for an existing file like `{file}`, the anchored edit tools (`read` + `edit`) change just what you need — no need to re-send the whole file through bash.",
+    "Note: `{file}` was already written earlier in this session. To change it, get its line ids with `beginTransaction` and apply `edit`/`insert`/`delete` instead of rewriting the whole file.",
+    "Heads up: that replaced all of `{file}` again. For a targeted change, prefer `beginTransaction` plus the id-based edit tools over a full `cat >` rewrite.",
+    "`{file}` already exists from a previous write — editing it in place with `beginTransaction` and `edit` is cheaper than re-emitting the entire file each time.",
+    "Reminder: you already created `{file}`. Land later edits via `beginTransaction` for line ids, then `edit`/`insert`/`delete`, rather than overwriting it wholesale.",
+    "This rewrote `{file}` from scratch again. When a file already exists, get its line ids with `beginTransaction` and use the line-edit tools so unrelated lines stay untouched.",
+    "Tip: for an existing file like `{file}`, the id-based edit tools (`beginTransaction` + `edit`) change just what you need — no need to re-send the whole file through bash.",
 )
 
 
@@ -155,7 +155,7 @@ def escalated_rewrite_message(file: str, count: int) -> str:
         f"STOP writing `{file}` through bash redirects (`>` or `>>`). You have now "
         f"written the whole file this way {count} times and it is still wrong — "
         f"re-emitting or appending keeps layering on mistakes. Do NOT write it "
-        f"through bash again. Run `read {file}` to get line anchors, then "
+        f"through bash again. Run `beginTransaction {file}` to get line ids, then "
         f"`edit` to change ONLY the specific lines that are wrong."
     )
 
@@ -218,8 +218,8 @@ def build_auto_read_block(files_tool: object, command: str) -> str:
     for target in targets[:_AUTO_READ_MAX_FILES]:
         try:
             # _force bypasses the redundant-read gate: the auto-read's whole job is
-            # to surface fresh anchors, so it must always get the file body.
-            output = files_tool.execute("read", {"file": target, "_force": True})  # type: ignore[attr-defined]
+            # to surface fresh line ids, so it must always get the file body.
+            output = files_tool.execute("beginTransaction", {"file": target, "_force": True})  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 - best-effort convenience read
             continue
         if output.startswith(TOOL_ATTENTION_MARKER):
@@ -227,15 +227,15 @@ def build_auto_read_block(files_tool: object, command: str) -> str:
         if not output or not output.strip() or output.lstrip().startswith("Error"):
             continue
         blocks.append(
-            f"You just wrote `{target}`. Its current line anchors are below — edit it "
-            "in place with edit; no separate read needed:\n"
+            f"You just wrote `{target}`. Its current line ids are below — edit it "
+            "in place with edit; no separate beginTransaction needed:\n"
             f"{output}"
         )
     if not blocks:
         return ""
     remaining = len(targets) - _AUTO_READ_MAX_FILES
     if remaining > 0:
-        blocks.append(f"(+{remaining} more written file(s); read them with read when needed.)")
+        blocks.append(f"(+{remaining} more written file(s); open them with beginTransaction when needed.)")
     return "\n\n".join(blocks)
 
 
@@ -555,13 +555,13 @@ class Agent:
             return f"bash: {cls._shorten(first_line, COMPACT_ARG_CHARS)!r}"
 
         parts = [name]
-        file = args.get("file") or args.get("path")
+        file = args.get("file")
         if isinstance(file, str) and file:
             parts.append(f"on {file}")
-        anchor = args.get("anchor")
+        anchor = args.get("id")
         if isinstance(anchor, str) and anchor:
             parts.append(f"at {anchor}")
-        content = args.get("content") or args.get("text")
+        content = args.get("content")
         if isinstance(content, str):
             line_count = 0 if content == "" else len(content.splitlines())
             parts.append(f"with {line_count} lines/{len(content)} chars")

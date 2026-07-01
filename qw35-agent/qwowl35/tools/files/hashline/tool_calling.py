@@ -130,37 +130,29 @@ class HashlineTools:
 
     def schemas(self) -> list[dict]:
         file_schema = {"type": "string", "description": "Path to the file."}
-        range_anchor_schema = {
+        range_id_schema = {
             "type": "string",
             "description": (
-                "Qualified anchor copied from read, such as '12:af'; ranges use "
-                "'12:af..18:9c'. A range is inclusive of both endpoints: '12:af..18:9c' "
+                "Line id copied from beginTransaction, such as '12af'; ranges use "
+                "'12af..189c'. A range is inclusive of both endpoints: '12af..189c' "
                 "covers lines 12 through 18, including 12 and 18."
             ),
         }
-        single_anchor_schema = {
+        single_id_schema = {
             "type": "string",
-            "description": "Single qualified anchor copied from read, such as '12:af'. Use position before/after for placement.",
+            "description": "Single line id copied from beginTransaction, such as '12af'. Use position before/after for placement.",
         }
         content_schema = {"type": "string", "description": "Literal replacement or inserted content."}
         return [
             {
                 "type": "function",
                 "function": {
-                    "name": "read",
-                    "description": "Read current line anchors before editing.",
+                    "name": "beginTransaction",
+                    "description": "Open a file for editing and read its line ids. Call this before edit/insert/delete.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "file": file_schema,
-                            "anchor": {
-                                "type": "string",
-                                "description": "Optional anchor or range for snippet output.",
-                            },
-                            "context": {
-                                "type": "integer",
-                                "description": "Context lines around anchors. Defaults to 5.",
-                            },
                         },
                         "required": ["file"],
                     },
@@ -170,15 +162,15 @@ class HashlineTools:
                 "type": "function",
                 "function": {
                     "name": "edit",
-                    "description": "Replace one anchored line or range only in an existing non-empty file. This tool cannot create files.",
+                    "description": "Replace one line or range by id only in an existing non-empty file. This tool cannot create files.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "file": file_schema,
-                            "anchor": range_anchor_schema,
+                            "id": range_id_schema,
                             "content": content_schema,
                         },
-                        "required": ["file", "anchor", "content"],
+                        "required": ["file", "id", "content"],
                     },
                 },
             },
@@ -186,20 +178,20 @@ class HashlineTools:
                 "type": "function",
                 "function": {
                     "name": "insert",
-                    "description": "Insert before or after one anchor only in an existing non-empty file. This tool cannot create files.",
+                    "description": "Insert before or after one line id only in an existing non-empty file. This tool cannot create files.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "file": file_schema,
-                            "anchor": single_anchor_schema,
+                            "id": single_id_schema,
                             "content": content_schema,
                             "position": {
                                 "type": "string",
                                 "enum": ["after", "before"],
-                                "description": "Placement relative to anchor. Defaults to after.",
+                                "description": "Placement relative to the id. Defaults to after.",
                             },
                         },
-                        "required": ["file", "anchor", "content"],
+                        "required": ["file", "id", "content"],
                     },
                 },
             },
@@ -207,14 +199,14 @@ class HashlineTools:
                 "type": "function",
                 "function": {
                     "name": "delete",
-                    "description": "Delete one anchored line or range only from an existing non-empty file. This tool cannot create files.",
+                    "description": "Delete one line or range by id only from an existing non-empty file. This tool cannot create files.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "file": file_schema,
-                            "anchor": range_anchor_schema,
+                            "id": range_id_schema,
                         },
-                        "required": ["file", "anchor"],
+                        "required": ["file", "id"],
                     },
                 },
             },
@@ -231,8 +223,8 @@ class HashlineTools:
                 message += f" Details: {detail}."
             return message
         try:
-            if name == "read":
-                return self.read(args)
+            if name == "beginTransaction":
+                return self.begin_transaction(args)
             if name == "edit":
                 return self.edit(args)
             if name == "insert":
@@ -241,45 +233,44 @@ class HashlineTools:
                 return self.delete(args)
             return f"Error: unknown tool {name!r}."
         except FileNotFoundError:
-            file = args.get("file") or args.get("path") or self._last_file or ""
+            file = args.get("file") or self._last_file or ""
             return f"Error: file not found: {file}"
         except HashlineError as exc:
             return f"Error: {exc}"
         except Exception as exc:  # noqa: BLE001
             return f"Error running {name}: {exc}"
 
-    def read(self, args: dict[str, Any]) -> str:
+    def begin_transaction(self, args: dict[str, Any]) -> str:
+        """Open a file for editing: return its whole-file line ids.
+
+        Renamed from ``read`` and stripped of the old windowed ``anchor``/``context``
+        params — the model begins a transaction on a file it intends to edit, and
+        this always returns the full set of line ids (the F1 gate still suppresses a
+        redundant re-open of an unchanged file; ``_force`` bypasses it).
+        """
         file = self._file(args)
-        anchors = self._anchors(args)
-        # F1: a full (anchorless) re-read of an already-read, barely-changed file is
-        # suppressed. Anchored reads are targeted lookups and always run; the
-        # internal ``_force`` flag (used by the post-write auto-read) bypasses too.
-        if not anchors and not bool(args.get("_force")):
+        if not bool(args.get("_force")):
             suppressed = self._maybe_suppress_full_read(file)
             if suppressed is not None:
                 return suppressed
-        context = int(args.get("context") if args.get("context") is not None else 5)
-        output = self._cap(run_read(ReadCmd(file=Path(file), anchor=anchors, context=max(0, context))))
+        output = self._cap(run_read(ReadCmd(file=Path(file), anchor=[], context=0)))
         if not output.strip():
             return output
-        # Read the full file once (not the possibly anchored/truncated snippet) so
-        # warnings use absolute line numbers and the fingerprint covers the whole
-        # file. Only a FULL read records the gate baseline / current anchors — an
-        # anchored snippet does not give the model whole-file anchors.
+        # Read the full file so warnings use absolute line numbers and the
+        # fingerprint covers the whole file; this records the F1 gate baseline.
         text = self._read_text(file)
         warnings, attention = self._syntax_section(file, text)
-        if not anchors:
-            self._read_records[file] = ReadRecord(
-                fingerprint=self._content_fingerprint(text),
-                byte_len=len(text.encode("utf-8")),
-            )
-            self._suppressed_once.pop(file, None)
+        self._read_records[file] = ReadRecord(
+            fingerprint=self._content_fingerprint(text),
+            byte_len=len(text.encode("utf-8")),
+        )
+        self._suppressed_once.pop(file, None)
         headered = file in self._read_headered
         self._read_headered.add(file)
         if headered:
             body = self._with_warnings(output, warnings)
         else:
-            header = f"{file} (anchors: each line is '<line>:<hash>|<content>'):"
+            header = f"{file} (ids: each line is '<line><hash>|<content>'):"
             body = self._with_warnings(f"{header}\n{output}", warnings)
         return mark_attention(body) if attention else body
 
@@ -309,15 +300,14 @@ class HashlineTools:
         self._suppressed_once[file] = fingerprint
         if fingerprint == record.fingerprint:
             return (
-                f"Skipped re-reading {file}: it is unchanged since your last read this "
-                "session — you still hold its current anchors. Edit with them, read an "
-                "anchor for a specific region, or read again to override."
+                f"Skipped re-opening {file}: it is unchanged since your last "
+                "beginTransaction this session — you still hold its current line ids. "
+                "Edit with them, or beginTransaction again to refresh."
             )
         return (
-            f"Skipped re-reading {file}: it changed only ~{delta * 100:.0f}% by size "
-            "since your last full read this session. Most anchors still hold, but those "
-            "near edits may be stale — read with an anchor for the changed region, or "
-            "read again to override."
+            f"Skipped re-opening {file}: it changed only ~{delta * 100:.0f}% by size "
+            "since your last beginTransaction this session. Most ids still hold, but "
+            "those near edits may be stale — beginTransaction again to refresh."
         )
 
     def has_current_anchors(self, file: str) -> bool:
@@ -341,7 +331,7 @@ class HashlineTools:
         """Trailing syntax block and an attention flag.
 
         When the file has syntax errors, returns a block that lists each error with
-        a ready ``edit anchor: <line>:<hash>|<content>`` so the model can fix that
+        a ready ``edit id: <line><hash>|<content>`` so the model can fix that
         exact row, plus ``True`` (the result should be flagged is_error). When clean
         or unknown, returns the existing OK/"" confirmation and ``False``. Reuses
         :func:`check_file_structured` and ``line_view``. Never raises.
@@ -363,7 +353,7 @@ class HashlineTools:
             for line_no, _col, message in shown:
                 lines.append(f"- {message}")
                 if 1 <= line_no <= n:
-                    lines.append(f"  edit anchor: {line_view(line_no, doc.lines[line_no - 1])}")
+                    lines.append(f"  edit id: {line_view(line_no, doc.lines[line_no - 1])}")
             extra = len(errors) - len(shown)
             if extra > 0:
                 lines.append(f"- … and {extra} more")
@@ -388,7 +378,7 @@ class HashlineTools:
 
     def edit(self, args: dict[str, Any]) -> str:
         file = self._file(args)
-        anchor = self._anchor(args, required=not self._has_start_query(args))
+        anchor = self._id(args, required=not self._has_start_query(args))
         content = self._content(args)
         before = self._read_text(file)
         raw = run_edit(
@@ -404,12 +394,12 @@ class HashlineTools:
 
     def insert(self, args: dict[str, Any]) -> str:
         file = self._file(args)
-        anchor = self._anchor(args, required=not self._has_start_query(args))
+        anchor = self._id(args, required=not self._has_start_query(args))
         if anchor and looks_like_range_anchor(anchor):
             left, right = anchor.split("..", 1)
             raise HashlineError(
-                "insert requires one line:hash anchor, not a range. "
-                f"Use anchor {left!r} with position='after', or anchor {right!r} with position='before'."
+                "insert requires one line id, not a range. "
+                f"Use id {left!r} with position='after', or id {right!r} with position='before'."
             )
         content = self._content(args)
         position = str(args.get("position") or "after").lower()
@@ -428,7 +418,7 @@ class HashlineTools:
 
     def delete(self, args: dict[str, Any]) -> str:
         file = self._file(args)
-        anchor = self._anchor(args, required=not self._has_start_query(args))
+        anchor = self._id(args, required=not self._has_start_query(args))
         before = self._read_text(file)
         raw = run_delete(
             DeleteCmd(
@@ -493,8 +483,8 @@ class HashlineTools:
             snippet = self._anchored_snippet(file, lo, hi)
             if snippet:
                 parts.append(
-                    f"Current {file} (anchors, lines {lo}-{hi}: "
-                    "each line is '<line>:<hash>|<content>'):"
+                    f"Current {file} (ids, lines {lo}-{hi}: "
+                    "each line is '<line><hash>|<content>'):"
                 )
                 parts.extend(snippet)
         # Report every syntax error now present in the post-mutation file so an
@@ -554,37 +544,25 @@ class HashlineTools:
             return ""
 
     def _file(self, args: dict[str, Any]) -> str:
-        file = args.get("file") or args.get("path") or self._last_file
+        file = args.get("file") or self._last_file
         if not isinstance(file, str) or not file:
             raise HashlineError("'file' is required")
         self._last_file = file
         return file
 
-    def _anchor(self, args: dict[str, Any], required: bool = True) -> str:
-        anchor = args.get("anchor")
-        if not isinstance(anchor, str) or not anchor:
+    def _id(self, args: dict[str, Any], required: bool = True) -> str:
+        value = args.get("id")
+        if not isinstance(value, str) or not value:
             if not required:
                 return ""
             raise HashlineError(
-                "'anchor' is required; file mutations cannot create files or target empty files. "
-                "Use bash to create the file, then read for anchors before editing."
+                "'id' is required; file mutations cannot create files or target empty files. "
+                "Use bash to create the file, then beginTransaction for line ids before editing."
             )
-        return anchor
-
-    def _anchors(self, args: dict[str, Any]) -> list[str]:
-        raw = args.get("anchor")
-        if raw is None or raw == "":
-            return []
-        if isinstance(raw, str):
-            return [raw]
-        if isinstance(raw, list) and all(isinstance(item, str) for item in raw):
-            return raw
-        raise HashlineError("'anchor' must be a string or string list")
+        return value
 
     def _content(self, args: dict[str, Any]) -> str:
         content = args.get("content")
-        if content is None:
-            content = args.get("text")
         if not isinstance(content, str):
             raise HashlineError("'content' is required")
         return content
@@ -604,4 +582,4 @@ class HashlineTools:
     def _cap(self, text: str) -> str:
         if len(text) <= MAX_READ_CHARS:
             return text.rstrip("\n")
-        return text[:MAX_READ_CHARS].rstrip("\n") + "\n... (truncated; read an anchor with context for the rest)"
+        return text[:MAX_READ_CHARS].rstrip("\n") + "\n... (truncated: file too large to show all ids; use bash to view the rest)"

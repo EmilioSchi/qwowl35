@@ -98,6 +98,18 @@ def format_short_hash(short: ShortHash) -> str:
     return f"{short & 0xFF:02x}"
 
 
+def format_line_ref(line_no: int, short: ShortHash) -> str:
+    """The copyable line locator shown in read output: line number followed by
+    the 2-hex content hash with NO separator (e.g. ``12af``).
+
+    Single choke point for the anchor grammar. Dropping the former ``:`` measured
+    ~-4.8% read-output tokens against the model's own BPE vocab (see
+    ``tools/anchor_encoding_decision.md``) at zero cost to the cross-check: the
+    hash is still the low byte, so the fixed trailing 2 chars parse back to it.
+    """
+    return f"{line_no}{format_short_hash(short)}"
+
+
 def write_short_hash_bytes(buf: bytearray, short: ShortHash) -> None:
     rendered = format_short_hash(short).encode("ascii")
     buf[0:2] = rendered
