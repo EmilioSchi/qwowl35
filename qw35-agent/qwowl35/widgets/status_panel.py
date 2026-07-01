@@ -178,14 +178,14 @@ class StatusBar(Widget):
     methods. The working directory is shown by the mascot, not here.
     """
 
-    DEFAULT_CSS = f"""
-    StatusBar {{
+    DEFAULT_CSS = """
+    StatusBar {
         height: auto;
         width: 1fr;
         padding: 0 1;
-        color: {theme.FG_DIM};
-        background: {theme.BG_BASE};
-    }}
+        color: $fg-dim;
+        background: $bg-base;
+    }
     """
 
     def __init__(self, *, base_url: str, think: str, effort: str | None) -> None:

@@ -24,6 +24,7 @@ from textual.widgets import Static
 import mascot
 import mascot_states
 import theme
+from theme import registry as theme_registry
 from agent import Agent
 from approval import ApprovalDecision
 from client import Qw35Client
@@ -34,6 +35,7 @@ from widgets.chat_log import ChatView
 from widgets.mascot_widget import MascotWidget
 from widgets.prompt_input import PromptInput
 from widgets.status_panel import StatusBar, display_path
+from widgets.theme_selector import ThemeSelector
 
 QUEUE_PREVIEW_CHARS = 120
 QUEUE_DISPLAY_LIMIT = 4
@@ -54,48 +56,50 @@ def format_queued_user_batch(messages: list[str]) -> str:
 class QwowlApp(App):
     TITLE = "qwowl35"
     # One uniform background across every region; only message boxes set their own.
-    CSS = f"""
-    Screen {{ background: {theme.BG_BASE}; }}
-    MascotWidget {{ background: {theme.BG_BASE}; }}
-    #top-row {{
+    # Colors come from Textual theme variables ($bg-base …) so the whole app
+    # restyles live when ``self.theme`` changes; see the ``theme`` package.
+    CSS = """
+    Screen { background: $bg-base; }
+    MascotWidget { background: $bg-base; }
+    #top-row {
         height: 4;
         width: 1fr;
-        background: {theme.BG_BASE};
-    }}
-    ChatView {{ background: {theme.BG_BASE}; }}
+        background: $bg-base;
+    }
+    ChatView { background: $bg-base; }
     /* The input dock contains a compact prompt bar plus the footer. */
-    #prompt-dock {{
+    #prompt-dock {
         dock: bottom;
         height: auto;
         max-height: 40%;
         width: 1fr;
-        background: {theme.BG_BASE};
+        background: $bg-base;
         border: none;
         padding: 0;
-    }}
-    #prompt-row {{
+    }
+    #prompt-row {
         width: 1fr;
         height: auto;
-        background: {theme.BG_SURFACE};
+        background: $bg-surface;
         padding: 0;
-    }}
-    #queue-panel {{
+    }
+    #queue-panel {
         display: none;
         width: 1fr;
         max-height: 8;
-        background: {theme.BG_BASE};
-        color: {theme.FG_DIM};
+        background: $bg-base;
+        color: $fg-dim;
         padding: 0 1 1 3;
-    }}
-    #prompt-mark {{
+    }
+    #prompt-mark {
         width: 3;
         height: 3;
-        color: {theme.ACCENT};
-        background: {theme.BG_SURFACE};
+        color: $accent;
+        background: $bg-surface;
         content-align: center middle;
         text-style: bold;
-    }}
-    #footer {{ color: {theme.FG_GHOST}; background: {theme.BG_BASE}; padding: 0 1; height: auto; }}
+    }
+    #footer { color: $fg-ghost; background: $bg-base; padding: 0 1; height: auto; }
     """
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
@@ -120,11 +124,24 @@ class QwowlApp(App):
         self.queue_panel = Static("", id="queue-panel")
         self._queued_messages: list[str] = []
         self.agent = Agent(self.client, self.registry, self.config, self)
+        # Theme catalog (built-in default + bundled opencode themes). Selection is
+        # session-only: it resets to the built-in default on next launch.
+        self._theme_catalog = theme_registry.load_catalog()
+        self._theme_name = theme_registry.BUILTIN_NAME
+        self._theme_mode = "dark"
         self._mascot_timer = None
         self._busy = False
         self._copied_revert = None
         self._copied_prev = None
         self._notice_revert = None
+
+    def get_theme_variable_defaults(self) -> dict[str, str]:
+        """Fallback values for the app's custom CSS variables ($bg-base …).
+
+        Guarantees they always resolve — before a theme is applied, or if a theme
+        omits a token — so the CSS never fails to parse.
+        """
+        return theme.to_css_variables(theme.DEFAULT)
 
     # ------------------------------------------------------------------ #
     # Composition / lifecycle
@@ -159,6 +176,9 @@ class QwowlApp(App):
         return out
 
     async def on_mount(self) -> None:
+        self._theme_catalog.register_all(self)
+        theme.set_active(self._theme_catalog.palette(self._theme_name, self._theme_mode))
+        self.theme = self._theme_catalog.textual_name(self._theme_name, self._theme_mode)
         self._reschedule_mascot()
         self.set_state(mascot.State.WAITING)
         self.query_one(PromptInput).focus()
@@ -330,6 +350,11 @@ class QwowlApp(App):
         text = submitted_text.strip()
         if not text:
             return
+        # Exact-match local commands are handled here and never reach the model
+        # (nor the queue). Everything else is a normal turn/queued message.
+        if self._dispatch_command(text):
+            prompt.clear()
+            return
         prompt.append_history(submitted_text)
         prompt.clear()
         if self._busy:
@@ -337,6 +362,62 @@ class QwowlApp(App):
             return
         self._busy = True
         self._run_turn(text)
+
+    # ------------------------------------------------------------------ #
+    # Local commands (typed into the prompt, matched exactly)
+    # ------------------------------------------------------------------ #
+    def _dispatch_command(self, text: str) -> bool:
+        """Run an exact-match ``\\``-command. Returns True if one was handled."""
+        if text in ("\\quit", "\\abort", "\\exit"):
+            self.action_quit()
+            return True
+        if text == "\\clear":
+            self._clear_conversation()
+            return True
+        if text == "\\theme":
+            self._open_theme_selector()
+            return True
+        return False
+
+    def _clear_conversation(self) -> None:
+        """``\\clear``: reset the transcript and agent history (keep system prompt)."""
+        self.agent.clear()
+        self.chat.clear()
+        self._queued_messages.clear()
+        self._render_queue()
+        self.set_info("cleared")
+
+    @work(exclusive=True, group="theme")
+    async def _open_theme_selector(self) -> None:
+        """``\\theme``: open the picker (live preview), commit or revert on close."""
+        result = await self.push_screen_wait(
+            ThemeSelector(self._theme_catalog.names, self._theme_name, self._theme_mode)
+        )
+        if result is not None:
+            name, mode = result
+            self.apply_theme_preview(name, mode)  # commit (session-only)
+        self.query_one(PromptInput).focus()
+
+    def apply_theme_preview(self, name: str, mode: str) -> None:
+        """Apply a theme+mode live: CSS restyle plus a refresh of Rich-drawn chrome."""
+        available = self._theme_catalog.available_modes(name)
+        if mode not in available:
+            mode = available[0] if available else "dark"
+        self._theme_name = name
+        self._theme_mode = mode
+        theme.set_active(self._theme_catalog.palette(name, mode))
+        self.theme = self._theme_catalog.textual_name(name, mode)
+        self._refresh_themed_widgets()
+
+    def _refresh_themed_widgets(self) -> None:
+        """Re-render widgets whose Rich content is cached; CSS-styled ones auto-update."""
+        try:
+            self.query_one("#footer", Static).update(self._footer_text())
+        except Exception:
+            pass
+        self.status.refresh()
+        self.mascot.refresh()
+        self._render_queue()
 
     def _enqueue_message(self, text: str) -> None:
         self._queued_messages.append(text)

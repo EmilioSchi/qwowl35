@@ -304,6 +304,21 @@ class Agent:
         # The soft nudge used last, so consecutive soft nudges differ in wording.
         self._last_rewrite_advice: str | None = None
 
+    def clear(self) -> None:
+        """Reset the conversation, keeping only the system message.
+
+        Mirrors qw35-client's ``/clear``: preserve the system prompt, drop the
+        rest, and reset the per-conversation guards so the next turn starts fresh.
+        """
+        system = next((m for m in self.messages if m.get("role") == "system"), None)
+        self.messages = (
+            [system] if system is not None else [build_system_message(registry=self.registry)]
+        )
+        self._last_tool_signature = None
+        self._last_repeat_msg = None
+        self._bash_rewrite_counts.clear()
+        self._last_rewrite_advice = None
+
     @staticmethod
     def _tool_signature(name: str, arguments: object) -> str:
         """Stable identity for a tool call: name plus canonical arguments."""

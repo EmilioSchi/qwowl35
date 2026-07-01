@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from textual.app import App, ComposeResult  # noqa: E402
 
+import theme  # noqa: E402
 from history import HistoryConfig, MessageHistory  # noqa: E402
 from widgets.prompt_input import PromptInput  # noqa: E402
 
@@ -35,6 +36,11 @@ class _Harness(App):
     def __init__(self) -> None:
         super().__init__()
         self.submitted: list[str] = []
+
+    def get_theme_variable_defaults(self) -> dict[str, str]:
+        # PromptInput's CSS uses the app's custom theme variables ($bg-surface …);
+        # provide them so the widget resolves outside QwowlApp.
+        return theme.to_css_variables(theme.DEFAULT)
 
     def compose(self) -> ComposeResult:
         yield PromptInput(id="p")
@@ -66,6 +72,9 @@ class _HistoryHarness(App):
     def __init__(self, history: MessageHistory) -> None:
         super().__init__()
         self._history = history
+
+    def get_theme_variable_defaults(self) -> dict[str, str]:
+        return theme.to_css_variables(theme.DEFAULT)
 
     def compose(self) -> ComposeResult:
         yield PromptInput(id="p", history=self._history)

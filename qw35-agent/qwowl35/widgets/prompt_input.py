@@ -16,7 +16,6 @@ from textual import events
 from textual.message import Message
 from textual.widgets import TextArea
 
-import theme
 from config import PASTE_CHAR_THRESHOLD, PASTE_LINE_THRESHOLD
 from history import MessageHistory
 
@@ -24,40 +23,40 @@ _PASTE_RE = re.compile(r"\[paste #(\d+)[^\]]*\]")
 
 
 class PromptInput(TextArea):
-    DEFAULT_CSS = f"""
-    PromptInput {{
+    DEFAULT_CSS = """
+    PromptInput {
         width: 1fr;
         height: auto;
         min-height: 3;
         max-height: 12;
-        background: {theme.BG_SURFACE};
-        color: {theme.FG_BRIGHT};
+        background: $bg-surface;
+        color: $fg-bright;
         border: none;
         outline: none;
         padding: 1 1 1 0;
         scrollbar-size-vertical: 1;
-        scrollbar-background: {theme.BG_SURFACE};
-        scrollbar-background-hover: {theme.BG_SURFACE};
-        scrollbar-background-active: {theme.BG_SURFACE};
-        scrollbar-color: {theme.SCROLL_BAR};
-        scrollbar-color-hover: {theme.SCROLL_BAR_HOVER};
-        scrollbar-color-active: {theme.SCROLL_BAR_ACTIVE};
-        scrollbar-corner-color: {theme.BG_SURFACE};
-    }}
-    PromptInput:focus {{
+        scrollbar-background: $bg-surface;
+        scrollbar-background-hover: $bg-surface;
+        scrollbar-background-active: $bg-surface;
+        scrollbar-color: $scroll-bar;
+        scrollbar-color-hover: $scroll-bar-hover;
+        scrollbar-color-active: $scroll-bar-active;
+        scrollbar-corner-color: $bg-surface;
+    }
+    PromptInput:focus {
         border: none;
         outline: none;
-    }}
-    PromptInput > .text-area--cursor-line {{
-        background: {theme.BG_SURFACE};
-    }}
-    PromptInput > .text-area--gutter {{
-        background: {theme.BG_SURFACE};
-    }}
-    PromptInput > .text-area--cursor {{
-        background: {theme.ACCENT};
-        color: {theme.BG_BASE};
-    }}
+    }
+    PromptInput > .text-area--cursor-line {
+        background: $bg-surface;
+    }
+    PromptInput > .text-area--gutter {
+        background: $bg-surface;
+    }
+    PromptInput > .text-area--cursor {
+        background: $accent;
+        color: $bg-base;
+    }
     """
 
     class Submitted(Message):

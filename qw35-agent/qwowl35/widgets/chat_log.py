@@ -34,8 +34,12 @@ _KNOWN_LIBS = re.compile(
     r"\b(textual|rich|httpx|tree[_-]sitter|asyncio|pytest|numpy|pandas|requests)\b",
     re.IGNORECASE,
 )
-_REF_STYLE = f"bold {theme.ACCENT} underline"
-_LIB_STYLE = theme.ACCENT
+def _ref_style() -> str:
+    return f"bold {theme.ACCENT} underline"
+
+
+def _lib_style() -> str:
+    return theme.ACCENT
 _HASHLINE_ANCHOR_LINE = re.compile(r"^\s*(\d+:[0-9a-f]{2})\|(.*)$", re.IGNORECASE)
 _DIFF_HUNK = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
 # First lines of the advisory blocks the agent appends to a tool result for the
@@ -49,17 +53,9 @@ _FILE_CHANGE_TOOLS = {
 }
 _FILE_READ_TOOLS = {"read"}
 _FILE_VIEW_TOOLS = _FILE_READ_TOOLS | _FILE_CHANGE_TOOLS
-_SHELL_BG = theme.BG_BASE
-_SHELL_PROMPT = theme.ACCENT
-_SHELL_CMD = theme.FG_BRIGHT   # command line: brighter foreground, not bold
-_SHELL_OUT = theme.FG_DIM      # command output: dimmer grey, not bold
-_CURSOR = "▋"                  # trailing block cursor while a command types out
-_BADGE_BG = _SHELL_BG          # same soft black as the mini-terminal
-_PATH_STYLE = theme.FG_MUTED   # file path beside a badge: muted grey, never bold
-_CODE_BG = theme.CODE_BG
-_DIFF_ADD_BG = theme.DIFF_ADD_BG
-_DIFF_REMOVE_BG = theme.DIFF_REMOVE_BG
-_DIFF_CONTEXT_BG = theme.DIFF_CONTEXT_BG
+_CURSOR = "▋"  # trailing block cursor while a command types out
+# Shell / code / diff colors are read from ``theme.*`` at render time (below) so
+# they follow a live theme change; there are no baked color aliases here.
 
 # Repaint streaming text ~20x/s so it visibly evolves while still batching the
 # (relatively costly) markdown re-parse.
@@ -142,13 +138,13 @@ def _line_with_bg(text: Text, bg: str) -> _BlockLine:
 def highlight_refs(text: str) -> Text:
     rich = Text(text)
     for match in _GITHUB_URL.finditer(text):
-        rich.stylize(f"{_REF_STYLE} link {match.group(0)}", match.start(), match.end())
+        rich.stylize(f"{_ref_style()} link {match.group(0)}", match.start(), match.end())
     for match in _OWNER_REPO.finditer(text):
         if "://" in text[max(0, match.start() - 8): match.start()]:
             continue
-        rich.stylize(_REF_STYLE, match.start(1), match.end(1))
+        rich.stylize(_ref_style(), match.start(1), match.end(1))
     for match in _KNOWN_LIBS.finditer(text):
-        rich.stylize(_LIB_STYLE, match.start(), match.end())
+        rich.stylize(_lib_style(), match.start(), match.end())
     return rich
 
 
@@ -225,11 +221,11 @@ def _tool_badge(name: str) -> str:
 def _tool_title(name: str, args: dict[str, Any] | None, color: str) -> Text:
     """Tool header: a black-backed badge in `color` (no bold) + grey path."""
     title = Text()
-    title.append(_tool_badge(name), style=f"{color} on {_BADGE_BG}")
+    title.append(_tool_badge(name), style=f"{color} on {theme.BG_BASE}")
     path = (args or {}).get("file") or (args or {}).get("path")
     if isinstance(path, str) and path:
         title.append("  ")
-        title.append(path, style=_PATH_STYLE)
+        title.append(path, style=theme.FG_MUTED)
     return title
 
 
@@ -262,17 +258,17 @@ def _command_rows(
         take = min(len(line), max(0, remaining))
         remaining -= take
         prompt = "$ " if index == 0 else "> "
-        text = Text(prompt, style=_SHELL_PROMPT)
+        text = Text(prompt, style=theme.ACCENT)
         if index < len(highlighted_lines):
             seg = highlighted_lines[index][:take]
             seg.no_wrap = True
             text.append_text(seg)
         else:
-            text.append(line[:take], style=_SHELL_CMD)
+            text.append(line[:take], style=theme.FG_BRIGHT)
         texts.append(text)
     if cursor and texts:
-        texts[-1].append(_CURSOR, style=_SHELL_CMD)
-    return [_line_with_bg(text, _SHELL_BG) for text in texts]
+        texts[-1].append(_CURSOR, style=theme.FG_BRIGHT)
+    return [_line_with_bg(text, theme.BG_BASE) for text in texts]
 
 
 def _highlight_bash_lines(command: str) -> list[Text]:
@@ -282,12 +278,12 @@ def _highlight_bash_lines(command: str) -> list[Text]:
             command,
             "bash",
             theme="monokai",
-            background_color=_SHELL_BG,
+            background_color=theme.BG_BASE,
             word_wrap=False,
         ).highlight(command)
         lines = highlighted.split("\n", allow_blank=True)
     except Exception:
-        return [Text(line, style=_SHELL_CMD) for line in command.splitlines() or [command]]
+        return [Text(line, style=theme.FG_BRIGHT) for line in command.splitlines() or [command]]
 
     styled: list[Text] = []
     for line in lines[: len(command.splitlines() or [command])]:
@@ -295,8 +291,8 @@ def _highlight_bash_lines(command: str) -> list[Text]:
         item.no_wrap = True
         _strip_bold_and_background(item)
         if not item.plain:
-            item.append("", style=_SHELL_CMD)
-        item.style = _SHELL_CMD
+            item.append("", style=theme.FG_BRIGHT)
+        item.style = theme.FG_BRIGHT
         styled.append(item)
     return styled
 
@@ -331,8 +327,8 @@ def _output_rows(output: str) -> list[_BlockLine]:
     rows: list[_BlockLine] = []
     for line in output.splitlines() or [output]:
         text = highlight_refs(line)
-        text.style = _SHELL_OUT  # base color; ref accents layer on top
-        rows.append(_line_with_bg(text, _SHELL_BG))
+        text.style = theme.FG_DIM  # base color; ref accents layer on top
+        rows.append(_line_with_bg(text, theme.BG_BASE))
     return rows
 
 
@@ -349,7 +345,7 @@ def _terminal_box(
     if output is not None:
         rows.extend(_output_rows(output))
     if note:
-        rows.append(_line_with_bg(Text(note, style="dim"), _SHELL_BG))
+        rows.append(_line_with_bg(Text(note, style="dim"), theme.BG_BASE))
     return _FullWidthLines(rows, wrap=True)
 
 
@@ -462,16 +458,16 @@ def _render_anchored_code(path: str, anchored_lines: list[str]) -> RenderableTyp
     for index, (anchor, content, is_label) in enumerate(parsed):
         row = Text(no_wrap=True)
         if is_label:
-            row.append(" " * (width + 2), style=f"on {_CODE_BG}")
+            row.append(" " * (width + 2), style=f"on {theme.CODE_BG}")
         else:
-            row.append(f"{anchor:>{width}}  ", style=f"bold {theme.ACCENT} on {_CODE_BG}")
+            row.append(f"{anchor:>{width}}  ", style=f"bold {theme.ACCENT} on {theme.CODE_BG}")
         if index < len(highlighted_lines):
             code_line = highlighted_lines[index].copy()
-            code_line.stylize(f"on {_CODE_BG}", 0, len(code_line.plain))
+            code_line.stylize(f"on {theme.CODE_BG}", 0, len(code_line.plain))
             row.append_text(code_line)
         else:
-            row.append(content, style=f"on {_CODE_BG}")
-        rows.append(_BlockLine(row, f"on {_CODE_BG}"))
+            row.append(content, style=f"on {theme.CODE_BG}")
+        rows.append(_BlockLine(row, f"on {theme.CODE_BG}"))
     return _FullWidthLines(rows)
 
 
@@ -496,7 +492,7 @@ def _render_code_block(
             visible_code,
             lexer,
             theme="monokai",
-            background_color=_CODE_BG,
+            background_color=theme.CODE_BG,
             word_wrap=False,
         ).highlight(visible_code).split("\n", allow_blank=True)
     except Exception:
@@ -506,10 +502,10 @@ def _render_code_block(
     for index, line in enumerate(code_lines):
         row = highlighted_lines[index].copy() if index < len(highlighted_lines) else Text(line)
         row.no_wrap = True
-        row.stylize(f"on {_CODE_BG}", 0, len(row.plain))
-        rows.append(_BlockLine(row, f"on {_CODE_BG}"))
+        row.stylize(f"on {theme.CODE_BG}", 0, len(row.plain))
+        rows.append(_BlockLine(row, f"on {theme.CODE_BG}"))
     if hidden:
-        rows.append(_line_with_bg(Text(f"... {hidden} more lines", style="dim"), _CODE_BG))
+        rows.append(_line_with_bg(Text(f"... {hidden} more lines", style="dim"), theme.CODE_BG))
     return _FullWidthLines(rows)
 
 
@@ -657,38 +653,38 @@ def _render_diff(diff: str) -> RenderableType:
         if hunk:
             old_line = int(hunk.group(1))
             new_line = int(hunk.group(2))
-            rows.append(_line_with_bg(Text(raw, style=f"bold {theme.ACCENT}"), _DIFF_CONTEXT_BG))
+            rows.append(_line_with_bg(Text(raw, style=f"bold {theme.ACCENT}"), theme.DIFF_CONTEXT_BG))
             continue
         if raw.startswith("---") or raw.startswith("+++"):
-            rows.append(_line_with_bg(Text(raw, style=f"bold {theme.FG_DIM}"), _DIFF_CONTEXT_BG))
+            rows.append(_line_with_bg(Text(raw, style=f"bold {theme.FG_DIM}"), theme.DIFF_CONTEXT_BG))
             continue
         if raw.startswith("-"):
             line_no = f"{old_line:>{width}}" if old_line else " " * width
             row = Text(no_wrap=True)
-            row.append(f"{line_no}  ", style=f"{theme.FG_GHOST} on {_DIFF_REMOVE_BG}")
+            row.append(f"{line_no}  ", style=f"{theme.FG_GHOST} on {theme.DIFF_REMOVE_BG}")
             # Marker in its own column + a separator space, so content lines up
             # with context rows (which reserve "  " for the same two columns).
-            row.append("- " + raw[1:], style=f"{theme.ERROR} on {_DIFF_REMOVE_BG}")
-            rows.append(_BlockLine(row, f"on {_DIFF_REMOVE_BG}"))
+            row.append("- " + raw[1:], style=f"{theme.ERROR} on {theme.DIFF_REMOVE_BG}")
+            rows.append(_BlockLine(row, f"on {theme.DIFF_REMOVE_BG}"))
             old_line += 1
             continue
         if raw.startswith("+"):
             line_no = f"{new_line:>{width}}" if new_line else " " * width
             row = Text(no_wrap=True)
-            row.append(f"{line_no}  ", style=f"{theme.FG_GHOST} on {_DIFF_ADD_BG}")
-            row.append("+ " + raw[1:], style=f"{theme.SUCCESS} on {_DIFF_ADD_BG}")
-            rows.append(_BlockLine(row, f"on {_DIFF_ADD_BG}"))
+            row.append(f"{line_no}  ", style=f"{theme.FG_GHOST} on {theme.DIFF_ADD_BG}")
+            row.append("+ " + raw[1:], style=f"{theme.SUCCESS} on {theme.DIFF_ADD_BG}")
+            rows.append(_BlockLine(row, f"on {theme.DIFF_ADD_BG}"))
             new_line += 1
             continue
         if raw.startswith("\\"):
-            rows.append(_line_with_bg(Text(raw, style="dim"), _DIFF_CONTEXT_BG))
+            rows.append(_line_with_bg(Text(raw, style="dim"), theme.DIFF_CONTEXT_BG))
             continue
         line_no = f"{new_line:>{width}}" if new_line else " " * width
         content = raw[1:] if raw.startswith(" ") else raw
         row = Text(no_wrap=True)
-        row.append(f"{line_no}  ", style=f"{theme.FG_GHOST} on {_DIFF_CONTEXT_BG}")
-        row.append("  " + content, style=f"dim {theme.FG_DIM} on {_DIFF_CONTEXT_BG}")
-        rows.append(_BlockLine(row, f"on {_DIFF_CONTEXT_BG}"))
+        row.append(f"{line_no}  ", style=f"{theme.FG_GHOST} on {theme.DIFF_CONTEXT_BG}")
+        row.append("  " + content, style=f"dim {theme.FG_DIM} on {theme.DIFF_CONTEXT_BG}")
+        rows.append(_BlockLine(row, f"on {theme.DIFF_CONTEXT_BG}"))
         if old_line:
             old_line += 1
         if new_line:
@@ -715,33 +711,33 @@ class ToolBlock(Static):
 class ChatView(VerticalScroll):
     """A vertical scroller holding one widget per message."""
 
-    DEFAULT_CSS = f"""
-    ChatView {{
+    DEFAULT_CSS = """
+    ChatView {
         height: 1fr;
         padding: 0 0 0 1;
         scrollbar-size-vertical: 1;
-        scrollbar-background: {theme.BG_BASE};
-        scrollbar-background-hover: {theme.BG_BASE};
-        scrollbar-background-active: {theme.BG_BASE};
-        scrollbar-color: {theme.SCROLL_BAR};
-        scrollbar-color-hover: {theme.SCROLL_BAR_HOVER};
-        scrollbar-color-active: {theme.SCROLL_BAR_ACTIVE};
-        scrollbar-corner-color: {theme.BG_BASE};
-    }}
-    ChatView .msg {{ margin: 1 0 0 0; width: 1fr; }}
-    ChatView .user {{
-        background: {theme.BG_SURFACE};
-        color: {theme.FG_BRIGHT};
+        scrollbar-background: $bg-base;
+        scrollbar-background-hover: $bg-base;
+        scrollbar-background-active: $bg-base;
+        scrollbar-color: $scroll-bar;
+        scrollbar-color-hover: $scroll-bar-hover;
+        scrollbar-color-active: $scroll-bar-active;
+        scrollbar-corner-color: $bg-base;
+    }
+    ChatView .msg { margin: 1 0 0 0; width: 1fr; }
+    ChatView .user {
+        background: $bg-surface;
+        color: $fg-bright;
         padding: 0 1;
-    }}
-    ChatView .assistant {{ color: {theme.FG_BRIGHT}; }}
-    ChatView .thinking {{ color: {theme.FG_FAINT}; text-style: italic; padding: 0 0 0 1; }}
-    ChatView .tool-pending {{ color: {theme.ACCENT}; padding: 0 1; }}
-    ChatView .tool-success {{ color: {theme.SUCCESS_SOFT}; padding: 0 1; }}
-    ChatView .tool-error   {{ color: {theme.ERROR_SOFT}; padding: 0 1; }}
-    ChatView .system {{ color: {theme.FG_FAINT}; text-style: italic; }}
-    ChatView .warning {{ color: {theme.WARNING}; text-style: bold; }}
-    ChatView .error {{ color: {theme.ERROR}; text-style: bold; }}
+    }
+    ChatView .assistant { color: $fg-bright; }
+    ChatView .thinking { color: $fg-faint; text-style: italic; padding: 0 0 0 1; }
+    ChatView .tool-pending { color: $accent; padding: 0 1; }
+    ChatView .tool-success { color: $success-soft; padding: 0 1; }
+    ChatView .tool-error   { color: $error-soft; padding: 0 1; }
+    ChatView .system { color: $fg-faint; text-style: italic; }
+    ChatView .warning { color: $warning; text-style: bold; }
+    ChatView .error { color: $error; text-style: bold; }
     """
 
     def __init__(self) -> None:
@@ -821,6 +817,23 @@ class ChatView(VerticalScroll):
 
     def add_system(self, text: str) -> None:
         self._append(Static(Text(text), classes="msg system"))
+
+    def clear(self) -> None:
+        """Wipe the transcript: remove every message widget and streaming state.
+
+        Used by the ``\\clear`` command. The persistent repaint timer set up in
+        ``on_mount`` keeps running; only content and in-flight buffers reset.
+        """
+        self.remove_children()
+        self._assistant = None
+        self._assistant_buf = ""
+        self._assistant_dirty = False
+        self._reasoning = None
+        self._reasoning_buf = ""
+        self._reasoning_dirty = False
+        self._tool_blocks.clear()
+        self._collapsibles.clear()
+        self.tools_expanded = False
 
     # -- assistant (streaming markdown) ------------------------------------- #
     def add_assistant_chunk(self, text: str) -> None:
@@ -958,10 +971,10 @@ class ChatView(VerticalScroll):
             return Group(label, _shell_text(target, cursor=cursor, reveal=reveal))
 
         if target:
-            text = Text(shown, style=_SHELL_OUT)
+            text = Text(shown, style=theme.FG_DIM)
             if cursor:
-                text.append(_CURSOR, style=_SHELL_OUT)
-            return Group(label, _FullWidthLines([_line_with_bg(text, _SHELL_BG)], wrap=True))
+                text.append(_CURSOR, style=theme.FG_DIM)
+            return Group(label, _FullWidthLines([_line_with_bg(text, theme.BG_BASE)], wrap=True))
         return label
 
     def _render_tool_result(self, block: ToolBlock) -> RenderableType:

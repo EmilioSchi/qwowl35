@@ -1,5 +1,5 @@
 # qwowl35 runtime dependencies
-textual>=0.60        # TUI framework — https://github.com/Textualize/textual
+textual>=1.0         # TUI framework (native Theme API for theme switching) — https://github.com/Textualize/textual
 rich>=13.0           # rendering primitives (pulled in by textual) — https://github.com/Textualize/rich
 httpx>=0.27          # async streaming HTTP client — https://github.com/encode/httpx
 xxhash>=3.4          # hashline-compatible xxh3_64 sidecar/content hashes

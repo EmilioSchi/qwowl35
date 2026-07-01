@@ -25,51 +25,49 @@ from approval import ApprovalDecision
 from widgets.chat_log import _shell_text
 
 _OPTIONS = ("Accept", "Deny", "Write to do differently")
-# Matches ChatView's warning accent so callouts read the same everywhere.
-_WARNING_STYLE = theme.WARNING
 
 
 class ApprovalModal(ModalScreen[ApprovalDecision]):
     # Transparent screen (no dim, no border); only the panel paints.
-    DEFAULT_CSS = f"""
-    ApprovalModal {{ align: center middle; background: transparent; }}
-    ApprovalModal #panel {{
+    DEFAULT_CSS = """
+    ApprovalModal { align: center middle; background: transparent; }
+    ApprovalModal #panel {
         width: 90%;
         max-width: 90%;
         height: auto;
         max-height: 80%;
-        background: {theme.BG_BASE};
+        background: $bg-base;
         border: none;
         padding: 1 2;
-    }}
+    }
     /* Command/warnings can be long; scroll them with the app's scrollbar
        palette while the options below stay fixed and keyboard-reachable. */
-    ApprovalModal #cmd-scroll {{
+    ApprovalModal #cmd-scroll {
         width: 1fr;
         height: auto;
         max-height: 60%;
         margin-bottom: 1;
         scrollbar-size-vertical: 1;
-        scrollbar-background: {theme.BG_BASE};
-        scrollbar-background-hover: {theme.BG_BASE};
-        scrollbar-background-active: {theme.BG_BASE};
-        scrollbar-color: {theme.SCROLL_BAR};
-        scrollbar-color-hover: {theme.SCROLL_BAR_HOVER};
-        scrollbar-color-active: {theme.SCROLL_BAR_ACTIVE};
-        scrollbar-corner-color: {theme.BG_BASE};
-    }}
-    ApprovalModal #cmd {{ width: 1fr; }}
-    ApprovalModal #warnings {{ width: 1fr; margin-top: 1; }}
-    ApprovalModal .option {{ width: 1fr; color: {theme.FG_BRIGHT}; padding: 0 1; }}
-    ApprovalModal .option-active {{ background: {theme.BG_SURFACE}; color: {theme.FG_BRIGHT}; text-style: bold; }}
-    ApprovalModal #alt-input {{
+        scrollbar-background: $bg-base;
+        scrollbar-background-hover: $bg-base;
+        scrollbar-background-active: $bg-base;
+        scrollbar-color: $scroll-bar;
+        scrollbar-color-hover: $scroll-bar-hover;
+        scrollbar-color-active: $scroll-bar-active;
+        scrollbar-corner-color: $bg-base;
+    }
+    ApprovalModal #cmd { width: 1fr; }
+    ApprovalModal #warnings { width: 1fr; margin-top: 1; }
+    ApprovalModal .option { width: 1fr; color: $fg-bright; padding: 0 1; }
+    ApprovalModal .option-active { background: $bg-surface; color: $fg-bright; text-style: bold; }
+    ApprovalModal #alt-input {
         display: none;
         width: 1fr;
         margin-top: 1;
         border: none;
-        background: {theme.BG_SURFACE};
-        color: {theme.FG_BRIGHT};
-    }}
+        background: $bg-surface;
+        color: $fg-bright;
+    }
     """
 
     can_focus = True
@@ -90,7 +88,8 @@ class ApprovalModal(ModalScreen[ApprovalDecision]):
                 if self._warnings:
                     warnings = Text(
                         "\n".join(f"• {w}" for w in self._warnings),
-                        style=_WARNING_STYLE,
+                        # Matches ChatView's warning accent so callouts read the same.
+                        style=theme.WARNING,
                     )
                     yield Static(warnings, id="warnings")
             for i, label in enumerate(_OPTIONS):
