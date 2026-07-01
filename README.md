@@ -41,9 +41,12 @@ way turn out to be useful to other programmers.
   decode-time sidecar, where the smaller weights buy faster generation on the
   memory-bound decode path — still very much a work in progress.
 - **Anchor-based file editing is token-efficient.** The editing tools key off
-  `<line number>:<checksum> | <code>` anchors instead of the classic "replace
-  old string with new string" approach, which costs noticeably fewer tokens for
-  the same edit.
+  `<line number><checksum>|<code>` anchors (e.g. `12af|    return x`) instead of
+  the classic "replace old string with new string" approach, which costs
+  noticeably fewer tokens for the same edit. The line number is followed directly
+  by a two-hex checksum of the line's content, with no separator; the checksum
+  lets an edit confirm it's still targeting the line it read, and the compact form
+  tokenizes cheaply in the model's own BPE vocabulary.
 - **Tool calls should respect what the model already learned.** This shows up
   in the BPE tokenization: it's not only the *format* that matters (here, an XML
   block with a specific structure the model was trained on), but also the *tool
