@@ -10,7 +10,6 @@ single server preset governs every connected client. See the qw35-server
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 # Thinking control, mirroring llama.cpp's `--reasoning on|off|auto`:
 #   auto → send nothing; defer to the server's `--mode` default
@@ -25,11 +24,8 @@ ALLOWED_THINK = ("auto", "on", "off")
 # medium ≈ 50%, high ≈ 80% of max_tokens; xhigh is uncapped).
 ALLOWED_EFFORTS = ("low", "medium", "high", "xhigh")
 
-# Input prompt: history persistence + paste-collapsing thresholds (little-coder
-# parity). History is stored as JSON-lines so multiline submissions round-trip.
-HISTORY_DIR = Path.home() / ".qwowl35"
-HISTORY_FILE = HISTORY_DIR / "history"
-HISTORY_MAX = 100
+# Input prompt: paste-collapsing thresholds (little-coder parity). Message-history
+# persistence now lives in its own container — see ``history.py``.
 PASTE_LINE_THRESHOLD = 10
 PASTE_CHAR_THRESHOLD = 1000
 
