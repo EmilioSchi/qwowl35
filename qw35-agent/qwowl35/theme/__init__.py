@@ -105,6 +105,17 @@ def set_active(palette: Palette) -> None:
     _active = palette
 
 
+def is_dark() -> bool:
+    """Whether the active palette reads as dark (by background luminance).
+
+    Used to pick light/dark-appropriate syntax-highlighting themes; the ``Palette``
+    itself carries no mode flag, so we infer it from ``BG_BASE`` (always ``#rrggbb``).
+    """
+    h = _active.BG_BASE.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (0.299 * r + 0.587 * g + 0.114 * b) < 128
+
+
 def css_var_name(token: str) -> str:
     """Map a palette token (``BG_BASE``) to its Textual CSS variable (``bg-base``)."""
     return token.lower().replace("_", "-")

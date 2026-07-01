@@ -367,20 +367,22 @@ class QwowlApp(App):
     # Local commands (typed into the prompt, matched exactly)
     # ------------------------------------------------------------------ #
     def _dispatch_command(self, text: str) -> bool:
-        """Run an exact-match ``\\``-command. Returns True if one was handled."""
-        if text in ("\\quit", "\\abort", "\\exit"):
-            self.action_quit()
+        """Run an exact-match ``/``-command. Returns True if one was handled."""
+        if text in ("/quit", "/exit", "/abort", "/close"):
+            # ``App.action_quit`` is a coroutine (a bare call would never run);
+            # ``exit`` is the synchronous shutdown entry point.
+            self.exit()
             return True
-        if text == "\\clear":
+        if text == "/clear":
             self._clear_conversation()
             return True
-        if text == "\\theme":
+        if text == "/theme":
             self._open_theme_selector()
             return True
         return False
 
     def _clear_conversation(self) -> None:
-        """``\\clear``: reset the transcript and agent history (keep system prompt)."""
+        """``/clear``: reset the transcript and agent history (keep system prompt)."""
         self.agent.clear()
         self.chat.clear()
         self._queued_messages.clear()
@@ -389,7 +391,7 @@ class QwowlApp(App):
 
     @work(exclusive=True, group="theme")
     async def _open_theme_selector(self) -> None:
-        """``\\theme``: open the picker (live preview), commit or revert on close."""
+        """``/theme``: open the picker (live preview), commit or revert on close."""
         result = await self.push_screen_wait(
             ThemeSelector(self._theme_catalog.names, self._theme_name, self._theme_mode)
         )

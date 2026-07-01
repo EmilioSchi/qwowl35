@@ -40,6 +40,20 @@ def _ref_style() -> str:
 
 def _lib_style() -> str:
     return theme.ACCENT
+
+
+def _code_theme() -> str:
+    """Pygments/Rich syntax theme matching the active light/dark mode.
+
+    ``monokai`` reads well on dark backgrounds, but its bright foregrounds wash
+    out on a light theme, so use a light-oriented style there instead.
+    """
+    return "monokai" if theme.is_dark() else "default"
+
+
+def _markdown(text: str) -> Markdown:
+    """Markdown renderable using the mode-appropriate code-block theme."""
+    return Markdown(text, code_theme=_code_theme())
 _HASHLINE_ANCHOR_LINE = re.compile(r"^\s*(\d+:[0-9a-f]{2})\|(.*)$", re.IGNORECASE)
 _DIFF_HUNK = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
 # First lines of the advisory blocks the agent appends to a tool result for the
@@ -277,7 +291,7 @@ def _highlight_bash_lines(command: str) -> list[Text]:
         highlighted = Syntax(
             command,
             "bash",
-            theme="monokai",
+            theme=_code_theme(),
             background_color=theme.BG_BASE,
             word_wrap=False,
         ).highlight(command)
@@ -446,7 +460,7 @@ def _render_anchored_code(path: str, anchored_lines: list[str]) -> RenderableTyp
         highlighted_lines = Syntax(
             code,
             lexer,
-            theme="monokai",
+            theme=_code_theme(),
             background_color=theme.CODE_BG,
             word_wrap=False,
         ).highlight(code).split("\n", allow_blank=True)
@@ -491,7 +505,7 @@ def _render_code_block(
         highlighted_lines = Syntax(
             visible_code,
             lexer,
-            theme="monokai",
+            theme=_code_theme(),
             background_color=theme.CODE_BG,
             word_wrap=False,
         ).highlight(visible_code).split("\n", allow_blank=True)
@@ -766,7 +780,7 @@ class ChatView(VerticalScroll):
         blink_changed = blink_on != self._blink_on
         self._blink_on = blink_on
         if self._assistant_dirty and self._assistant is not None:
-            self._assistant.update(Markdown(self._assistant_buf))
+            self._assistant.update(_markdown(self._assistant_buf))
             self._assistant_dirty = False
             self._bump()
         if self._reasoning_dirty and self._reasoning is not None:
@@ -813,7 +827,7 @@ class ChatView(VerticalScroll):
 
     # -- user --------------------------------------------------------------- #
     def add_user(self, text: str) -> None:
-        self._append(Static(Markdown(text), classes="msg user"))
+        self._append(Static(_markdown(text), classes="msg user"))
 
     def add_system(self, text: str) -> None:
         self._append(Static(Text(text), classes="msg system"))
@@ -821,7 +835,7 @@ class ChatView(VerticalScroll):
     def clear(self) -> None:
         """Wipe the transcript: remove every message widget and streaming state.
 
-        Used by the ``\\clear`` command. The persistent repaint timer set up in
+        Used by the ``/clear`` command. The persistent repaint timer set up in
         ``on_mount`` keeps running; only content and in-flight buffers reset.
         """
         self.remove_children()
@@ -841,7 +855,7 @@ class ChatView(VerticalScroll):
         if self._assistant is None:
             self._assistant_buf = text
             self._assistant = self._append(
-                Static(Markdown(self._assistant_buf), classes="msg assistant")
+                Static(_markdown(self._assistant_buf), classes="msg assistant")
             )
         else:
             self._assistant_buf += text
@@ -849,7 +863,7 @@ class ChatView(VerticalScroll):
 
     def flush_assistant(self) -> None:
         if self._assistant is not None:
-            self._assistant.update(Markdown(self._assistant_buf))
+            self._assistant.update(_markdown(self._assistant_buf))
             self._bump()
         self._assistant = None
         self._assistant_buf = ""

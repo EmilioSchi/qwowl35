@@ -1,4 +1,4 @@
-"""Tests for local ``\\``-commands: dispatch, ``\\clear``, and the theme picker.
+"""Tests for local ``/``-commands: dispatch, ``/clear``, and the theme picker.
 
 Run directly: ``python qwowl35/tests/theme_command_test.py``. The dispatch/clear
 tests use fakes (no TUI); the picker test drives the real app headless via
@@ -34,7 +34,7 @@ def assert_true(value, label: str) -> None:
 def _dispatch_app():
     app = QwowlApp.__new__(QwowlApp)
     calls: list[str] = []
-    app.action_quit = lambda: calls.append("quit")
+    app.exit = lambda: calls.append("quit")  # quit/exit/abort/close -> App.exit()
     app._clear_conversation = lambda: calls.append("clear")
     app._open_theme_selector = lambda: calls.append("theme")
     return app, calls
@@ -42,11 +42,12 @@ def _dispatch_app():
 
 def test_dispatch_routes_exact_commands() -> None:
     for cmd, expected in [
-        ("\\quit", "quit"),
-        ("\\abort", "quit"),
-        ("\\exit", "quit"),
-        ("\\clear", "clear"),
-        ("\\theme", "theme"),
+        ("/quit", "quit"),
+        ("/exit", "quit"),
+        ("/abort", "quit"),
+        ("/close", "quit"),
+        ("/clear", "clear"),
+        ("/theme", "theme"),
     ]:
         app, calls = _dispatch_app()
         assert_true(app._dispatch_command(cmd), f"{cmd} handled")
@@ -55,7 +56,7 @@ def test_dispatch_routes_exact_commands() -> None:
 
 def test_dispatch_ignores_non_commands() -> None:
     app, calls = _dispatch_app()
-    for text in ("hello", "quit", "\\quitx", "\\ quit", "\\THEME", "\\clear now", "\\"):
+    for text in ("hello", "quit", "/quitx", "/ quit", "/THEME", "/clear now", "/", "\\quit"):
         assert_true(not app._dispatch_command(text), f"{text!r} not a command")
     assert_equal(calls, [], "no handlers fired for non-commands")
 
@@ -142,8 +143,8 @@ def test_theme_picker_preview_commit_and_revert() -> None:
             assert_true(len(names) >= 2, "need at least two themes to navigate")
             app.apply_theme_preview(theme_default := names[0], "dark")
 
-            # \theme opens the picker (real worker + push_screen_wait flow)
-            app._dispatch_command("\\theme")
+            # /theme opens the picker (real worker + push_screen_wait flow)
+            app._dispatch_command("/theme")
             await pilot.pause()
             await pilot.pause()
             assert_true(isinstance(app.screen, ThemeSelector), "picker opened")
@@ -175,7 +176,7 @@ def test_clear_command_empties_chat_keeps_system() -> None:
             await pilot.pause()
             assert_true(len(app.chat.children) > 0, "chat has a message")
 
-            app._dispatch_command("\\clear")
+            app._dispatch_command("/clear")
             await pilot.pause()
 
             assert_equal(len(app.chat.children), 0, "transcript emptied")
