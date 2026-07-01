@@ -45,6 +45,47 @@ def test_block_rows_pad_background_to_width() -> None:
     assert_true("\x1b[48;2;17;19;24m         " in ansi, "background padding emitted")
 
 
+def _textual_content_height(renderable, width: int = 80) -> int:
+    """Mimic Textual's ``RichVisual.get_height`` (textual/visual.py): the height it
+    assigns an auto-height widget by COUNTING '\\n' in the rendered segments, not by
+    counting logical lines. It then crops the widget's strips to that height. A box
+    whose final row lacked a trailing newline measured one row short, so Textual
+    cropped the last line — the bash output, a tool-call arg preview, or the final
+    line of the approval command — and painted a blank in its place.
+    """
+    console = Console(width=width, file=StringIO())
+    options = console.options.update_width(width).update(highlight=False)
+    return sum(seg.text.count("\n") for seg in console.render(renderable, options))
+
+
+def test_fullwidth_wrap_height_counts_every_row() -> None:
+    # Regression (output-not-displayed bug): every wrapped row must terminate with a
+    # newline, including the last, so Textual's newline-based height measurement
+    # matches the real row count and never crops the final row.
+    rows = [_line_with_bg(Text(f"row {i}"), "#111318") for i in range(4)]
+    height = _textual_content_height(_FullWidthLines(rows, wrap=True))
+    assert_true(height == 4, f"every wrapped row measured (got {height}, want 4)")
+
+
+def test_bash_result_height_includes_output_row() -> None:
+    # The concrete symptom: `$ date` and its output were measured as 2 rows, so
+    # Textual cropped the output line to a blank. Badge + command + output = 3.
+    block = ToolBlock("bash")
+    block.args_buf = '{"command":"date"}'
+    block.full_result = "Wed Jul  1 21:11:27 CEST 2026\n"
+    height = _textual_content_height(ChatView()._render_tool_result(block))
+    assert_true(height >= 3, f"result measured tall enough to show output (got {height})")
+
+
+def test_tool_call_detail_height_includes_detail_row() -> None:
+    # Same bug for non-bash calls: the badge + the single arg-preview row must both
+    # be measured, or the detail line is cropped away ("with other commands").
+    block = ToolBlock("beginTransaction")
+    block.args_buf = '{"file":"example.py"}'
+    height = _textual_content_height(ChatView()._render_tool_call(block))
+    assert_true(height >= 2, f"call detail measured tall enough to show (got {height})")
+
+
 def test_fullwidth_wrap_shows_all_lines_under_height_constraint() -> None:
     # Regression: the approval modal lives in an auto-height container, so the
     # render options carry a `height`. _FullWidthLines(wrap=True) must render each
@@ -404,6 +445,9 @@ def test_render_is_display_only_and_non_mutating() -> None:
 def main() -> None:
     test_block_rows_pad_background_to_width()
     test_fullwidth_wrap_shows_all_lines_under_height_constraint()
+    test_fullwidth_wrap_height_counts_every_row()
+    test_bash_result_height_includes_output_row()
+    test_tool_call_detail_height_includes_detail_row()
     test_split_bash_advisories()
     test_advisory_segments_classifies()
     test_bash_post_write_anchors_render_as_file_view()

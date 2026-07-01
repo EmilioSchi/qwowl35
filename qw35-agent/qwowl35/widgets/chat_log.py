@@ -122,14 +122,13 @@ class _FullWidthLines:
                 yield text
             return
 
-        last_index = len(self._lines) - 1
         # Render each logical line at its NATURAL height: clear options.height so
         # render_lines doesn't pad every single line out to the widget's full
         # height. (When height is set — e.g. inside an auto-height container like
         # the approval modal — each line would otherwise be padded to the whole
         # height, so only the first line shows and the rest collapse to blanks.)
         line_options = options.update(height=None)
-        for index, line in enumerate(self._lines):
+        for line in self._lines:
             text = line.text.copy()
             text.no_wrap = False
             # render_lines folds the line and pads every visual row to the full
@@ -137,10 +136,17 @@ class _FullWidthLines:
             rows = console.render_lines(
                 text, line_options, pad=True, style=Style.parse(line.pad_style)
             )
-            for row_index, segments in enumerate(rows):
+            # Terminate EVERY visual row with a newline, including the very last.
+            # Textual measures a widget's height by counting '\n' in the rendered
+            # segments (RichVisual.get_height), then crops the strips to that
+            # height. A box whose final row had no trailing newline was measured
+            # one row short, so its last line — the bash output, a tool-call arg
+            # preview, or the final line of the approval command — got cropped
+            # away. It also let the next renderable in a Group ride onto that
+            # unterminated row (the "swallow" the advisory block worked around).
+            for segments in rows:
                 yield from segments
-                if not (index == last_index and row_index == len(rows) - 1):
-                    yield Segment.line()
+                yield Segment.line()
 
 
 def _line_with_bg(text: Text, bg: str) -> _BlockLine:
