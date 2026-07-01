@@ -252,8 +252,6 @@ class StatusBar(Widget):
         else:
             dot_style = theme.FG_GHOST
         label = host_label(state.base_url)
-        if state.model:
-            label = f"{label} · {state.model}"
         out = Text()
         out.append("● ", style=dot_style)
         out.append(label, style=theme.FG_DIM)
