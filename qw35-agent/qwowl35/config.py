@@ -20,8 +20,9 @@ from dataclasses import dataclass, replace
 ALLOWED_THINK = ("auto", "on", "off")
 
 # Reasoning levels for the optional effort override (only meaningful with
-# thinking on). The server maps each to a thinking-token budget (low ≈ 20%,
-# medium ≈ 50%, high ≈ 80% of max_tokens; xhigh is uncapped).
+# thinking on). The server maps each to a thinking-token budget (low ≈ 4%,
+# medium ≈ 10%, high ≈ 16% of max_tokens — 8192 basis when max_tokens is
+# unset; xhigh falls back to the 16% backstop, not uncapped).
 ALLOWED_EFFORTS = ("low", "medium", "high", "xhigh")
 
 # Input prompt: paste-collapsing thresholds (little-coder parity). Message-history

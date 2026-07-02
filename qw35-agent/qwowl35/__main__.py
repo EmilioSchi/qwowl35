@@ -33,7 +33,7 @@ def main() -> None:
         "--reasoning-effort",
         choices=["low", "medium", "high", "xhigh"],
         help="optional thinking budget when --think on: low/medium/high cap the reasoning "
-        "budget, xhigh is uncapped (only sent when given)",
+        "budget at 4/10/16%% of max_tokens, xhigh keeps the 16%% backstop (only sent when given)",
     )
     parser.add_argument(
         "--restricted-bash",

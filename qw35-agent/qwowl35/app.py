@@ -119,6 +119,7 @@ class QwowlApp(App):
             base_url=self.config.base_url,
             think=self.config.think,
             effort=self.config.reasoning_effort,
+            max_tokens=self.config.max_tokens,
         )
         self.chat = ChatView()
         self.queue_panel = Static("", id="queue-panel")

@@ -11,15 +11,19 @@ from textual.widget import Widget
 import theme
 
 
-# Mirrors the server's thinking-budget fractions
-# (qw35-server `thinking_budget_for`): low 4%, medium 10%, high 16% of the
-# answer budget; xhigh/unspecified fall back to the 16% backstop. Keep in sync.
+# Mirrors the server's thinking-budget computation (qw35-server
+# `thinking_budget_for`): low 4%, medium 10%, high 16% of the request's
+# max_tokens; xhigh/unspecified fall back to the 16% backstop. When the request
+# carries no fixed max_tokens (the agent default) the server scales against its
+# 8192-token agentic basis, and always floors the cap at 16 tokens. Keep in sync.
 EFFORT_CAP_PERCENT = {
     "low": 4,
     "medium": 10,
     "high": 16,
     "xhigh": 16,
 }
+SERVER_DEFAULT_TOKEN_BASIS = 8192
+SERVER_MIN_CAP_TOKENS = 16
 
 
 def rough_token_count(text: str) -> int:
@@ -43,6 +47,18 @@ def effort_cap_percent(think: str, effort: str | None, inferred_thinking: bool =
     if inferred_thinking:
         return EFFORT_CAP_PERCENT.get(effort or "xhigh", 16)
     return None
+
+
+def thinking_cap_tokens(cap_percent: int | None, max_tokens: int | None) -> int | None:
+    """Token cap the server will enforce, from the effort percentage.
+
+    Matches `thinking_budget_for`: a fixed request max_tokens is the basis,
+    otherwise the server's 8192 agentic default; the cap never drops below 16.
+    """
+    if cap_percent is None:
+        return None
+    basis = max_tokens if max_tokens and max_tokens > 0 else SERVER_DEFAULT_TOKEN_BASIS
+    return max(SERVER_MIN_CAP_TOKENS, int(basis * cap_percent / 100))
 
 
 def display_path(path: str, max_len: int = 80) -> str:
@@ -146,8 +162,7 @@ def think_summary(
 def context_line(state: "StatusState") -> str:
     """Footer-left text: context fill plus live thinking-budget usage."""
     cap = effort_cap_percent(state.think, state.effort, state.inferred_thinking)
-    basis = _thinking_basis(state.ctx_size, state.prompt_tokens)
-    cap_tokens = round(basis * cap / 100) if cap is not None and basis is not None else None
+    cap_tokens = thinking_cap_tokens(cap, state.max_tokens)
     think_used = percent(state.reasoning_estimate, cap_tokens) if state.reasoning_estimate else None
     return (
         f"{decode_summary(state.decode_tps)}  "
@@ -161,6 +176,7 @@ class StatusState:
     base_url: str
     think: str
     effort: str | None
+    max_tokens: int | None = None
     model: str | None = None
     ready: bool | None = None
     ctx_size: int | None = None
@@ -188,9 +204,13 @@ class StatusBar(Widget):
     }
     """
 
-    def __init__(self, *, base_url: str, think: str, effort: str | None) -> None:
+    def __init__(
+        self, *, base_url: str, think: str, effort: str | None, max_tokens: int | None = None
+    ) -> None:
         super().__init__()
-        self.state = StatusState(base_url=base_url, think=think, effort=effort)
+        self.state = StatusState(
+            base_url=base_url, think=think, effort=effort, max_tokens=max_tokens
+        )
 
     def update_health(self, payload: dict | None) -> None:
         if not payload:
@@ -283,11 +303,3 @@ def _int_or_none(value: object) -> int | None:
     if isinstance(value, float):
         return int(value)
     return None
-
-
-def _thinking_basis(ctx_size: int | None, prompt_tokens: int | None) -> int | None:
-    if ctx_size is None:
-        return None
-    if prompt_tokens is None:
-        return ctx_size
-    return max(0, ctx_size - prompt_tokens)

@@ -24,6 +24,7 @@ from widgets.status_panel import (  # noqa: E402
     percent,
     rough_token_count,
     think_summary,
+    thinking_cap_tokens,
 )
 
 
@@ -53,6 +54,16 @@ def test_effort_cap_mapping_matches_server() -> None:
     assert_equal(effort_cap_percent("off", "high"), None, "thinking off")
     assert_equal(effort_cap_percent("auto", None), None, "auto before reasoning")
     assert_equal(effort_cap_percent("auto", None, inferred_thinking=True), 16, "auto inferred")
+
+
+def test_thinking_cap_tokens_matches_server_basis() -> None:
+    # Mirrors qw35-server `thinking_budget_for`: fixed max_tokens is the basis,
+    # otherwise the server's 8192 agentic default; the cap never drops below 16.
+    assert_equal(thinking_cap_tokens(None, None), None, "no cap when thinking off")
+    assert_equal(thinking_cap_tokens(10, None), 819, "8192 basis when max_tokens unset")
+    assert_equal(thinking_cap_tokens(16, None), 1310, "backstop on the 8192 basis")
+    assert_equal(thinking_cap_tokens(16, 4096), 655, "fixed max_tokens is the basis")
+    assert_equal(thinking_cap_tokens(4, 100), 16, "cap floored at 16 tokens")
 
 
 def test_display_path_normalizes_home_and_crops_from_left() -> None:
@@ -105,6 +116,13 @@ def test_context_line_combines_context_and_think() -> None:
     state.decode_tps = 19.65
     assert_equal(context_line(state), "19.6 tok/s  3.8%/130k  auto think", "speed leads the footer text")
 
+    # Live usage scales against the server's 8192 basis, not remaining context:
+    # medium cap = 819 tokens, so 410 estimated reasoning tokens ≈ 50%.
+    state.think = "on"
+    state.effort = "medium"
+    state.reasoning_estimate = 410
+    assert_equal(context_line(state), "19.6 tok/s  3.8%/130k  medium think 50%", "usage on server basis")
+
 
 def test_status_bar_stacks_when_too_narrow() -> None:
     left = Text("3.8%/130k  auto think")   # 21 cells
@@ -137,6 +155,7 @@ def test_rough_token_count_is_monotonic() -> None:
 def main() -> None:
     test_percent_handles_unknowns_and_bounds()
     test_effort_cap_mapping_matches_server()
+    test_thinking_cap_tokens_matches_server_basis()
     test_display_path_normalizes_home_and_crops_from_left()
     test_compact_context_and_think_text()
     test_decode_speed_uses_fixed_four_figure_field()
