@@ -10,6 +10,12 @@ from typing import Any
 
 from gguf import GGUFReader, GGUFValueType, ReaderTensor
 
+import gguf_custom_types
+
+# qw35 unified models carry custom tensor types (GF4=100, GF2=101) that stock
+# gguf-py rejects at GGUFReader construction time.
+gguf_custom_types.register_custom_types()
+
 logger = logging.getLogger("gguf-dump")
 
 
