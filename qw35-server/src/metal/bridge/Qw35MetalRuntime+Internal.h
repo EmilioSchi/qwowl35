@@ -34,8 +34,9 @@
 #define QW35_MAX_SLABS 64u
 
 /// Per-layer weights resolved once at init so the per-token encode loop does
-/// no string formatting or dictionary lookups. FFN matvec weights are GF4
-/// (type_id 100) in the unified .gguf.
+/// no string formatting or dictionary lookups. FFN matvec weights are baked
+/// per layer in the unified .gguf as GF4 (type_id 100) or GF2 (type_id 101);
+/// codecs may be mixed across layers.
 @interface Qw35LayerTensors : NSObject
 @property (nonatomic, strong) Qw35Tensor *attnNorm;
 @property (nonatomic, strong) Qw35Tensor *postAttentionNorm;

@@ -634,10 +634,19 @@
         open_real_engine_with(prefill_chunk, 128)
     }
 
+    /// Model opened by the real_model_* tests. QW35_REAL_MODEL overrides the
+    /// default base GGUF so captures/smokes can target another cook (e.g. the
+    /// Ornith editions).
+    #[cfg(target_os = "macos")]
+    fn real_model_path() -> String {
+        std::env::var("QW35_REAL_MODEL")
+            .unwrap_or_else(|_| ".gguf/Qwen3.5-9B-Q4_K_M.gguf".to_string())
+    }
+
     #[cfg(target_os = "macos")]
     fn open_real_engine_with(prefill_chunk: u32, ctx_size: u32) -> Engine {
         Engine::open(EngineConfig {
-            model_path: PathBuf::from(".gguf/Qwen3.5-9B-Q4_K_M.gguf"),
+            model_path: PathBuf::from(real_model_path()),
             model_id: DEFAULT_MODEL_ID.to_string(),
             ctx_size,
             prefill_chunk,

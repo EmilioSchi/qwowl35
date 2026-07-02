@@ -5,14 +5,12 @@
 
     #[test]
     fn supports_real_qwen35_gguf_quant_formats() {
-        for name in ["f32", "q4_k", "q5_k", "q6_k", "q8_0", "gf4"] {
+        for name in ["f32", "q4_k", "q5_k", "q6_k", "q8_0", "gf4", "gf2"] {
             assert!(qwen_metal_type_supported(name), "{name}");
         }
 
         assert!(!qwen_metal_type_supported("q3_k"));
         assert!(!qwen_metal_type_supported("iq1_s"));
-        // gf2 has a decode matvec but no tiled prefill kernel yet.
-        assert!(!qwen_metal_type_supported("gf2"));
     }
 
     #[test]

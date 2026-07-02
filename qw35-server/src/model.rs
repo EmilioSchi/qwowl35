@@ -346,26 +346,39 @@ impl Engine {
         self.session_cache
     }
 
-    /// True when decode uses GF4 FFN weights — i.e. the unified .gguf with its
-    /// FFN baked as type-id 100 (a plain base GGUF decodes on Q4_K instead).
+    /// True when decode uses baked FFN weights — i.e. a unified .gguf whose
+    /// FFN carries the GF4 (100) or GF2 (101) codec on any layer (a plain
+    /// base GGUF decodes on Q4_K instead).
     pub fn gf4_active(&self) -> bool {
-        self.ffn_is_gf4()
+        let (gf4, gf2) = self.ffn_codec_layers();
+        gf4 + gf2 > 0
     }
 
-    /// True when the GGUF itself carries a GF4 (type-id 100) FFN — i.e. the
-    /// unified Qwowl3.5-9B .gguf rather than a plain base GGUF.
-    fn ffn_is_gf4(&self) -> bool {
-        self.gguf
-            .tensor("blk.0.ffn_gate.weight")
-            .is_some_and(|t| t.type_id == 100)
+    /// Count layers whose FFN is baked as (GF4, GF2). A layer is attributed
+    /// by its `ffn_gate` tensor; codecs may be mixed across layers in one
+    /// unified .gguf.
+    fn ffn_codec_layers(&self) -> (u32, u32) {
+        let blocks = self.gguf.metadata_u32("qwen35.block_count").unwrap_or(0);
+        let mut gf4 = 0;
+        let mut gf2 = 0;
+        for layer in 0..blocks {
+            let name = format!("blk.{layer}.ffn_gate.weight");
+            match self.gguf.tensor(&name).map(|t| t.type_id) {
+                Some(100) => gf4 += 1,
+                Some(101) => gf2 += 1,
+                _ => {}
+            }
+        }
+        (gf4, gf2)
     }
 
-    /// Label for the startup summary `ffn=` line.
-    pub fn ffn_label(&self) -> &'static str {
-        if self.ffn_is_gf4() {
-            "gf4-unified"
-        } else {
-            "gguf"
+    /// Label for the startup summary `ffn=` line and /health.
+    pub fn ffn_label(&self) -> String {
+        match self.ffn_codec_layers() {
+            (0, 0) => "gguf".to_string(),
+            (_, 0) => "gf4-unified".to_string(),
+            (0, _) => "gf2-unified".to_string(),
+            (gf4, gf2) => format!("gf4+gf2({gf4}+{gf2})"),
         }
     }
 

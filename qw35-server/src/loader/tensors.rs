@@ -121,9 +121,10 @@ pub(crate) unsafe fn parse_mapping(ptr: *const u8, len: usize) -> Result<ParsedG
 }
 
 fn tensor_nbytes(type_id: u32, elements: u64) -> Option<u64> {
-    // GF2 (qw35 2-bit sidecar codec) stores two planes — 16 two-bit codes
-    // packed in one uint32 plus one fp8(e5m2) scale byte per group of 16, i.e.
-    // 5 bytes per 16 elements — which does not fit the single (block_elems,
+    // GF2 (qw35 2-bit codec): 16 two-bit codes packed in one uint32 plus one
+    // fp8(e5m2) scale byte per group of 16, stored as interleaved 256-element
+    // super-blocks (16 code words then their 16 scale bytes, 80 B). Still 5
+    // bytes per 16 elements, which does not fit the single (block_elems,
     // block_bytes) tuple math below, so size it explicitly.
     if type_id == 101 {
         return elements

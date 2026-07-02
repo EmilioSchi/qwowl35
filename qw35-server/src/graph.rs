@@ -205,10 +205,11 @@ fn require_tensor(gguf: &MappedGguf, name: &str, missing: &mut Vec<String>) {
 }
 
 fn qwen_metal_type_supported(name: &str) -> bool {
-    // "gf4" is the unified .gguf FFN codec: both the single-token decode matvec
-    // and the tiled multi-token prefill matmul have GF4 kernels. ("gf2" has no
-    // tiled prefill kernel, so it is intentionally not prefill-capable here.)
-    matches!(name, "f32" | "q4_k" | "q5_k" | "q6_k" | "q8_0" | "gf4")
+    // "gf4" and "gf2" are the unified .gguf baked FFN codecs: both have
+    // single-token decode matvec AND tiled multi-token prefill kernels
+    // (gf2 gained prefill with the interleaved super-block layout), and the
+    // two may be mixed per layer in one file.
+    matches!(name, "f32" | "q4_k" | "q5_k" | "q6_k" | "q8_0" | "gf4" | "gf2")
 }
 
 #[cfg(test)]

@@ -223,6 +223,16 @@ kernel qw35_mul_mm_t qw35_kernel_mul_mm<
     qw35_block_gf4, 16, qw35_dequantize_gf4,
     float, float2x4>;
 
+// GF2 mirrors GF4's tiled path: interleaved 80-byte super-block (16 code
+// words + 16 scale bytes per 256 elems), qw35_block_gf2 / qw35_dequantize_gf2
+// in qw35_gf2.metal.
+template [[host_name("qw35_mul_mm_gf2_f32")]]
+kernel qw35_mul_mm_t qw35_kernel_mul_mm<
+    half, half4x4, simdgroup_half8x8,
+    float, float2x4, simdgroup_float8x8,
+    qw35_block_gf2, 16, qw35_dequantize_gf2,
+    float, float2x4>;
+
 template [[host_name("qw35_mul_mm_q5_k_f32")]]
 kernel qw35_mul_mm_t qw35_kernel_mul_mm<
     half, half4x4, simdgroup_half8x8,

@@ -498,10 +498,19 @@
     for (size_t i = 0; i < 4; i++) {
         if (![self attnPipeline:attn[i] error:error]) return NO;
     }
-    // GF4 FFN is baked into the unified .gguf as type-100 tensors in the tensor
-    // store; the type-id drives the GF4 kernel path.
-    Qw35Tensor *ffnGate0 = [_tensorStore tensorNamed:@"blk.0.ffn_gate.weight"];
-    BOOL gf4Ffn = ffnGate0 != nil && ffnGate0.type_id == 100;
+    // Baked FFN codecs (GF4 type-100, GF2 type-101) are per-layer in a mixed
+    // unified .gguf, so scan every layer's gate/up/down instead of sampling
+    // blk.0 only; prewarm each codec's kernels once if any layer uses it.
+    BOOL gf4Ffn = NO;
+    BOOL gf2Ffn = NO;
+    for (Qw35LayerTensors *layer in _layers) {
+        Qw35Tensor *const parts[] = { layer.ffnGate, layer.ffnUp, layer.ffnDown };
+        for (size_t i = 0; i < 3; i++) {
+            if (parts[i] == nil) continue;
+            if (parts[i].type_id == 100) gf4Ffn = YES;
+            if (parts[i].type_id == 101) gf2Ffn = YES;
+        }
+    }
     if (gf4Ffn) {
         if (![_pipelineCache pipelineNamed:@"qw35_ffn_gate_up_swiglu_gf4_f32" error:error]) return NO;
         if (![_pipelineCache pipelineNamed:@"qw35_decode_matmul_gf4_2row_residual_f32" error:error]) return NO;
@@ -509,10 +518,16 @@
         // Tiled GF4 prefill matmul (full and bounded-output tail-chunk variants).
         if (![_pipelineCache mulMmPipelineNamed:@"qw35_mul_mm_gf4_f32" bcInp:NO bcOut:NO error:error]) return NO;
         if (![_pipelineCache mulMmPipelineNamed:@"qw35_mul_mm_gf4_f32" bcInp:NO bcOut:YES error:error]) return NO;
-        Qw35Tensor *baseHead = [_tensorStore tensorNamed:@"output.weight"];
-        if (baseHead != nil && baseHead.type_id == 100) {
-            if (![_pipelineCache pipelineNamed:@"qw35_output_gf4_argmax_partials_16row_f32" error:error]) return NO;
-        }
+    }
+    if (gf2Ffn) {
+        if (![_pipelineCache pipelineNamed:@"qw35_decode_matmul_gf2_2row_residual_f32" error:error]) return NO;
+        if (![_pipelineCache pipelineNamed:@"qw35_decode_matmul_gf2_2row_f32" error:error]) return NO;
+        if (![_pipelineCache mulMmPipelineNamed:@"qw35_mul_mm_gf2_f32" bcInp:NO bcOut:NO error:error]) return NO;
+        if (![_pipelineCache mulMmPipelineNamed:@"qw35_mul_mm_gf2_f32" bcInp:NO bcOut:YES error:error]) return NO;
+    }
+    Qw35Tensor *baseHead = [_tensorStore tensorNamed:@"output.weight"];
+    if (baseHead != nil && baseHead.type_id == 100) {
+        if (![_pipelineCache pipelineNamed:@"qw35_output_gf4_argmax_partials_16row_f32" error:error]) return NO;
     }
     return YES;
 }

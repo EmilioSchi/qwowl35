@@ -1013,7 +1013,7 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "test_responder": engine.test_responder(),
         "ctx_size": engine.ctx_size(),
         "prefill_chunk": engine.prefill_chunk(),
-        "ffn": if engine.gf4_active() { "gf4-sidecar" } else { "gguf" },
+        "ffn": engine.ffn_label(),
         "mapped_bytes": summary.mapped_bytes,
         "architecture": summary.architecture,
         "model_name": summary.name,

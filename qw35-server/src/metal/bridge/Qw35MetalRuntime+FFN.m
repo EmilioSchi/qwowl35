@@ -154,8 +154,10 @@
 }
 
 /// Single-token quantized matvec. With residual == YES the kernel adds into
-/// dst instead of overwriting it (Q4_K, Q6_K, and GF4 weights only).
-/// GF4 FFN tensors carry type_id 100.
+/// dst instead of overwriting it (Q4_K, Q6_K, GF4, and GF2 weights only).
+/// Unified-.gguf baked FFN tensors carry type_id 100 (GF4) or 101 (GF2);
+/// both store one contiguous interleaved stream, so every codec shares the
+/// generic bind below (weight, input, dst, n_blocks, k, rows at 0..5).
 - (BOOL)encodeDecodeMatvecTensor:(id<MTLComputeCommandEncoder>)enc
                           weight:(Qw35Tensor *)w
                            input:(id<MTLBuffer>)input
@@ -165,28 +167,6 @@
                            error:(NSError **)error {
     const int64_t k = (int64_t)w.dims[0];
     const int64_t rows = (int64_t)w.dims[1];
-
-    if (w.type_id == 101) {
-        // GF2 (2-bit): one buffer holds the code plane [rows*groups] uint32
-        // followed by the fp8 scale plane [rows*groups] uchar. Group is 16.
-        const int64_t n_groups = (int64_t)qw35_div_up_u64((uint64_t)k, 16);
-        const uint64_t codes_bytes = (uint64_t)rows * (uint64_t)n_groups * 4;
-        NSString *gf2k = residual ? @"qw35_decode_matmul_gf2_2row_residual_f32"
-                                  : @"qw35_decode_matmul_gf2_2row_f32";
-        id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:gf2k error:error];
-        if (!pipe) return NO;
-        [enc setComputePipelineState:pipe];
-        [enc setBuffer:w.buffer offset:w.offset atIndex:0];
-        [enc setBuffer:w.buffer offset:(w.offset + (NSUInteger)codes_bytes) atIndex:1];
-        [enc setBuffer:input offset:inputOffset atIndex:2];
-        [enc setBuffer:dst offset:0 atIndex:3];
-        [enc setBytes:&n_groups length:sizeof(n_groups) atIndex:4];
-        [enc setBytes:&k length:sizeof(k) atIndex:5];
-        [enc setBytes:&rows length:sizeof(rows) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)qw35_div_up_u64((uint64_t)rows, 4), 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
-        return YES;
-    }
 
     NSString *kernel = nil;
     uint64_t block_elems = 256;
@@ -213,11 +193,18 @@
                               : @"qw35_decode_matmul_gf4_2row_f32";
             block_elems = 8;
             break;
+        case 101:
+            // GF2 kernels take the group count (16 elems per code word) at
+            // the n_blocks slot; the interleaved super-block walk is internal.
+            kernel = residual ? @"qw35_decode_matmul_gf2_2row_residual_f32"
+                              : @"qw35_decode_matmul_gf2_2row_f32";
+            block_elems = 16;
+            break;
         default:
             if (error) *error = qw35_error(@"unsupported tensor type %u for %@", w.type_id, w.name);
             return NO;
     }
-    if (residual && w.type_id != 12 && w.type_id != 14 && w.type_id != 100) {
+    if (residual && w.type_id != 12 && w.type_id != 14 && w.type_id != 100 && w.type_id != 101) {
         if (error) *error = qw35_error(@"no residual matvec kernel for tensor type %u (%@)", w.type_id, w.name);
         return NO;
     }
@@ -273,12 +260,12 @@
         case 12: tiledKernel = @"qw35_mul_mm_q4_k_f32"; break;
         case 13: tiledKernel = @"qw35_mul_mm_q5_k_f32"; break;
         case 14: tiledKernel = @"qw35_mul_mm_q6_k_f32"; break;
-        // Unified .gguf: FFN is GF4 (type 100). A 256-element super-block keeps
-        // the k%256 guard and row_bytes=w.bytes/rows valid, so the tiled path
-        // below is reused unchanged. GF2 (101) has a separate scale plane and
-        // is not supported for prefill — it falls through to the error and
-        // stays decode-only.
+        // Unified .gguf baked FFN codecs: both GF4 (100) and GF2 (101) store
+        // 256-element interleaved super-blocks, keeping the k%256 guard and
+        // row_bytes=w.bytes/rows valid, so the tiled path below is reused
+        // unchanged for either.
         case 100: tiledKernel = @"qw35_mul_mm_gf4_f32"; break;
+        case 101: tiledKernel = @"qw35_mul_mm_gf2_f32"; break;
         default:
             if (error) *error = qw35_error(@"unsupported tensor type %u for %@", w.type_id, weightName);
             return NO;
