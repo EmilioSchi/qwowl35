@@ -13,6 +13,9 @@ is inclusive of both endpoints: `12af..189c` covers lines 12 through 18,
 including both line 12 and line 18.
 
 Use beginTransaction to open a file and get its line ids before editing.
+edit, insert, and delete each require a prior beginTransaction on the file in
+this session; calls without it are denied, because that output is the only
+source of valid line ids.
 
 Use the file edit tools for existing non-empty files:
 - edit: replace one line or range by id in a file that already exists and is non-empty.

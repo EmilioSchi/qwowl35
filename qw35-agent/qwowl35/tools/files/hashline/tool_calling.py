@@ -376,8 +376,24 @@ class HashlineTools:
         except Exception:  # noqa: BLE001 - best-effort cleanup must not break the edit
             return []
 
+    def _require_transaction(self, file: str, action: str) -> None:
+        """Deny a mutation on a file never opened with beginTransaction this session.
+
+        The model only holds line ids for files it has opened; without a prior
+        beginTransaction any id it sends is a guess.
+        """
+        if file in self._read_headered:
+            return
+        raise HashlineError(
+            f"{action} denied: {file} was not opened with beginTransaction in this "
+            "session, so you do not hold its line ids. Call the beginTransaction "
+            f"tool on {file} first to read its current '<line><hash>' ids, then "
+            "retry using an id copied from that output."
+        )
+
     def edit(self, args: dict[str, Any]) -> str:
         file = self._file(args)
+        self._require_transaction(file, "edit")
         anchor = self._id(args, required=not self._has_start_query(args))
         content = self._content(args)
         before = self._read_text(file)
@@ -394,6 +410,7 @@ class HashlineTools:
 
     def insert(self, args: dict[str, Any]) -> str:
         file = self._file(args)
+        self._require_transaction(file, "insert")
         anchor = self._id(args, required=not self._has_start_query(args))
         if anchor and looks_like_range_anchor(anchor):
             left, right = anchor.split("..", 1)
@@ -418,6 +435,7 @@ class HashlineTools:
 
     def delete(self, args: dict[str, Any]) -> str:
         file = self._file(args)
+        self._require_transaction(file, "delete")
         anchor = self._id(args, required=not self._has_start_query(args))
         before = self._read_text(file)
         raw = run_delete(

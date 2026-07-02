@@ -219,6 +219,7 @@ def test_start_end_keyword_ids_resolve_positionally() -> None:
         try:
             Path("m.py").write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
             tools = HashlineTools()
+            tools.execute("beginTransaction", {"file": "m.py"})
 
             appended = tools.execute(
                 "insert",
@@ -290,11 +291,54 @@ def test_noop_edit_reports_no_changes() -> None:
             os.chdir(cwd)
 
 
+def test_mutation_denied_without_begin_transaction() -> None:
+    """edit/insert/delete on a file never opened with beginTransaction are denied
+    with advice to open it first, and the file on disk stays untouched."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            original = "def f():\n    return 1\n"
+            Path("m.py").write_text(original, encoding="utf-8")
+            Path("other.py").write_text("x = 1\n", encoding="utf-8")
+            tools = HashlineTools()
+
+            for name, extra in (
+                ("edit", {"content": "    return 2"}),
+                ("insert", {"content": "import os", "position": "before"}),
+                ("delete", {}),
+            ):
+                result = tools.execute(name, {"file": "m.py", "id": "1aa", **extra})
+                assert_true(result.startswith(f"Error: {name} denied"), f"{name} denied: {result}")
+                assert_true("beginTransaction" in result, f"{name} denial advises beginTransaction: {result}")
+                assert_equal(Path("m.py").read_text(encoding="utf-8"), original, f"file untouched after denied {name}")
+
+            # Opening a DIFFERENT file does not unlock this one.
+            tools.execute("beginTransaction", {"file": "other.py"})
+            still = tools.execute("edit", {"file": "m.py", "id": "1aa", "content": "x"})
+            assert_true(still.startswith("Error: edit denied"), f"gate is per-file: {still}")
+
+            # After opening the file, the same mutation with a real id succeeds.
+            shown = tools.execute("beginTransaction", {"file": "m.py"})
+            return_id = _line_id(shown, 2)
+            edited = tools.execute("edit", {"file": "m.py", "id": return_id, "content": "    return 2"})
+            assert_true(edited.startswith("Edited line 2"), f"edit allowed after open: {edited}")
+
+            # A follow-up mutation without re-opening still passes the gate
+            # (the session remembers the file; stale ids stay covered by hashes).
+            second_id = _line_id(edited, 2)
+            second = tools.execute("edit", {"file": "m.py", "id": second_id, "content": "    return 3"})
+            assert_true(second.startswith("Edited line 2"), f"second edit allowed: {second}")
+        finally:
+            os.chdir(cwd)
+
+
 def main() -> None:
     test_xxh32_matches_hashline_reference_values()
     test_line_ref_has_no_separator_and_round_trips()
     test_schema_advertises_begin_transaction_only()
     test_begin_transaction_edit_insert_delete_flow()
+    test_mutation_denied_without_begin_transaction()
     test_noop_edit_reports_no_changes()
     test_insert_range_id_reports_single_id_guidance()
     test_stale_id_reports_context_and_flips_on_edit()
