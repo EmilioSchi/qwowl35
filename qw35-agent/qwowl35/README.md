@@ -24,6 +24,11 @@ Configuration is CLI-only — no environment-variable overrides. The bash analyz
 gains an AST mode if the optional `tree-sitter-language-pack` is installed, but
 falls back to substring matching without it.
 
+The `/theme` picker is the one exception: the last committed theme is remembered
+across launches (written to `theme.json` in the OS config dir). Set
+`QWOWL35_THEME=<name>` (or `<name>:<mode>`, e.g. `tokyonight:light`) to override
+that saved choice for a session.
+
 ## Design
 
 - **Tools upfront.** The system prompt describes `bash` and the anchored file

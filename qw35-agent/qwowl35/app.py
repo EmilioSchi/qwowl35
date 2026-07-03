@@ -24,6 +24,7 @@ from textual.widgets import Static
 import mascot
 import mascot_states
 import theme
+from theme import preference as theme_preference
 from theme import registry as theme_registry
 from agent import Agent
 from approval import ApprovalDecision
@@ -129,11 +130,13 @@ class QwowlApp(App):
         self.queue_panel = Static("", id="queue-panel")
         self._queued_messages: list[str] = []
         self.agent = Agent(self.client, self.registry, self.config, self)
-        # Theme catalog (built-in default + bundled opencode themes). Selection is
-        # session-only: it resets to the built-in default on next launch.
+        # Theme catalog (built-in default + bundled opencode themes). The last
+        # committed choice is persisted across launches (env override, then saved
+        # file, then the built-in default); see ``theme.preference``.
         self._theme_catalog = theme_registry.load_catalog()
-        self._theme_name = theme_registry.BUILTIN_NAME
-        self._theme_mode = "dark"
+        self._theme_name, self._theme_mode = theme_preference.load(
+            self._theme_catalog, default_name=theme_registry.BUILTIN_NAME
+        )
         self._mascot_timer = None
         self._busy = False
         self._quit_pending = False
@@ -403,7 +406,9 @@ class QwowlApp(App):
         )
         if result is not None:
             name, mode = result
-            self.apply_theme_preview(name, mode)  # commit (session-only)
+            self.apply_theme_preview(name, mode)  # commit
+            # apply_theme_preview snaps mode to an available one; persist that.
+            theme_preference.save(self._theme_name, self._theme_mode)
         self.query_one(PromptInput).focus()
 
     def apply_theme_preview(self, name: str, mode: str) -> None:
