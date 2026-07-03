@@ -34,6 +34,7 @@ from widgets.approval import ApprovalModal
 from widgets.chat_log import ChatView
 from widgets.mascot_widget import MascotWidget
 from widgets.prompt_input import PromptInput
+from widgets.quit_confirm import QuitConfirm
 from widgets.status_panel import StatusBar, display_path
 from widgets.theme_selector import ThemeSelector
 
@@ -102,7 +103,10 @@ class QwowlApp(App):
     #footer { color: $fg-ghost; background: $bg-base; padding: 0 1; height: auto; }
     """
     BINDINGS = [
-        ("ctrl+c", "quit", "Quit"),
+        # Ctrl+C opens a confirmation modal instead of quitting outright — it's an
+        # easy key to hit by accident. priority=True so it fires even while the
+        # prompt Input is focused. The confirm's own dispatch calls exit().
+        Binding("ctrl+c", "request_quit", "Quit", priority=True),
         Binding("ctrl+o", "toggle_tools", "Expand tools", show=False, priority=True),
     ]
 
@@ -132,6 +136,7 @@ class QwowlApp(App):
         self._theme_mode = "dark"
         self._mascot_timer = None
         self._busy = False
+        self._quit_pending = False
         self._copied_revert = None
         self._copied_prev = None
         self._notice_revert = None
@@ -470,6 +475,27 @@ class QwowlApp(App):
 
     def action_toggle_tools(self) -> None:
         self.chat.toggle_tools()
+
+    # ------------------------------------------------------------------ #
+    # Quit confirmation (Ctrl+C)
+    # ------------------------------------------------------------------ #
+    def action_request_quit(self) -> None:
+        """Ctrl+C: ask before quitting. Ignore repeats while the modal is open."""
+        if self._quit_pending:
+            return
+        self._prompt_quit()
+
+    @work(group="quit-confirm")
+    async def _prompt_quit(self) -> None:
+        self._quit_pending = True
+        try:
+            confirmed = await self.push_screen_wait(QuitConfirm())
+        finally:
+            self._quit_pending = False
+        if confirmed:
+            self.exit()
+        else:
+            self.query_one(PromptInput).focus()
 
     # ------------------------------------------------------------------ #
     # Bash approval (called from the agent worker via the registry)
