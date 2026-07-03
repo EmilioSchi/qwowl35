@@ -593,7 +593,7 @@ def _render_autoread_segment(text: str, expanded: bool) -> list[RenderableType]:
         limited, hidden = anchored[:TOOL_PREVIEW_LINES], len(anchored) - TOOL_PREVIEW_LINES
     parts.append(_render_anchored_code(p_path or path, limited))
     if hidden:
-        parts.append(Text(f"... {hidden} more lines (Ctrl+O to expand)", style="dim"))
+        parts.append(Text(f"... {hidden} more lines (Ctrl+o to expand)", style="dim"))
     for note in trailing:
         if note.strip():
             parts.append(Text(note, style="dim"))
@@ -1007,7 +1007,7 @@ class ChatView(VerticalScroll):
         if block.tool_name == "bash":
             output, advisory = _split_bash_advisories(body)
             preview, hidden = _preview_lines(output, expanded)
-            note = f"... {hidden} more lines (Ctrl+O to expand)" if hidden else None
+            note = f"... {hidden} more lines (Ctrl+o to expand)" if hidden else None
             box = _terminal_box(
                 _command_from_args(block.args_buf),
                 output=preview or None,
@@ -1029,7 +1029,7 @@ class ChatView(VerticalScroll):
         out = Text("Result\n", style=color)
         out.append(highlight_refs(preview))
         if hidden:
-            out.append(Text(f"\n... {hidden} more lines (Ctrl+O to expand)", style="dim"))
+            out.append(Text(f"\n... {hidden} more lines (Ctrl+o to expand)", style="dim"))
         return Group(title, out)
 
     def _render_file_tool_result(
@@ -1060,13 +1060,13 @@ class ChatView(VerticalScroll):
                         hidden = len(anchored) - TOOL_PREVIEW_LINES
                     parts.append(_render_anchored_code(path, limited))
                     if hidden:
-                        parts.append(Text(f"... {hidden} more lines (Ctrl+O to expand)", style="dim"))
+                        parts.append(Text(f"... {hidden} more lines (Ctrl+o to expand)", style="dim"))
                     _append_trailing(parts, trailing, expanded)
                 elif after.strip():
                     preview, hidden = _preview_lines(after, expanded)
                     text = highlight_refs(preview)
                     if hidden:
-                        text.append(Text(f"\n... {hidden} more lines (Ctrl+O to expand)", style="dim"))
+                        text.append(Text(f"\n... {hidden} more lines (Ctrl+o to expand)", style="dim"))
                     parts.append(text)
             return Group(*parts) if parts else None
 
@@ -1088,6 +1088,6 @@ class ChatView(VerticalScroll):
             _render_anchored_code(path, limited),
         ]
         if hidden:
-            parts.append(Text(f"... {hidden} more lines (Ctrl+O to expand)", style="dim"))
+            parts.append(Text(f"... {hidden} more lines (Ctrl+o to expand)", style="dim"))
         _append_trailing(parts, trailing, expanded)
         return Group(*parts)
