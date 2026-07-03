@@ -11,6 +11,7 @@ mod sampling;
 mod stop_sequence;
 mod text_filter;
 mod think_budget;
+mod tool_penalty;
 use prompt::{
     render_qwen35_chat_prompt, render_qwen35_chat_prompt_with_boundaries,
 };
@@ -18,6 +19,7 @@ use sampling::sample_from_logits;
 use stop_sequence::{earliest_stop_match, StopSequenceWatcher};
 use text_filter::GeneratedTextFilter;
 use think_budget::ThinkBudget;
+use tool_penalty::ToolCallPenaltyGuard;
 
 pub const DEFAULT_MODEL_ID: &str = "qwen3.5-9b";
 pub const DEFAULT_PREFILL_CHUNK: u32 = 32;
@@ -80,6 +82,11 @@ pub struct GenerateRequest {
     /// literal text instead of suppressing them, so the caller can route
     /// reasoning separately from content.
     pub emit_reasoning: bool,
+    /// Stream tool-call bodies incrementally as raw XML fragments plus
+    /// `qw35_tool_call` side-channel chunks (qwowl35's live display). Off =
+    /// the OpenAI-compatible buffered behavior. Only the chat-completions
+    /// streaming path honors it.
+    pub stream_tool_call_xml: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -914,6 +921,14 @@ impl Engine {
             message_tokens,
         );
 
+        // Suspend sampling penalties inside <tool_call> blocks (see
+        // `ToolCallPenaltyGuard`): the body is a verbatim payload and the
+        // unwindowed presence penalty otherwise corrupts long commands.
+        let mut tool_penalty_guard = ToolCallPenaltyGuard::new(
+            self.tokenizer.spec.tool_call_token_id,
+            self.tokenizer.spec.end_tool_call_token_id,
+        );
+
         // Fast-path per-window decode-tps trace (QW35_DECODE_TRACE): prints the
         // instantaneous tok/s every 128 decoded tokens with the current ctx, so a
         // session-length slowdown can be localized on the production path without
@@ -944,7 +959,13 @@ impl Engine {
                                 *slot += amount;
                             }
                         }
-                        sample_from_logits(&logits, request, &all_seen, prompt_tokens.len())
+                        sample_from_logits(
+                            &logits,
+                            request,
+                            &all_seen,
+                            prompt_tokens.len(),
+                            tool_penalty_guard.active(),
+                        )
                     })
                 };
                 let sampled = match sampled {
@@ -961,6 +982,7 @@ impl Engine {
                 })
             };
             sample_duration += sample_start.elapsed();
+            tool_penalty_guard.observe(next);
 
             if !request.ignore_eos && stop_ids.contains(&next) {
                 finish_reason = FinishReason::Stop;

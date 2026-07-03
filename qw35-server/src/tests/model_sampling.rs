@@ -23,6 +23,7 @@
             ignore_eos: false,
             stop_sequences: Vec::new(),
             emit_reasoning: false,
+            stream_tool_call_xml: false,
         }
     }
 
@@ -31,7 +32,7 @@
         // Token 0 appears only in the prompt; OpenAI semantics leave it alone.
         let logits = [2.0, 1.0, 0.5];
         let request = sampler_request(10.0, 0.0, 1.0);
-        assert_eq!(sample_from_logits(&logits, &request, &[0], 1), 0);
+        assert_eq!(sample_from_logits(&logits, &request, &[0], 1, false), 0);
     }
 
     #[test]
@@ -39,10 +40,10 @@
         let logits = [0.0, 2.0, 1.0];
         let request = sampler_request(1.5, 0.0, 1.0);
         // Token 1 generated once: 2.0 - 1.5 = 0.5 < 1.0 -> token 2 wins.
-        assert_eq!(sample_from_logits(&logits, &request, &[0, 1], 1), 2);
+        assert_eq!(sample_from_logits(&logits, &request, &[0, 1], 1, false), 2);
         // Repeating it does not deepen the presence penalty.
-        let single = sample_from_logits(&logits, &request, &[0, 1], 1);
-        let triple = sample_from_logits(&logits, &request, &[0, 1, 1, 1], 1);
+        let single = sample_from_logits(&logits, &request, &[0, 1], 1, false);
+        let triple = sample_from_logits(&logits, &request, &[0, 1, 1, 1], 1, false);
         assert_eq!(single, triple);
     }
 
@@ -51,9 +52,20 @@
         let logits = [0.0, 2.0, 1.0];
         let request = sampler_request(0.0, 0.4, 1.0);
         // One occurrence: 2.0 - 0.4 = 1.6 still beats 1.0.
-        assert_eq!(sample_from_logits(&logits, &request, &[0, 1], 1), 1);
+        assert_eq!(sample_from_logits(&logits, &request, &[0, 1], 1, false), 1);
         // Three occurrences: 2.0 - 1.2 = 0.8 loses to 1.0.
-        assert_eq!(sample_from_logits(&logits, &request, &[0, 1, 1, 1], 1), 2);
+        assert_eq!(sample_from_logits(&logits, &request, &[0, 1, 1, 1], 1, false), 2);
+    }
+
+    #[test]
+    fn suspended_penalties_leave_repeated_tokens_untouched() {
+        // Inside a tool-call body (suspend=true) neither the presence penalty
+        // nor the repetition penalty may reorder the logits: 2.0 - 1.5 = 0.5
+        // would flip the argmax to token 2 when applied.
+        let logits = [0.0, 2.0, 1.0];
+        let request = sampler_request(1.5, 0.4, 2.0);
+        assert_eq!(sample_from_logits(&logits, &request, &[0, 1, 1, 1], 1, false), 2);
+        assert_eq!(sample_from_logits(&logits, &request, &[0, 1, 1, 1], 1, true), 1);
     }
 
     #[test]
@@ -76,7 +88,7 @@
         let start = std::time::Instant::now();
         let mut acc = 0u64;
         for _ in 0..iters {
-            acc += u64::from(sample_from_logits(&logits, &request, &seen, prompt_len));
+            acc += u64::from(sample_from_logits(&logits, &request, &seen, prompt_len, false));
         }
         let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(iters);
         eprintln!(
@@ -90,5 +102,5 @@
         let request = sampler_request(0.0, 0.0, 2.0);
         // Token 0 is prompt-only but the llama.cpp-style repetition penalty
         // spans the full window: 2.0 / 2.0 = 1.0 < 1.5 -> token 1 wins.
-        assert_eq!(sample_from_logits(&logits, &request, &[0], 1), 1);
+        assert_eq!(sample_from_logits(&logits, &request, &[0], 1, false), 1);
     }

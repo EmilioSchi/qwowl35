@@ -42,3 +42,17 @@
             false
         ));
     }
+
+    #[test]
+    fn stream_tool_call_xml_flag_plumbs_through_and_defaults_off() {
+        let build = |json: serde_json::Value| {
+            into_generate_request(&chat_req(json), "m", &defaults(false)).expect("request builds")
+        };
+        let msgs = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(!build(msgs).stream_tool_call_xml);
+        let flagged = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream_tool_call_xml": true,
+        });
+        assert!(build(flagged).stream_tool_call_xml);
+    }

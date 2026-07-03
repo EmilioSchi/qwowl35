@@ -159,6 +159,18 @@ class LoggingChat:
         entry = self._tool_calls.setdefault(index, {"name": "", "args": []})
         entry["args"].append(fragment)
 
+    def name_tool_call(self, index: int, name: str) -> None:
+        entry = self._tool_calls.setdefault(index, {"name": "", "args": []})
+        entry["name"] = name
+
+    def finalize_tool_call(self, index: int, arguments: str) -> None:
+        # Authoritative parsed JSON replaces the streamed raw XML fragments.
+        entry = self._tool_calls.setdefault(index, {"name": "", "args": []})
+        entry["args"] = [arguments]
+
+    def demote_tool_call(self, index: int) -> None:
+        self._tool_calls.pop(index, None)
+
     def add_tool_result(self, index: int, name: str, result: str, is_error: bool = False) -> None:
         entry = self._tool_calls.get(index, {})
         arguments = "".join(entry.get("args", []))

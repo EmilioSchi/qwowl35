@@ -250,6 +250,9 @@ from client import (
     StreamAccumulator,
     ToolCallArgsDelta,
     ToolCallBegin,
+    ToolCallDemoted,
+    ToolCallFinal,
+    ToolCallName,
     Usage,
 )
 from config import Config
@@ -603,13 +606,30 @@ class Agent:
                 self.ui.chat.add_assistant_chunk(event.text)
             elif isinstance(event, ToolCallBegin):
                 # Tool call starting — close any open text, open a growing box.
+                # With raw streaming the name may still be empty (the box shows
+                # the raw XML until ToolCallName arrives).
                 self.ui.chat.flush_reasoning()
                 self.ui.chat.flush_assistant()
                 generating = False
-                self.ui.set_state(mascot.State.BASH if event.name == "bash" else mascot.State.EDIT)
+                if event.name:
+                    self.ui.set_state(
+                        mascot.State.BASH if event.name == "bash" else mascot.State.EDIT
+                    )
                 self.ui.chat.begin_tool_call(event.index, event.name)
             elif isinstance(event, ToolCallArgsDelta):
                 self.ui.chat.update_tool_call(event.index, event.fragment)
+            elif isinstance(event, ToolCallName):
+                self.ui.set_state(
+                    mascot.State.BASH if event.name == "bash" else mascot.State.EDIT
+                )
+                self.ui.chat.name_tool_call(event.index, event.name)
+            elif isinstance(event, ToolCallFinal):
+                self.ui.chat.finalize_tool_call(event.index, event.arguments)
+            elif isinstance(event, ToolCallDemoted):
+                # Not a tool call after all — drop the box; the raw text follows
+                # as content/reasoning deltas (and the malformed-call retry
+                # logic sees it in the accumulated turn).
+                self.ui.chat.demote_tool_call(event.index)
             elif isinstance(event, Usage):
                 self.ui.set_usage(event.usage, event.timings)
             elif isinstance(event, Finish):

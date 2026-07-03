@@ -470,3 +470,89 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def test_raw_mode_streaming_call_shows_growing_xml() -> None:
+    # Before the function is recognized (empty tool name) the box shows the raw
+    # tool-call XML itself, grown to the reveal cursor.
+    block = ToolBlock("")
+    block.args_buf = "\n<function=bash>\n<parameter=command>\necho hi\n"
+    block.reveal = len("\n<function=bash>\n<parameter=")
+    text = _plain(ChatView()._render_tool_call(block))
+    assert_true("<function=bash>" in text, "raw XML header shown")
+    assert_true("<parameter=" in text, "raw XML grows to the reveal cursor")
+    assert_true("echo hi" not in text, "unrevealed tail stays hidden")
+
+
+def test_call_target_raw_mode_is_untruncated() -> None:
+    # The generic detail preview truncates at 240 chars; raw mode must not,
+    # or a long heredoc's XML would stop growing mid-stream.
+    block = ToolBlock("")
+    block.args_buf = "\n<function=bash>\n<parameter=command>\n" + ("x" * 500)
+    target = ChatView()._call_target(block)
+    assert_true(target == block.args_buf, "raw target is the full XML buffer")
+
+
+def test_name_tool_call_switches_to_bash_box_and_clamps_reveal() -> None:
+    view = ChatView()
+    block = ToolBlock("")
+    view._tool_blocks[0] = block
+    block.args_buf = "\n<function=bash>\n<parameter=command>\n"
+    block.reveal = len(block.args_buf)  # deep into the raw XML view
+    view.name_tool_call(0, "bash")
+    assert_true(block.tool_name == "bash", "name applied")
+    target = view._call_target(block)
+    assert_true(block.reveal <= len(target), "reveal clamped into the new target")
+
+
+def test_named_streaming_call_grows_command_from_partial_xml() -> None:
+    # After recognition, fragments keep arriving; the bash box must extract the
+    # growing command from the partial XML buffer.
+    view = ChatView()
+    block = ToolBlock("bash")
+    view._tool_blocks[0] = block
+    block.args_buf = "\n<function=bash>\n<parameter=command>\ncat <<'EOF' > f.py\nprint('a')\n"
+    target = view._call_target(block)
+    assert_true(target.startswith("cat <<'EOF' > f.py"), f"command extracted: {target!r}")
+    assert_true("print('a')" in target, "later command lines included")
+    assert_true("<parameter" not in target, "XML scaffolding stripped")
+
+
+def test_finalize_tool_call_replaces_args_and_marks_done() -> None:
+    view = ChatView()
+    block = ToolBlock("bash")
+    view._tool_blocks[0] = block
+    block.args_buf = "\n<function=bash>\n<parameter=command>\necho hi\n</parameter>\n</function>\n"
+    view.finalize_tool_call(0, '{"command":"echo hi"}')
+    assert_true(block.stream_done, "stream_done set")
+    assert_true(view._call_target(block) == "echo hi", "final JSON drives the command")
+
+
+def test_demote_tool_call_removes_block() -> None:
+    view = ChatView()
+    block = ToolBlock("")
+    removed = []
+    block.remove = lambda: removed.append(True)  # type: ignore[method-assign]
+    view._tool_blocks[0] = block
+    view.demote_tool_call(0)
+    assert_true(0 not in view._tool_blocks, "block dropped from in-flight map")
+    assert_true(removed == [True], "widget removed from the log")
+
+
+def test_crlf_command_reveal_matches_prefix() -> None:
+    # splitlines() treated \r\n as one boundary while the reveal charged one
+    # char, desyncing the shown prefix; split("\n") keeps them in lockstep.
+    # The lexer normalizes the (invisible) \r out of the rendered rows, so
+    # compare with \r stripped from line ends — what matters is that rows and
+    # boundaries stay in lockstep with target[:reveal].
+    cmd = "echo a\r\necho b\r\necho c"
+    for reveal in range(1, len(cmd) + 1):
+        rows = _command_rows(cmd, cursor=False, reveal=reveal)
+        visible = "\n".join(row.text.plain[2:] for row in rows)
+        expected = [line.rstrip("\r") for line in cmd[:reveal].split("\n")]
+        if expected and expected[-1] == "":
+            expected = expected[:-1]
+        assert_true(
+            visible == "\n".join(expected),
+            f"prefix matches at reveal={reveal}: {visible!r}",
+        )

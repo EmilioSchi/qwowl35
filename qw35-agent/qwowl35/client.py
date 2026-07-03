@@ -69,6 +69,39 @@ class ToolCallArgsDelta:
 
 
 @dataclass
+class ToolCallName:
+    """qw35 side-channel: the streamed call's function name became known.
+
+    With ``stream_tool_call_xml`` the Begin delta arrives the moment the server
+    sees ``<tool_call>`` (empty name, raw XML fragments follow); the name is
+    delivered as soon as the header is recognizable and again, authoritatively,
+    when the block parses. The last one wins."""
+
+    index: int
+    name: str
+
+
+@dataclass
+class ToolCallFinal:
+    """qw35 side-channel: authoritative parsed arguments JSON for the call.
+
+    Replaces (not appends to) whatever raw XML fragments were streamed."""
+
+    index: int
+    arguments: str
+
+
+@dataclass
+class ToolCallDemoted:
+    """qw35 side-channel: the streamed block failed to parse as a tool call.
+
+    The call at ``index`` must be dropped; its raw text follows as ordinary
+    content/reasoning deltas (and the agent's malformed-call retry sees it)."""
+
+    index: int
+
+
+@dataclass
 class PrefillProgress:
     percent: float
     processed: int
@@ -91,6 +124,9 @@ StreamEvent = (
     | ReasoningDelta
     | ToolCallBegin
     | ToolCallArgsDelta
+    | ToolCallName
+    | ToolCallFinal
+    | ToolCallDemoted
     | PrefillProgress
     | Finish
     | Usage
@@ -383,7 +419,17 @@ def _parameter_name_from_open_tag(tag_body: str) -> str | None:
 
 
 def _xml_text_value(raw: str, *, complete: bool) -> str:
-    value = _strip_parameter_boundary_newlines(raw) if complete else raw
+    if complete:
+        value = _strip_parameter_boundary_newlines(raw)
+    else:
+        # Mid-stream: the LEADING tag-boundary newline is already certain, so
+        # strip it (a growing bash box must not start with a blank line); the
+        # trailing one must stay — more value text may still arrive.
+        value = raw
+        if value.startswith("\r\n"):
+            value = value[2:]
+        elif value.startswith("\n"):
+            value = value[1:]
     return html_unescape(value)
 
 
@@ -499,6 +545,21 @@ class StreamAccumulator:
                 # Defensive: args before begin — create a stub.
                 call = self._calls.setdefault(event.index, _PendingCall(id="", name=""))
             call.args_buffer += event.fragment
+        elif isinstance(event, ToolCallName):
+            call = self._calls.get(event.index)
+            if call is not None:
+                call.name = event.name
+        elif isinstance(event, ToolCallFinal):
+            call = self._calls.get(event.index)
+            if call is not None:
+                # Authoritative parsed JSON replaces the streamed raw XML. If
+                # the stream dies before this chunk, the raw buffer still falls
+                # through _parse_tool_args's XML recovery.
+                call.args_buffer = event.arguments
+        elif isinstance(event, ToolCallDemoted):
+            # The block was not a tool call after all; its text arrives as
+            # ordinary content/reasoning deltas.
+            self._calls.pop(event.index, None)
         elif isinstance(event, Finish):
             self.finish_reason = event.reason
         elif isinstance(event, Usage):
@@ -532,8 +593,14 @@ class StreamAccumulator:
 # Client
 # --------------------------------------------------------------------------- #
 class Qw35Client:
-    def __init__(self, base_url: str, timeout: float = 600.0) -> None:
+    def __init__(
+        self, base_url: str, timeout: float = 600.0, stream_tool_xml: bool = True
+    ) -> None:
         self.base_url = base_url.rstrip("/")
+        # Ask the server to stream tool-call bodies incrementally (raw XML
+        # fragments + qw35_tool_call side-channel) so the TUI can show a call
+        # growing live. Off = the buffered OpenAI-shape stream.
+        self.stream_tool_xml = stream_tool_xml
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
 
     async def aclose(self) -> None:
@@ -576,6 +643,8 @@ class Qw35Client:
             "stream_options": {"include_usage": True},
             **gen_params,
         }
+        if self.stream_tool_xml:
+            body["stream_tool_call_xml"] = True
         if tools:
             body["tools"] = tools
 
@@ -641,6 +710,16 @@ def _classify_chunk(chunk: dict):
             if percent is None:
                 percent = (processed / total * 100.0) if total else 0.0
             yield PrefillProgress(percent=float(percent), processed=processed, total=total)
+        tool_side = chunk.get("qw35_tool_call")
+        if isinstance(tool_side, dict):
+            kind = tool_side.get("event")
+            index = tool_side.get("index", 0)
+            if kind == "name":
+                yield ToolCallName(index=index, name=str(tool_side.get("name", "")))
+            elif kind == "final":
+                yield ToolCallFinal(index=index, arguments=str(tool_side.get("arguments", "")))
+            elif kind == "demoted":
+                yield ToolCallDemoted(index=index)
         if chunk.get("usage") is not None:
             yield Usage(usage=chunk.get("usage") or {}, timings=chunk.get("qw35_timings") or {})
         return

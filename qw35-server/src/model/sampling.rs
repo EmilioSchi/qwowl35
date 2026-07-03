@@ -10,6 +10,7 @@ pub(super) fn sample_from_logits(
     request: &GenerateRequest,
     seen: &[u32],
     prompt_len: usize,
+    suspend_penalties: bool,
 ) -> u32 {
     // Penalties touch only a handful of token ids (the seen/repeat windows), so
     // apply them to those ids directly instead of probing a hash set/map for
@@ -23,7 +24,11 @@ pub(super) fn sample_from_logits(
     // generated output (logit -= count * frequency + (count > 0) * presence).
     // Penalizing prompt tokens too would demote every identifier mentioned in
     // a long agentic prompt.
-    if request.presence_penalty != 0.0 || request.frequency_penalty != 0.0 {
+    // `suspend_penalties` (inside a <tool_call> body — see ToolCallPenaltyGuard)
+    // skips all three penalty knobs: a verbatim payload legitimately repeats.
+    if !suspend_penalties
+        && (request.presence_penalty != 0.0 || request.frequency_penalty != 0.0)
+    {
         let mut completion_counts: HashMap<u32, f32> = HashMap::new();
         for &token in &seen[prompt_len.min(seen.len())..] {
             *completion_counts.entry(token).or_insert(0.0) += 1.0;
@@ -39,7 +44,7 @@ pub(super) fn sample_from_logits(
 
     // The repetition penalty is the llama.cpp-style knob and spans the full
     // repeat_last_n window (prompt tokens included).
-    if request.repetition_penalty != 1.0 {
+    if !suspend_penalties && request.repetition_penalty != 1.0 {
         for id in repeat_penalty_token_set(seen, request.repeat_last_n) {
             if let Some(slot) = adjusted.get_mut(id as usize) {
                 if slot.is_finite() {

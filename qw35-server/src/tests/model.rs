@@ -174,6 +174,7 @@
                     ignore_eos: false,
                     stop_sequences: Vec::new(),
                     emit_reasoning: false,
+            stream_tool_call_xml: false,
                 })
                 .unwrap_or_else(|err| panic!("turn {} failed: {err:?}", idx + 1));
             eprintln!("turn {} assistant: {:?}", idx + 1, generation.text);
@@ -744,6 +745,7 @@
             ignore_eos: true,
             stop_sequences: Vec::new(),
             emit_reasoning: false,
+            stream_tool_call_xml: false,
         };
         let prompt = render_qwen35_chat_prompt(
             &request.messages,

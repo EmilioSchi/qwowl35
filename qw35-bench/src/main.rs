@@ -1072,6 +1072,7 @@ fn generate_request(prompt: &PromptConfig) -> GenerateRequest {
         ignore_eos: prompt.ignore_eos,
         stop_sequences: Vec::new(),
         emit_reasoning: false,
+        stream_tool_call_xml: false,
     }
 }
 

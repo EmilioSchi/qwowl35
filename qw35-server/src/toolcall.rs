@@ -316,6 +316,19 @@ pub enum AssistantEvent {
         index: usize,
         arguments: String,
     },
+    /// Raw-streaming mode only: the function name for the call at `index`
+    /// became known (from the streamed header, or authoritatively at the end
+    /// of the block). May repeat; the last one wins.
+    ToolCallName {
+        index: usize,
+        name: String,
+    },
+    /// Raw-streaming mode only: the block at `index` failed to parse after a
+    /// `ToolCallBegin` was already emitted. The caller must roll the call
+    /// back; its text follows as ordinary `Content`/`Reasoning`.
+    ToolCallDemoted {
+        index: usize,
+    },
 }
 
 /// Incremental parser over the visible generated text. Detects
@@ -330,6 +343,13 @@ pub struct AssistantStreamParser {
     trim_leading: bool,
     emitted_calls: usize,
     current_index: usize,
+    /// Stream tool-call bodies incrementally: `ToolCallBegin` fires the moment
+    /// `<tool_call>` is seen (empty name), raw XML body fragments flow as
+    /// `ToolCallArgs`, the name arrives via `ToolCallName`, and the parsed
+    /// arguments via `ToolCallEnd`. A block that fails to parse emits
+    /// `ToolCallDemoted` before its text. Off = the legacy buffered behavior
+    /// (Begin + one Args + End at block end).
+    stream_raw: bool,
 }
 
 #[derive(Debug)]
@@ -368,6 +388,12 @@ impl AssistantStreamParser {
     /// `start_in_thinking` is set when the generation header already opened a
     /// `<think>` block in the prompt, so the model output begins inside it.
     pub fn new(start_in_thinking: bool) -> Self {
+        Self::with_options(start_in_thinking, false)
+    }
+
+    /// `stream_raw` turns on incremental tool-call streaming (see the field
+    /// doc); only the flagged chat-completions stream uses it.
+    pub fn with_options(start_in_thinking: bool, stream_raw: bool) -> Self {
         Self {
             state: if start_in_thinking {
                 ParserState::Thinking
@@ -378,6 +404,7 @@ impl AssistantStreamParser {
             trim_leading: true,
             emitted_calls: 0,
             current_index: 0,
+            stream_raw,
         }
     }
 
@@ -470,8 +497,15 @@ impl AssistantStreamParser {
                 self.pending.drain(..tag.len());
                 match *tag {
                     "<tool_call>" => {
+                        let builder = ToolCallBuilder::new(self.stream_raw);
+                        if self.stream_raw {
+                            // Commit the call immediately (empty name) so the
+                            // raw XML body can stream from the first token.
+                            let begin = vec![builder.begin_event()];
+                            self.forward(begin, events, in_thinking);
+                        }
                         self.state = ParserState::ToolCall {
-                            builder: ToolCallBuilder::new(),
+                            builder,
                             origin: if in_thinking {
                                 ToolCallOrigin::Thinking
                             } else {
@@ -535,7 +569,7 @@ impl AssistantStreamParser {
             let final_events = builder.finalize();
             let demoted_to_text = final_events
                 .iter()
-                .all(|event| matches!(event, BuilderEvent::Text(_)));
+                .all(|event| matches!(event, BuilderEvent::Text(_) | BuilderEvent::Demote(_)));
             let text_as_reasoning = origin == ToolCallOrigin::Thinking;
             self.forward(final_events, events, text_as_reasoning);
             if text_as_reasoning && demoted_to_text {
@@ -646,6 +680,24 @@ impl AssistantStreamParser {
                         events.push(AssistantEvent::Content(text));
                     }
                 }
+                BuilderEvent::Name(name) => events.push(AssistantEvent::ToolCallName {
+                    index: self.current_index,
+                    name,
+                }),
+                BuilderEvent::Demote(text) => {
+                    // The call was committed with an early Begin but its block
+                    // failed to parse: roll the index back so the next call
+                    // stays dense, then re-emit the block as ordinary text.
+                    events.push(AssistantEvent::ToolCallDemoted {
+                        index: self.current_index,
+                    });
+                    self.emitted_calls = self.emitted_calls.saturating_sub(1);
+                    if text_as_reasoning {
+                        events.push(AssistantEvent::Reasoning(text));
+                    } else {
+                        events.push(AssistantEvent::Content(text));
+                    }
+                }
             }
         }
     }
@@ -735,6 +787,11 @@ enum BuilderEvent {
     End(String),
     /// Degraded output: the block was not a parseable tool call.
     Text(String),
+    /// Raw-streaming mode: the function name became known.
+    Name(String),
+    /// Raw-streaming mode: degraded output after an early `Begin` was already
+    /// emitted; the caller rolls the call back and re-emits this as text.
+    Demote(String),
 }
 
 /// Parses the inside of one Qwen3 XML `<tool_call>...</tool_call>` block.
@@ -743,13 +800,36 @@ enum BuilderEvent {
 struct ToolCallBuilder {
     id: String,
     raw: String,
+    /// Incremental mode: emit the raw body as `Args` fragments as it arrives
+    /// and the function name (`Name`) as soon as the header is recognizable.
+    /// The whole-block parse at the end stays authoritative.
+    stream_raw: bool,
+    /// The header was classified (or given up on); stop rescanning `raw`.
+    header_settled: bool,
 }
 
+/// Give up classifying the streamed header once the body has grown this far
+/// without a complete first tag: every recognizable header (`<function=NAME>`,
+/// `<bash …`, a compact `<name attr=…>`) fits well within it, and rescanning an
+/// unbounded prefix on every feed would be quadratic on pathological bodies.
+const HEADER_SCAN_LIMIT: usize = 256;
+
 impl ToolCallBuilder {
-    fn new() -> Self {
+    fn new(stream_raw: bool) -> Self {
         Self {
             id: new_call_id(),
             raw: String::new(),
+            stream_raw,
+            header_settled: false,
+        }
+    }
+
+    /// The early commit for raw-streaming mode: the call exists (stable id,
+    /// index assigned by `forward`) before its name is known.
+    fn begin_event(&self) -> BuilderEvent {
+        BuilderEvent::Begin {
+            id: self.id.clone(),
+            name: String::new(),
         }
     }
 
@@ -757,7 +837,57 @@ impl ToolCallBuilder {
     /// tag. Always consumes the full input.
     fn feed_scanned(&mut self, text: &str) -> Vec<BuilderEvent> {
         self.raw.push_str(text);
-        Vec::new()
+        if !self.stream_raw {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if !self.header_settled {
+            if let Some(name) = self.scan_header() {
+                events.push(BuilderEvent::Name(name));
+            }
+        }
+        if !text.is_empty() {
+            events.push(BuilderEvent::Args(text.to_string()));
+        }
+        events
+    }
+
+    /// Best-effort early recognition of the function name from the streamed
+    /// header: `<function=NAME>`, the recoverable `<bash …` attribute form, or
+    /// a compact `<name attr=…>` element. Purely cosmetic for live display —
+    /// the authoritative name is re-emitted by the whole-block parse.
+    fn scan_header(&mut self) -> Option<String> {
+        let trimmed = self.raw.trim_start();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if !trimmed.starts_with('<') {
+            // Whatever this is, it is not a recognizable header; the final
+            // parse will settle it (likely a demote).
+            self.header_settled = true;
+            return None;
+        }
+        if is_recoverable_bash_command_body(trimmed) {
+            self.header_settled = true;
+            return Some("bash".to_string());
+        }
+        let Some(end) = find_open_tag_end(trimmed) else {
+            if self.raw.len() > HEADER_SCAN_LIMIT {
+                self.header_settled = true;
+            }
+            return None;
+        };
+        self.header_settled = true;
+        if let Some((name, _)) = parse_named_open_tag(trimmed, "function") {
+            return Some(name);
+        }
+        // Compact form `<name attr=…>`: mirror parse_compact_tool_call_xml's
+        // element-name acceptance.
+        let (name, _) = split_xml_element_name(trimmed[1..end].trim())?;
+        if matches!(name, "function" | "parameter") || !is_simple_xml_target(name) {
+            return None;
+        }
+        Some(name.to_string())
     }
 
     /// Called when the end tag arrives.
@@ -773,12 +903,20 @@ impl ToolCallBuilder {
     fn finish_parsed(self, closed: bool) -> Vec<BuilderEvent> {
         let mut events = Vec::new();
         if let Some((name, arguments)) = parse_tool_call_xml(&self.raw) {
-            events.push(BuilderEvent::Begin {
-                id: self.id.clone(),
-                name,
-            });
-            events.push(BuilderEvent::Args(arguments.clone()));
-            events.push(BuilderEvent::End(arguments));
+            if self.stream_raw {
+                // Begin and the raw Args fragments already went out; deliver
+                // the authoritative name (overwrites any streamed guess) and
+                // the parsed arguments.
+                events.push(BuilderEvent::Name(name));
+                events.push(BuilderEvent::End(arguments));
+            } else {
+                events.push(BuilderEvent::Begin {
+                    id: self.id.clone(),
+                    name,
+                });
+                events.push(BuilderEvent::Args(arguments.clone()));
+                events.push(BuilderEvent::End(arguments));
+            }
         } else {
             warn_unparsed_tool_call(&self.raw);
             let text = if closed {
@@ -786,7 +924,11 @@ impl ToolCallBuilder {
             } else {
                 format!("<tool_call>{}", self.raw)
             };
-            events.push(BuilderEvent::Text(text));
+            if self.stream_raw {
+                events.push(BuilderEvent::Demote(text));
+            } else {
+                events.push(BuilderEvent::Text(text));
+            }
         }
         events
     }
@@ -1315,6 +1457,16 @@ pub fn assemble_events(events: &[AssistantEvent]) -> ParsedAssistantOutput {
                 if let Some(call) = out.tool_calls.get_mut(*index) {
                     call.arguments = arguments.clone();
                 }
+            }
+            AssistantEvent::ToolCallName { index, name } => {
+                if let Some(call) = out.tool_calls.get_mut(*index) {
+                    call.name = name.clone();
+                }
+            }
+            // A demoted call is rolled back; its text follows as Content or
+            // Reasoning and is folded in by the arms above.
+            AssistantEvent::ToolCallDemoted { index } => {
+                out.tool_calls.truncate(*index);
             }
         }
     }

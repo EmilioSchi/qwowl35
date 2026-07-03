@@ -113,3 +113,85 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def test_qw35_tool_call_side_channel_chunks_classify() -> None:
+    from client import (
+        ToolCallDemoted,
+        ToolCallFinal,
+        ToolCallName,
+        _classify_chunk,
+    )
+
+    name = list(_classify_chunk({"choices": [], "qw35_tool_call": {"event": "name", "index": 0, "name": "bash"}}))
+    assert_equal(name, [ToolCallName(index=0, name="bash")], "name chunk")
+    final = list(_classify_chunk({"choices": [], "qw35_tool_call": {"event": "final", "index": 1, "arguments": "{\"command\":\"ls\"}"}}))
+    assert_equal(final, [ToolCallFinal(index=1, arguments='{"command":"ls"}')], "final chunk")
+    demoted = list(_classify_chunk({"choices": [], "qw35_tool_call": {"event": "demoted", "index": 0}}))
+    assert_equal(demoted, [ToolCallDemoted(index=0)], "demoted chunk")
+
+
+def test_begin_with_empty_name_still_classifies() -> None:
+    from client import ToolCallBegin, _classify_chunk
+
+    chunk = {
+        "choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "", "arguments": ""}}]}}]
+    }
+    events = list(_classify_chunk(chunk))
+    assert_equal(events, [ToolCallBegin(index=0, id="call_1", name="")], "empty-name begin")
+
+
+def test_accumulator_final_replaces_raw_xml_fragments() -> None:
+    from client import (
+        StreamAccumulator,
+        ToolCallArgsDelta,
+        ToolCallBegin,
+        ToolCallFinal,
+        ToolCallName,
+    )
+
+    acc = StreamAccumulator()
+    acc.add(ToolCallBegin(index=0, id="call_9", name=""))
+    acc.add(ToolCallArgsDelta(index=0, fragment="\n<function=bash>\n<parameter=command>\n"))
+    acc.add(ToolCallName(index=0, name="bash"))
+    acc.add(ToolCallArgsDelta(index=0, fragment="echo hi\n</parameter>\n</function>\n"))
+    acc.add(ToolCallFinal(index=0, arguments='{"command":"echo hi"}'))
+    turn = acc.finalize()
+    assert_equal(len(turn.tool_calls), 1, "one call")
+    assert_equal(turn.tool_calls[0].name, "bash", "name from side-channel")
+    assert_equal(turn.tool_calls[0].arguments, {"command": "echo hi"}, "final JSON wins")
+
+
+def test_accumulator_raw_xml_fallback_when_stream_dies_before_final() -> None:
+    from client import StreamAccumulator, ToolCallArgsDelta, ToolCallBegin, ToolCallName
+
+    acc = StreamAccumulator()
+    acc.add(ToolCallBegin(index=0, id="call_9", name=""))
+    acc.add(ToolCallName(index=0, name="bash"))
+    acc.add(
+        ToolCallArgsDelta(
+            index=0,
+            fragment="\n<function=bash>\n<parameter=command>\necho hi\n</parameter>\n</function>\n",
+        )
+    )
+    turn = acc.finalize()
+    assert_equal(turn.tool_calls[0].arguments, {"command": "echo hi"}, "XML recovery fallback")
+
+
+def test_accumulator_demoted_call_is_dropped_and_content_kept() -> None:
+    from client import (
+        ContentDelta,
+        StreamAccumulator,
+        ToolCallArgsDelta,
+        ToolCallBegin,
+        ToolCallDemoted,
+    )
+
+    acc = StreamAccumulator()
+    acc.add(ToolCallBegin(index=0, id="call_9", name=""))
+    acc.add(ToolCallArgsDelta(index=0, fragment="\nnope\n"))
+    acc.add(ToolCallDemoted(index=0))
+    acc.add(ContentDelta("<tool_call>\nnope\n</tool_call>"))
+    turn = acc.finalize()
+    assert_equal(turn.tool_calls, [], "demoted call dropped")
+    assert_equal(turn.content, "<tool_call>\nnope\n</tool_call>", "demoted text kept as content")

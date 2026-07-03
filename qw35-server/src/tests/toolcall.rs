@@ -161,6 +161,9 @@
                 }
                 AssistantEvent::Content(text) => panic!("unexpected content {text:?}"),
                 AssistantEvent::Reasoning(_) => panic!("unexpected reasoning"),
+                AssistantEvent::ToolCallName { .. } | AssistantEvent::ToolCallDemoted { .. } => {
+                    panic!("raw-streaming event in plain mode")
+                }
             }
         }
         assert!(saw_begin);
@@ -588,4 +591,162 @@
         assert!(!call.contains("&gt;"), "no &gt; escaping: {call}");
         assert!(!call.contains("&lt;"), "no &lt; escaping: {call}");
         assert!(!call.contains("&amp;"), "no &amp; escaping: {call}");
+    }
+
+    // ── Raw-streaming mode (stream_tool_call_xml) ──────────────────────────
+
+    fn run_streaming(feeds: &[&str], start_in_thinking: bool) -> Vec<AssistantEvent> {
+        let mut parser = AssistantStreamParser::with_options(start_in_thinking, true);
+        let mut events = Vec::new();
+        for feed in feeds {
+            events.extend(parser.feed(feed));
+        }
+        events.extend(parser.finish());
+        events
+    }
+
+    /// Ignore ids (unique per builder) when comparing streamed vs whole parses.
+    fn assert_same_output(streamed: &ParsedAssistantOutput, whole: &ParsedAssistantOutput) {
+        assert_eq!(streamed.content, whole.content);
+        assert_eq!(streamed.reasoning, whole.reasoning);
+        assert_eq!(streamed.tool_calls.len(), whole.tool_calls.len());
+        for (s, w) in streamed.tool_calls.iter().zip(&whole.tool_calls) {
+            assert_eq!(s.name, w.name);
+            assert_eq!(s.arguments, w.arguments);
+        }
+    }
+
+    #[test]
+    fn stream_raw_assembles_identically_at_every_split_point() {
+        let fixtures = [
+            bash_block("echo '</parameter> appears in this file'"),
+            bash_block("cat <<'EOF' > f.py\nprint('x')\nprint('y')\nEOF"),
+            CALL_BLOCK.to_string(),
+            format!("Let me check.\n{CALL_BLOCK}\nDone."),
+            "<tool_call>\nnope\n</tool_call>".to_string(),
+        ];
+        for text in &fixtures {
+            let whole = parse_assistant_text(text, false);
+            for split in text.char_indices().map(|(idx, _)| idx).skip(1) {
+                let events = run_streaming(&[&text[..split], &text[split..]], false);
+                assert_same_output(&assemble_events(&events), &whole);
+            }
+            let chars: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+            let char_feeds: Vec<&str> = chars.iter().map(String::as_str).collect();
+            let events = run_streaming(&char_feeds, false);
+            assert_same_output(&assemble_events(&events), &whole);
+        }
+    }
+
+    #[test]
+    fn stream_raw_begin_fires_before_body_and_name_arrives_early() {
+        let block = bash_block("echo hi");
+        // Feed only up to the end of the `<function=bash>` header line.
+        let header_end = block.find(">\n<parameter").unwrap() + 1;
+        let mut parser = AssistantStreamParser::with_options(false, true);
+        let events = parser.feed(&block[..header_end]);
+        let begin_pos = events
+            .iter()
+            .position(|e| matches!(e, AssistantEvent::ToolCallBegin { index: 0, name, .. } if name.is_empty()))
+            .expect("early Begin with empty name");
+        let name_pos = events
+            .iter()
+            .position(|e| matches!(e, AssistantEvent::ToolCallName { index: 0, name } if name == "bash"))
+            .expect("early Name from the streamed header");
+        assert!(begin_pos < name_pos);
+        // No content leaked; the body streamed as raw Args fragments.
+        assert!(events.iter().all(|e| !matches!(e, AssistantEvent::Content(_))));
+    }
+
+    #[test]
+    fn stream_raw_args_fragments_reconstruct_the_body_without_end_tag() {
+        let cmd = "cat <<'EOF' > demo.txt\nline one\nline two </tool_\nEOF";
+        let block = bash_block(cmd);
+        // Char-at-a-time worst case: holdback must keep every partial
+        // `</tool_call>` prefix out of the emitted fragments.
+        let chars: Vec<String> = block.chars().map(|c| c.to_string()).collect();
+        let char_feeds: Vec<&str> = chars.iter().map(String::as_str).collect();
+        let events = run_streaming(&char_feeds, false);
+        let streamed: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AssistantEvent::ToolCallArgs { fragment, .. } => Some(fragment.as_str()),
+                _ => None,
+            })
+            .collect();
+        let body_start = "<tool_call>".len();
+        let body_end = block.len() - "</tool_call>".len();
+        assert_eq!(streamed, &block[body_start..body_end]);
+        assert!(!streamed.contains("</tool_call>"));
+        // The end still carries the authoritative parsed arguments.
+        let out = assemble_events(&events);
+        assert_eq!(out.tool_calls.len(), 1);
+        let args: serde_json::Value = serde_json::from_str(&out.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["command"], cmd);
+    }
+
+    #[test]
+    fn stream_raw_demote_rolls_back_the_call_index() {
+        let bad = "<tool_call>\nnope\n</tool_call>";
+        let text = format!("{bad}\n{CALL_BLOCK}");
+        let events = run_streaming(&[&text], false);
+        // The bad block committed index 0 then demoted it; the valid call must
+        // re-use index 0.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AssistantEvent::ToolCallDemoted { index: 0 })));
+        let begins: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                AssistantEvent::ToolCallBegin { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(begins, vec![0, 0]);
+        let out = assemble_events(&events);
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].name, "get_weather");
+        assert!(out.content.contains("<tool_call>\nnope\n</tool_call>"));
+    }
+
+    #[test]
+    fn stream_raw_demote_inside_thinking_routes_to_reasoning() {
+        let text = "<tool_call>\n<function=bash>\nbroken\n</tool_call>\nstill thinking";
+        let events = run_streaming(&[text], true);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AssistantEvent::ToolCallDemoted { .. })));
+        let out = assemble_events(&events);
+        assert!(out.tool_calls.is_empty());
+        assert!(out.content.is_empty(), "content leaked: {:?}", out.content);
+        assert!(out.reasoning.contains("still thinking"));
+    }
+
+    #[test]
+    fn stream_raw_bash_attribute_header_names_bash_early() {
+        let mut parser = AssistantStreamParser::with_options(false, true);
+        let events = parser.feed("<tool_call>\n<bash command=\"ls -");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AssistantEvent::ToolCallName { name, .. } if name == "bash")));
+    }
+
+    #[test]
+    fn plain_mode_emits_no_raw_streaming_events() {
+        let block = bash_block("cat <<'EOF' > f.py\nprint('x')\nEOF");
+        let events = run(&[&block], false);
+        assert!(events.iter().all(|e| !matches!(
+            e,
+            AssistantEvent::ToolCallName { .. } | AssistantEvent::ToolCallDemoted { .. }
+        )));
+        // Exactly the legacy shape: one Begin, one Args (full JSON), one End.
+        let args: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                AssistantEvent::ToolCallArgs { fragment, .. } => Some(fragment),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args.len(), 1);
+        serde_json::from_str::<serde_json::Value>(args[0]).expect("legacy Args is full JSON");
     }

@@ -75,12 +75,13 @@ _CURSOR = "▋"  # trailing block cursor while a command types out
 # (relatively costly) markdown re-parse.
 _REFRESH_INTERVAL = 0.05
 
-# Client-side typewriter reveal for tool-call args. The server emits the whole
-# XML tool call in one delta, so growth can't ride on fragment arrival anymore;
-# we instead reveal a few more characters every tick. Long commands get an
-# adaptive bump so they don't crawl, but the bump is capped so a very long
-# multiline write (e.g. a big `cat <<EOF` heredoc) still types out line by line
-# instead of dumping a dozen lines in the first frame.
+# Reveal smoothing for tool-call args. The server streams the tool-call body
+# incrementally (raw XML fragments while the call is being generated, see
+# stream_tool_call_xml), so the display target only ever contains bytes that
+# actually arrived; the reveal cursor trails it a few characters per tick to
+# smooth bursty fragment arrival into a steady type-out. Once the call finishes
+# (final args or its result arrives) the reveal fast-forwards — anything still
+# untyped at that point would be replay, not streaming.
 _REVEAL_MIN_STEP = 2
 _REVEAL_MAX_STEP = 24
 # Cursor blink: toggle every N ticks (N * _REFRESH_INTERVAL seconds).
@@ -264,7 +265,10 @@ def _command_rows(
     """
     if not command:
         command = "(waiting for command...)"
-    lines = command.splitlines() or [command]
+    # split("\n"), NOT splitlines(): reveal charges exactly 1 char per line
+    # boundary, but splitlines also breaks on \r\n, \v,   etc., which
+    # desynced the per-line reveal offsets from target[:reveal].
+    lines = command.split("\n")
     highlighted_lines = _highlight_bash_lines(command)
     if reveal is None:
         reveal = len(command)
@@ -303,10 +307,10 @@ def _highlight_bash_lines(command: str) -> list[Text]:
         ).highlight(command)
         lines = highlighted.split("\n", allow_blank=True)
     except Exception:
-        return [Text(line, style=theme.FG_BRIGHT) for line in command.splitlines() or [command]]
+        return [Text(line, style=theme.FG_BRIGHT) for line in command.split("\n")]
 
     styled: list[Text] = []
-    for line in lines[: len(command.splitlines() or [command])]:
+    for line in lines[: len(command.split("\n"))]:
         item = line.copy()
         item.no_wrap = True
         _strip_bold_and_background(item)
@@ -718,6 +722,8 @@ class ToolBlock(Static):
 
     def __init__(self, name: str) -> None:
         super().__init__(classes="msg tool-pending")
+        # Empty name = raw mode: the call streamed in before its function was
+        # recognized; the box shows the raw XML growing until name_tool_call.
         self.tool_name = name
         self.args_buf = ""
         self.full_result: str | None = None
@@ -726,6 +732,7 @@ class ToolBlock(Static):
         self.args_dirty = False
         self.reveal = 0  # chars of the command/detail currently typed out
         self.result_ready = False  # result arrived but reveal still typing out
+        self.stream_done = False  # final args arrived; reveal fast-forwards
 
 
 class ChatView(VerticalScroll):
@@ -795,20 +802,29 @@ class ChatView(VerticalScroll):
             self._bump()
         for index, block in list(self._tool_blocks.items()):
             target = self._call_target(block)
+            if block.reveal > len(target):
+                # The target can shrink mid-stream (raw XML → recognized
+                # command); keep the cursor pinned to its tip.
+                block.reveal = len(target)
+            if block.stream_done or block.result_ready:
+                # Generation of this call is over: anything still untyped
+                # would be a fake replay, not streaming — fast-forward.
+                if block.reveal < len(target):
+                    block.reveal = len(target)
+                    block.args_dirty = True
+                if block.result_ready:
+                    self._promote_result(index)
+                    continue
             revealing = block.reveal < len(target)
             if revealing:
-                # Adaptive: long commands type out faster so they don't crawl,
-                # but capped so a huge multiline write still reveals ~a line per
-                # frame rather than dumping many lines at once.
+                # Smooth real fragment arrival: trail the streamed target a
+                # few chars per tick. Adaptive so a backlog catches up, but
+                # capped so a burst still types out rather than dumping.
                 step = min(
                     _REVEAL_MAX_STEP,
                     max(_REVEAL_MIN_STEP, (len(target) - block.reveal) // 8),
                 )
                 block.reveal = min(len(target), block.reveal + step)
-                # Reveal just finished and a result was waiting → show it now.
-                if block.reveal >= len(target) and block.result_ready:
-                    self._promote_result(index)
-                    continue
             # Repaint when content advanced or new args arrived. While typing,
             # the per-tick advance already repaints, so the blink rides along.
             if block.args_dirty or revealing:
@@ -925,6 +941,38 @@ class ChatView(VerticalScroll):
         block.args_buf += fragment
         block.args_dirty = True
 
+    def name_tool_call(self, index: int, name: str) -> None:
+        """The streamed call's function name became known (qw35 side-channel).
+
+        The display target changes shape here (raw XML → extracted command/
+        detail), so clamp the reveal into the new target: the recognized view
+        starts typing from wherever its content currently ends."""
+        block = self._tool_blocks.get(index)
+        if block is None:
+            return
+        block.tool_name = name
+        block.reveal = min(block.reveal, len(self._call_target(block)))
+        block.args_dirty = True
+
+    def finalize_tool_call(self, index: int, arguments: str) -> None:
+        """Authoritative parsed arguments arrived; the call finished streaming."""
+        block = self._tool_blocks.get(index)
+        if block is None:
+            return
+        block.args_buf = arguments
+        block.stream_done = True
+        block.args_dirty = True
+
+    def demote_tool_call(self, index: int) -> None:
+        """The streamed block was not a tool call after all — drop its box.
+
+        The raw text re-arrives as ordinary assistant/reasoning deltas, so
+        removing the widget keeps a single source of truth on screen."""
+        block = self._tool_blocks.pop(index, None)
+        if block is None:
+            return
+        block.remove()
+
     def add_tool_result(self, index: int, name: str, text: str, is_error: bool = False) -> None:
         block = self._tool_blocks.get(index)
         if block is None:  # defensive: result with no streamed call
@@ -972,9 +1020,27 @@ class ChatView(VerticalScroll):
         """Full text the reveal animation is typing toward."""
         if block.tool_name == "bash":
             return _command_from_args(block.args_buf)
+        if not block.tool_name:
+            # Raw mode: the call is streaming but not yet recognized; the
+            # target is the raw XML itself, untruncated.
+            return block.args_buf
         return self._call_detail(block)
 
     def _render_tool_call(self, block: ToolBlock) -> RenderableType:
+        if not block.tool_name:
+            # Raw mode: show the tool-call XML growing verbatim until the
+            # function is recognized (name_tool_call) or the block demotes.
+            target = self._call_target(block)
+            revealing = block.reveal < len(target)
+            shown = target[: block.reveal] if revealing else target
+            label = _tool_title("", None, theme.ACCENT)
+            text = Text(shown.lstrip("\r\n"), style=theme.FG_DIM)
+            if revealing and self._blink_on:
+                text.append(_CURSOR, style=theme.FG_DIM)
+            if not text.plain:
+                return label
+            return Group(label, _FullWidthLines([_line_with_bg(text, theme.BG_BASE)], wrap=True))
+
         args = _parse_args(block.args_buf)
         label = _tool_title(block.tool_name, args, theme.ACCENT)
         target = self._call_target(block)

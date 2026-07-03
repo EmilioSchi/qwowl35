@@ -60,6 +60,11 @@ struct ChatRequest {
     stream: bool,
     #[serde(default)]
     stream_options: Option<StreamOptions>,
+    /// qw35 extension (sent by qwowl35): stream tool-call bodies incrementally
+    /// as raw XML `arguments` fragments plus `qw35_tool_call` side-channel
+    /// chunks, instead of buffering each call to one delta at its end.
+    #[serde(default)]
+    stream_tool_call_xml: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -507,6 +512,7 @@ fn into_generate_request(
         // With thinking enabled the markers pass through so the response can
         // carry reasoning_content; tool-call markers pass through always.
         emit_reasoning: enable_thinking,
+        stream_tool_call_xml: req.stream_tool_call_xml.unwrap_or(false),
     })
 }
 
@@ -650,6 +656,8 @@ fn into_responses_generate_request(
         // Thinking is routed into a reasoning output item; tool-call markers
         // pass through always.
         emit_reasoning: enable_thinking,
+        // Raw tool-call streaming is a chat-completions extension only.
+        stream_tool_call_xml: false,
     })
 }
 
@@ -1261,15 +1269,17 @@ async fn stream_response(
     let request2 = request.clone();
 
     tokio::task::spawn_blocking(move || {
-        let mut parser = toolcall::AssistantStreamParser::new(
+        let mut parser = toolcall::AssistantStreamParser::with_options(
             request2.emit_reasoning && request2.enable_thinking,
+            request2.stream_tool_call_xml,
         );
         let mut emitter = ChatStreamEmitter {
             tx: &tx2,
             id: &id2,
             model: &model2,
             created,
-            saw_tool_call: false,
+            emitted_tool_calls: 0,
+            stream_raw: request2.stream_tool_call_xml,
         };
         let result = engine_arc.generate_stream_with_progress(
             &request2,
@@ -1302,7 +1312,7 @@ async fn stream_response(
             Ok(generation) => {
                 let _ = emitter.send_events(parser.finish());
                 let finish_reason =
-                    chat_finish_reason(generation.finish_reason, emitter.saw_tool_call);
+                    chat_finish_reason(generation.finish_reason, emitter.emitted_tool_calls > 0);
                 let timings = timings_json(&generation.timings);
                 let _ = tx2.blocking_send(Ok(sse_event(&serde_json::json!({
                     "id": id2,
@@ -1370,7 +1380,14 @@ struct ChatStreamEmitter<'a> {
     id: &'a str,
     model: &'a str,
     created: u64,
-    saw_tool_call: bool,
+    /// Live tool calls emitted so far: +1 on Begin, -1 when a raw-streamed
+    /// block is demoted back to text. Drives the final finish_reason.
+    emitted_tool_calls: usize,
+    /// Raw tool-call streaming was requested (`stream_tool_call_xml`): the
+    /// parser's `ToolCallName`/`ToolCallEnd`/`ToolCallDemoted` events go out
+    /// as choice-less `qw35_tool_call` side-channel chunks (same house style
+    /// as `qw35_prefill`; OpenAI clients ignore empty-choices chunks).
+    stream_raw: bool,
 }
 
 impl ChatStreamEmitter<'_> {
@@ -1382,7 +1399,7 @@ impl ChatStreamEmitter<'_> {
                     serde_json::json!({"reasoning_content": text})
                 }
                 AssistantEvent::ToolCallBegin { index, id, name } => {
-                    self.saw_tool_call = true;
+                    self.emitted_tool_calls += 1;
                     serde_json::json!({"tool_calls": [{
                         "index": index,
                         "id": id,
@@ -1396,9 +1413,38 @@ impl ChatStreamEmitter<'_> {
                         "function": {"arguments": fragment},
                     }]})
                 }
-                // Chat completions has no per-call end chunk; the final
-                // finish_reason covers it.
-                AssistantEvent::ToolCallEnd { .. } => continue,
+                AssistantEvent::ToolCallEnd { index, arguments } => {
+                    if self.stream_raw {
+                        // The streamed fragments were raw XML; deliver the
+                        // authoritative parsed arguments out-of-band.
+                        self.send_side_channel(serde_json::json!({
+                            "event": "final",
+                            "index": index,
+                            "arguments": arguments,
+                        }))?;
+                    }
+                    // Chat completions has no per-call end chunk; the final
+                    // finish_reason covers it.
+                    continue;
+                }
+                AssistantEvent::ToolCallName { index, name } => {
+                    self.send_side_channel(serde_json::json!({
+                        "event": "name",
+                        "index": index,
+                        "name": name,
+                    }))?;
+                    continue;
+                }
+                AssistantEvent::ToolCallDemoted { index } => {
+                    // The demoted block's text follows as ordinary content/
+                    // reasoning deltas.
+                    self.emitted_tool_calls = self.emitted_tool_calls.saturating_sub(1);
+                    self.send_side_channel(serde_json::json!({
+                        "event": "demoted",
+                        "index": index,
+                    }))?;
+                    continue;
+                }
             };
             self.tx
                 .blocking_send(Ok(sse_event(&serde_json::json!({
@@ -1412,6 +1458,19 @@ impl ChatStreamEmitter<'_> {
                 .map_err(|err| format!("stream closed: {err}"))?;
         }
         Ok(())
+    }
+
+    fn send_side_channel(&self, payload: serde_json::Value) -> Result<(), String> {
+        self.tx
+            .blocking_send(Ok(sse_event(&serde_json::json!({
+                "id": self.id,
+                "object": "chat.completion.chunk",
+                "created": self.created,
+                "model": self.model,
+                "choices": [],
+                "qw35_tool_call": payload,
+            }))))
+            .map_err(|err| format!("stream closed: {err}"))
     }
 }
 
@@ -1742,6 +1801,9 @@ impl ResponsesStreamState<'_> {
                 }
                 self.close_open()
             }
+            // Raw-streaming-only events; the responses path never enables
+            // stream_tool_call_xml, so these cannot occur here.
+            AssistantEvent::ToolCallName { .. } | AssistantEvent::ToolCallDemoted { .. } => Ok(()),
         }
     }
 
