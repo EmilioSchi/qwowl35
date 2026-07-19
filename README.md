@@ -54,7 +54,7 @@ way turn out to be useful to other programmers.
   vocabulary already contains many common function names that tokenize to one
   token, and leaning on those keeps tool-calling cheaper and more reliable.
 - **Fine-tunes can quietly break the tool-call format.** I tried other
-  fine-tuned variants of Qwen 3.5 9B, such as Qwopus3.5, but ran into problems.
+  fine-tuned variants of Qwen 3.5 9B, such as Qwopus3.5 or Ornith-1.0, but ran into problems.
   Some of them — especially ones distilled or tuned from larger models — lost
   the ability to emit tool calls in the exact format Alibaba's team trained the
   base model on, which in turn breaks their agentic capabilities. Ironically,
@@ -146,12 +146,26 @@ flags and the full picture.
 
 ## qwowl35: the terminal agent
 
-`qw35-agent/` ships **qwowl35**, a minimal terminal coding agent built on
+`qw35-agent/` ships **qwowl35**, a terminal coding agent built on
 [Textual](https://github.com/Textualize/textual) that drives the server in a
-streaming tool-calling loop. It has a safety-aware **bash** tool and
-anchor-backed **file** read/edit tools, gates risky commands behind a keyboard
-approval prompt, and pins an animated owl mascot top-left that mirrors the
+streaming tool-calling loop, with an animated owl mascot top-left mirroring the
 agent's live state (prefill → thinking → inference → bash → edit → done).
+
+The user picks the operating mode before each prompt — a Vim-style label in
+the bottom-left corner shows it, **Shift+Tab** (or `/mode`) cycles it, and it
+locks while the model generates. **NORMAL** (the default) runs the freestyle
+executor (safety-gated **bash** + an *editor* sub-agent applying every file
+change, shown as **INSERT** while it runs). **PLAN** runs a *planner* (todos +
+a plan-approval gate) that gathers codebase facts by spawning stateless
+read-only *explorer* sub-agents through its `explore` tool (shown as
+**VISUAL**; each explorer reports back through one `resume` summary), then
+hands the approved todos to executors that continue ONE persistent
+conversation — each todo re-prefills only its directive thanks to the
+server's checkpoint stack (`--checkpoints`). **WEB** and **CHAT** run a
+fetch-restricted and a tool-less conversational agent. Every agent is fully
+segregated: its own system prompt, only its own tools, exactly the data
+handed over to it; the editor and explorer run on a separate scratch GPU
+session (`--scratch-ctx`) so they never disturb a stage in progress.
 
 <p align="center">
   <img src="assets/qw35.gif" alt="qwowl35 terminal agent driving qw35-server" width="800">
@@ -164,9 +178,12 @@ python -m qwowl35 --think auto --reasoning-effort high   # --think auto is the d
 ```
 
 Configuration is CLI-only (`--base-url`, `--think auto|on|off`,
-`--reasoning-effort`, `--restricted-bash`). See
-[`qw35-agent/qwowl35/README.md`](qw35-agent/qwowl35/README.md) for the design notes,
-key bindings, and the headless debug runners.
+`--reasoning-effort`, `--restricted-bash`); the mode is chosen inside the TUI.
+Run artifacts (mode, exploration reports, plan, per-task results) land under
+the user cache dir next to the prompt history and are cleaned up by age. See
+[`qw35-agent/qwowl35/README.md`](qw35-agent/qwowl35/README.md) for the design
+notes, key bindings, and the headless debug runners (`debug/headless.py
+--mode plan` drives the planner pipeline unattended).
 
 ## Context window
 
@@ -211,6 +228,45 @@ llama.cpp's. The `real_model_decode_path_parity_report` ignored test
 measures decode-vs-prefill logit parity (GF4's 3-bit body still flips
 the occasional argmax versus base weights; the exact Q6_K head keeps
 token selection clean).
+
+## The reranker: Qwowl3-Reranker-0.6B
+
+The same server process hosts a second, much smaller model: a
+**Qwen3-Reranker-0.6B** (llama.cpp rank conversion — dense Qwen3, a yes/no
+`cls.output` classification head, `sigmoid(z_yes − z_no)` scoring) served on
+`POST /v1/rerank`:
+
+```sh
+./download_model.sh reranker     # fetch qwen3-reranker-0.6b-q8_0.gguf (once)
+./target/release/qw35            # auto-loads it when present on disk
+curl -s localhost:8080/v1/rerank -d '{"query":"...","documents":["...","..."]}'
+```
+
+`--reranker-model FILE` overrides the auto-loaded file, `--no-reranker` skips
+it; with no reranker the endpoint answers `501 inference_unavailable` and
+nothing else changes. The reranker is its own engine
+(`qw35-server/src/reranker/`) over its own mmap and tokenizer vocab; it reuses
+the shared Metal runtime parameterized for a dense model (every layer
+attention, ungated Q via a function constant, 128-dim full-head RoPE) plus a
+shared-prefix KV reuse so all documents of a request evaluate the
+system+instruct+query prefix once. Scores match llama.cpp's RANK pooling to
+Pearson r > 0.9999 with identical top-1 (`tools/rerank_parity.py`).
+
+Like the 9B, the reranker has a cooked unified edition,
+**`Qwowl3-Reranker-0.6B.gguf`** (FFN baked GF4 + AWQ fold into `ffn_norm`,
+scale-search on), produced by `tools/cook_qwowl3_reranker_gf4.py` from
+act-stats captured on real rerank prompts
+(`tools/capture_reranker_act_stats.py`). Unlike the 9B, though, **the raw
+q8_0 file is the recommended serve**: rerank is prefill-bound, and measured
+end-to-end (`tools/rerank_compare.py`, 100 queries × 4–64 docs) GF4 brings
+no latency win (~286 vs ~273 ms/doc — noise) while costing ranking fidelity
+on a 0.6B (top-1 agreement vs q8_0: 93%; relevant-subset rank correlation
+0.85, vs a 0.94 cross-engine noise floor) — it only saves ~180 MB. An
+AWQ-alpha sweep (0.4/0.6/0.8/off) confirmed alpha 0.6 as the best cook; the
+gap is inherent to 3-bit FFN on a model this small. The qwowl35 agent uses
+this cross-encoder by DEFAULT to prune web_fetch results down to the
+query-relevant chunks (`--rerank-scorer` picks another mode; every neural
+mode fails open to BM25 when its backend is absent).
 
 ## Thanks
 

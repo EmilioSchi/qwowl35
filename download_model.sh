@@ -19,6 +19,13 @@ CANON_REPO="EmilioSchi/Qwowl3.5-9B-GGUF"
 CANON_FILE="Qwowl3.5-9B.gguf"
 ACT_STATS_FILE="act-stats.bin"
 
+# Reranker (served with --reranker-model): base rank-converted GGUF and the
+# locally-cooked unified variant (FFN baked GF4 + AWQ fold into ffn_norm).
+RERANKER_REPO="gpustack/qwen3-reranker-0.6b-GGUF"
+RERANKER_FILE="qwen3-reranker-0.6b-q8_0.gguf"
+RERANKER_CANON_FILE="Qwowl3-Reranker-0.6B.gguf"
+RERANKER_ACT_STATS_FILE="reranker-act-stats.bin"
+
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${QW35_GGUF_DIR:-"$ROOT/.gguf"}
 case "$OUT_DIR" in
@@ -27,6 +34,7 @@ case "$OUT_DIR" in
 esac
 TOKEN=${HF_TOKEN:-}
 COOK="$ROOT/tools/cook_qw35_awq_gf4.py"
+COOK_RERANKER="$ROOT/tools/cook_qwowl3_reranker_gf4.py"
 
 usage() {
     cat <<EOF
@@ -55,6 +63,17 @@ Targets:
 
   all       Run model, then cook.
 
+  reranker  Download the rank-converted reranker GGUF
+            $RERANKER_FILE (~640 MB) from
+            $RERANKER_REPO (may need --token). Served with:
+              qw35 --reranker-model .gguf/$RERANKER_FILE
+
+  cook-reranker
+            Cook the unified reranker $RERANKER_CANON_FILE from the
+            downloaded base (FFN baked as GF4 + AWQ fold into ffn_norm).
+            Needs $RERANKER_ACT_STATS_FILE, captured from real rerank
+            prompts (see tools/capture_reranker_act_stats.py).
+
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache (~/.cache/huggingface/token) is used if present.
@@ -70,7 +89,7 @@ EOF
 
 TARGET=download
 case "${1:-}" in
-    download|unified|model|cook|gf4|all) TARGET=$1; shift ;;
+    download|unified|model|cook|gf4|all|reranker|cook-reranker) TARGET=$1; shift ;;
     -h|--help|help) usage; exit 0 ;;
     "" ) ;;
     --token) ;;  # no target given, options follow
@@ -186,6 +205,73 @@ cook_unified() {
     echo "Cooked $canon"
 }
 
+download_reranker() {
+    out="$OUT_DIR/$RERANKER_FILE"
+    part="$out.part"
+    url="https://huggingface.co/$RERANKER_REPO/resolve/main/$RERANKER_FILE"
+
+    mkdir -p "$OUT_DIR"
+
+    if [ -s "$out" ]; then
+        echo "Already downloaded: $out"
+        return
+    fi
+
+    echo "Downloading $RERANKER_FILE"
+    echo "from https://huggingface.co/$RERANKER_REPO"
+    echo "If the download stops, run the same command again to resume it."
+
+    if [ -n "$TOKEN" ]; then
+        curl -fL --progress-meter -C - -H "Authorization: Bearer $TOKEN" -o "$part" "$url"
+    else
+        curl -fL --progress-meter -C - -o "$part" "$url"
+    fi
+
+    mv "$part" "$out"
+    echo "Saved $out"
+}
+
+cook_reranker() {
+    model="$OUT_DIR/$RERANKER_FILE"
+    canon="$OUT_DIR/$RERANKER_CANON_FILE"
+    act_stats="$OUT_DIR/$RERANKER_ACT_STATS_FILE"
+
+    if [ ! -s "$model" ]; then
+        echo "Reranker GGUF not found: $model" >&2
+        echo "Run './download_model.sh reranker' first." >&2
+        exit 1
+    fi
+
+    if [ -s "$canon" ]; then
+        echo "Already cooked: $canon"
+        return
+    fi
+
+    if [ ! -s "$act_stats" ]; then
+        echo "Reranker AWQ activation stats not found: $act_stats" >&2
+        echo "Capture them from real rerank prompts first:" >&2
+        echo "  QW35_CAPTURE_ACT_OUT=$act_stats qw35 --reranker-model $model &" >&2
+        echo "  python3 tools/rerank_corpus.py --out rerank-corpus.jsonl" >&2
+        echo "  python3 tools/capture_reranker_act_stats.py --corpus rerank-corpus.jsonl" >&2
+        exit 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Cooking the unified reranker requires python3." >&2
+        exit 1
+    fi
+    if ! python3 -c "import numpy, gguf" >/dev/null 2>&1; then
+        echo "Cooking the unified reranker requires the numpy and gguf packages." >&2
+        echo "Install them with:" >&2
+        echo "  python3 -m pip install -U numpy gguf" >&2
+        exit 1
+    fi
+
+    echo "Cooking unified $RERANKER_CANON_FILE from $RERANKER_FILE..."
+    python3 "$COOK_RERANKER" "$model" "$canon" --awq "$act_stats"
+    echo "Cooked $canon"
+}
+
 case "$TARGET" in
     download|unified)
         download_unified
@@ -202,6 +288,15 @@ case "$TARGET" in
     all)
         download_model
         cook_unified
+        ;;
+    reranker)
+        download_reranker
+        echo
+        echo "Tip: './download_model.sh cook-reranker' cooks the unified $RERANKER_CANON_FILE"
+        echo "once reranker act-stats have been captured."
+        ;;
+    cook-reranker)
+        cook_reranker
         ;;
 esac
 

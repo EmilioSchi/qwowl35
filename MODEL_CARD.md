@@ -171,6 +171,37 @@ that layer's `post_attention_norm`. Every non-FFN tensor is streamed through
 untouched, one tensor at a time, so peak RAM is a single tensor. It is CPU-heavy
 and takes a few minutes. Requires `python3` + `numpy` + `gguf`.
 
+## Companion model: Qwowl3-Reranker-0.6B
+
+The optional reranker (`qw35 --reranker-model`, `POST /v1/rerank`) follows the
+same recipe on a dense Qwen3: `Qwowl3-Reranker-0.6B.gguf` is the llama.cpp
+rank conversion of Qwen3-Reranker-0.6B (q8_0, yes/no `cls.output` head) with
+its FFN baked as GF4 and the AWQ inverse scale folded into `ffn_norm` (the
+dense pre-FFN norm). The shared cook machinery lives in
+`tools/qw35_cook_common.py`; the reranker recipe in
+`tools/cook_qwowl3_reranker_gf4.py` (scale-search on by default — a 0.6B has
+less redundancy than the 9B). Its AWQ stats are captured from REAL rerank
+prompts through the serving path itself:
+
+```bash
+./download_model.sh reranker            # base qwen3-reranker-0.6b-q8_0.gguf
+QW35_CAPTURE_ACT_OUT=.gguf/reranker-act-stats.bin \
+  ./target/release/qw35 --reranker-model .gguf/qwen3-reranker-0.6b-q8_0.gguf &
+python3 tools/rerank_corpus.py --out rerank-corpus.jsonl
+python3 tools/capture_reranker_act_stats.py --corpus rerank-corpus.jsonl
+./download_model.sh cook-reranker       # -> .gguf/Qwowl3-Reranker-0.6B.gguf
+```
+
+Quality/speed gates: `tools/rerank_parity.py` (raw q8_0 vs llama.cpp RANK
+pooling) and `tools/rerank_compare.py` (cooked vs raw ranking agreement +
+latency). **Measured verdict (2026-07): serve the raw q8_0.** Rerank is
+prefill-bound, so GF4 gains no speed here (unlike the 9B, whose decode is
+weight-bandwidth-bound), and on a 0.6B the 3-bit FFN costs ranking fidelity:
+top-1 agreement vs q8_0 93%, relevant-subset Spearman 0.85 against a 0.94
+cross-engine noise floor (alpha sweep 0.4/0.6/0.8/no-AWQ: 0.6 is best;
+AWQ itself helps, top-1 86%→93%). The cooked file saves only ~180 MB — kept
+as an artifact, not the default serve.
+
 ## Licensing
 
 The model weights are **Qwowl3.5-9B** by Emilio Schininà, cooked from the Qwen
