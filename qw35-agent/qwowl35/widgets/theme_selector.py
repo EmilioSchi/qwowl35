@@ -1,6 +1,6 @@
 """A keyboard-driven theme picker with live preview.
 
-Mirrors :class:`~widgets.approval.ApprovalModal`: a transparent, centered
+Mirrors :class:`~widgets.approval_modal.ApprovalModal`: a transparent, centered
 overlay, so the header (mascot/top-row) and footer (footer text + status bar +
 prompt) painted on the screen *below* stay visible and recolor live as the
 selection moves.

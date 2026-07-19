@@ -124,6 +124,41 @@ def test_resolve_honors_text_weak_override() -> None:
     assert_equal(lt.FG_DIM, "#777777", "text-weak override used for FG_DIM")
 
 
+def test_resolve_honors_markdown_overrides() -> None:
+    themed = {
+        "dark": {
+            "palette": {**_MINIMAL["dark"]["palette"]},
+            "overrides": {
+                "markdown-heading": "#CA9EE6",    # case normalized
+                "markdown-link": "#8da4e2",
+                "markdown-code": "#a6d189ad",     # alpha stripped
+                "markdown-block-quote": "#e5c890",
+                "markdown-list-item": "#8da4e2",
+                "markdown-horizontal-rule": "#a5adce",
+            },
+        }
+    }
+    pal = tl.resolve_theme(themed, "dark")
+    assert_equal(pal.MD_HEADING, "#ca9ee6", "markdown-heading honored (case normalized)")
+    assert_equal(pal.MD_LINK, "#8da4e2", "markdown-link honored")
+    assert_equal(pal.MD_CODE, "#a6d189", "markdown-code honored (alpha stripped)")
+    assert_equal(pal.MD_QUOTE, "#e5c890", "markdown-block-quote honored")
+    assert_equal(pal.MD_LIST, "#8da4e2", "markdown-list-item honored")
+    assert_equal(pal.MD_HR, "#a5adce", "markdown-horizontal-rule honored")
+
+
+def test_resolve_markdown_fallbacks_without_overrides() -> None:
+    # _MINIMAL dark ships no markdown-* overrides -> derived from the same
+    # sources as the general tokens.
+    pal = tl.resolve_theme(_MINIMAL, "dark")
+    assert_equal(pal.MD_HEADING, "#3366cc", "heading falls back to primary")
+    assert_equal(pal.MD_LINK, pal.ACCENT, "link falls back to accent")
+    assert_equal(pal.MD_CODE, pal.SUCCESS_SOFT, "code falls back to the success-soft mix")
+    assert_equal(pal.MD_QUOTE, pal.FG_FAINT, "quote falls back to the faint mix")
+    assert_equal(pal.MD_LIST, pal.ACCENT, "list falls back to accent")
+    assert_equal(pal.MD_HR, pal.FG_GHOST, "hr falls back to the ghost mix")
+
+
 def test_resolve_ignores_nonhex_and_missing() -> None:
     junk = {
         "dark": {

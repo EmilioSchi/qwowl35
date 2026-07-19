@@ -11,7 +11,9 @@ import asyncio
 import json
 import random
 import re
-from typing import Protocol
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Awaitable, Callable, Literal, Protocol
 
 # How long to hold the WAKEUP frame so it is actually seen before prefill starts.
 WAKEUP_HOLD_SECONDS = 0.8
@@ -19,7 +21,7 @@ COMPACT_ARG_CHARS = 140
 COMPACT_RESULT_CHARS = 220
 MALFORMED_TOOL_CALL_MAX_RETRIES = 3
 MALFORMED_TOOL_CALL_PATTERN = re.compile(
-    r"<tool_call\b[\s\S]*?<\s*(?:function(?:\b|=)|bash|beginTransaction|edit|insert|delete)\b",
+    r"<tool_call\b[\s\S]*?<\s*(?:function(?:\b|=)|bash|run_shell_command|beginTransaction|read_file|replace|edit|insert|delete)\b",
     re.IGNORECASE,
 )
 MALFORMED_TOOL_CALL_FEEDBACK = (
@@ -28,7 +30,7 @@ MALFORMED_TOOL_CALL_FEEDBACK = (
     "Use exactly one <function=tool_name> element inside <tool_call>. "
     "Put arguments in child <parameter=name>value</parameter> elements; do not use JSON or XML attributes for arguments. "
     "Escape XML text as &amp;, &lt;, and &gt; when those characters are literal content; raw quotes are okay in parameter text. "
-    "For creating or replacing a whole file, prefer a bash heredoc command; for editing an existing non-empty file, beginTransaction for line ids first and use edit/insert/delete."
+    "For creating or replacing a whole file, prefer a bash heredoc command; for editing an existing non-empty file, use your file-editing tools."
 )
 
 # When a turn ends with no tool call but the text reads as if the model was still
@@ -36,11 +38,13 @@ MALFORMED_TOOL_CALL_FEEDBACK = (
 # rather than ending the turn. Bounded by this cap so a model that keeps trailing
 # off without acting still terminates (no infinite loop).
 CONTINUATION_MAX_NUDGES = 2
+# Tool-agnostic on purpose: this text is injected into EVERY stage's loop,
+# and naming specific tools once pushed a planner (which has none of them)
+# into a repeat-denial spiral.
 CONTINUATION_FEEDBACK = (
     "You ended your turn without calling a tool, but your message reads as if you "
     "were still working — you described a next step and then stopped. If you are not "
-    "finished, continue now by calling the next tool (run the program to check its "
-    "output, beginTransaction for line ids, or edit to fix a line). If "
+    "finished, continue now by calling the next tool. If "
     "the task really is complete, reply with a brief explicit confirmation."
 )
 
@@ -89,10 +93,23 @@ def repeated_tool_message(
     return chooser.choice(notes)
 
 
+# The shell tool's wire name (qwen-code's trained `run_shell_command`) plus
+# the legacy "bash" alias still used by older transcripts and tests.
+SHELL_TOOL_NAMES = frozenset({"bash", "run_shell_command"})
+
 # Registry strings for a bash command that was gated and never executed. No file
 # was written, so a wholesale-write target in such a command must not be recorded
-# (see :meth:`Agent._rewrite_advice_for`).
+# (see :meth:`TurnRunner._rewrite_advice_for`).
 _BASH_NOT_RUN_PREFIXES = ("Command denied", "Command not run")
+
+
+def stage_violation_message(name: str, allowed: frozenset[str]) -> str:
+    """Tool-result text for a call outside the active stage's toolset."""
+    tools = ", ".join(sorted(allowed))
+    return (
+        f"The tool `{name}` is not available in this stage. "
+        f"Tools available right now: {tools}. Continue with one of those."
+    )
 
 
 def _bash_syntax_warning(arguments: object) -> str:
@@ -114,12 +131,12 @@ def _bash_syntax_warning(arguments: object) -> str:
 # not read as a stuck loop. Each note names the file and points at read +
 # the edit family; none forbids the rewrite outright.
 REWRITE_ADVICE_NOTES = (
-    "Note: `{file}` was already written earlier in this session. To change it, get its line ids with `beginTransaction` and apply `edit`/`insert`/`delete` instead of rewriting the whole file.",
-    "Heads up: that replaced all of `{file}` again. For a targeted change, prefer `beginTransaction` plus the id-based edit tools over a full `cat >` rewrite.",
-    "`{file}` already exists from a previous write — editing it in place with `beginTransaction` and `edit` is cheaper than re-emitting the entire file each time.",
-    "Reminder: you already created `{file}`. Land later edits via `beginTransaction` for line ids, then `edit`/`insert`/`delete`, rather than overwriting it wholesale.",
-    "This rewrote `{file}` from scratch again. When a file already exists, get its line ids with `beginTransaction` and use the line-edit tools so unrelated lines stay untouched.",
-    "Tip: for an existing file like `{file}`, the id-based edit tools (`beginTransaction` + `edit`) change just what you need — no need to re-send the whole file through bash.",
+    "Note: `{file}` was already written earlier in this session. To change it, use the `edit` tool instead of rewriting the whole file.",
+    "Heads up: that replaced all of `{file}` again. For a targeted change, prefer the `edit` tool over a full `cat >` rewrite.",
+    "`{file}` already exists from a previous write — changing it with the `edit` tool is cheaper than re-emitting the entire file each time.",
+    "Reminder: you already created `{file}`. Land later changes with the `edit` tool rather than overwriting it wholesale.",
+    "This rewrote `{file}` from scratch again. When a file already exists, describe the fix to the `edit` tool so unrelated lines stay untouched.",
+    "Tip: for an existing file like `{file}`, the `edit` tool changes just what you need — no need to re-send the whole file through bash.",
 )
 
 
@@ -127,15 +144,16 @@ def rewrite_advice_message(
     file: str,
     exclude: str | None = None,
     rng: random.Random | None = None,
+    pool: tuple = REWRITE_ADVICE_NOTES,
 ) -> str:
     """Pick a differently-worded nudge for a repeated wholesale file rewrite.
 
-    Mirrors :func:`repeated_tool_message`: a random note from
-    :data:`REWRITE_ADVICE_NOTES`, avoiding ``exclude`` (the note used for the
-    previous nudge) so two consecutive nudges never read the same. ``rng`` lets
-    callers/tests pin the choice.
+    Mirrors :func:`repeated_tool_message`: a random note from ``pool``,
+    avoiding ``exclude`` (the note used for the previous nudge) so two
+    consecutive nudges never read the same. ``rng`` lets callers/tests pin
+    the choice.
     """
-    notes = [note.format(file=file) for note in REWRITE_ADVICE_NOTES]
+    notes = [note.format(file=file) for note in pool]
     if exclude is not None and len(notes) > 1:
         notes = [note for note in notes if note != exclude]
     chooser = rng or random
@@ -155,8 +173,8 @@ def escalated_rewrite_message(file: str, count: int) -> str:
         f"STOP writing `{file}` through bash redirects (`>` or `>>`). You have now "
         f"written the whole file this way {count} times and it is still wrong — "
         f"re-emitting or appending keeps layering on mistakes. Do NOT write it "
-        f"through bash again. Run `beginTransaction {file}` to get line ids, then "
-        f"`edit` to change ONLY the specific lines that are wrong."
+        f"through bash again. Use the `edit` tool with precise instructions to "
+        f"change ONLY the specific lines that are wrong."
     )
 
 
@@ -199,7 +217,10 @@ def build_auto_read_block(files_tool: object, command: str) -> str:
     tools — no separate ``read`` round-trip. This complements the
     rewrite-recognition policy (which discourages re-writing the whole file):
     instead of only nudging, we hand the model exactly what it needs to edit.
-    Empty/missing files and unreadable targets are silently skipped.
+    Empty/missing files and unreadable targets are silently skipped. When any
+    written file fails its syntax/LSP check, the returned block is prefixed with
+    TOOL_ATTENTION_MARKER so the caller flags the bash result is_error, exactly
+    like the edit tools do.
     """
     if not isinstance(command, str) or not command:
         return ""
@@ -215,28 +236,150 @@ def build_auto_read_block(files_tool: object, command: str) -> str:
     if not targets:
         return ""
     blocks: list[str] = []
+    attention = False
     for target in targets[:_AUTO_READ_MAX_FILES]:
         try:
+            # A just-created file is often the first of its language this session;
+            # give its server a bounded moment to boot so the syntax check below
+            # is the real LSP one, not a silent tree-sitter fallback. Runs on a
+            # worker thread (see _auto_read_written_files).
+            warm_lsp(target)
             # _force bypasses the redundant-read gate: the auto-read's whole job is
             # to surface fresh line ids, so it must always get the file body.
-            output = files_tool.execute("beginTransaction", {"file": target, "_force": True})  # type: ignore[attr-defined]
+            output = files_tool.execute("read_file", {"file_path": target, "_force": True})  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 - best-effort convenience read
             continue
-        if output.startswith(TOOL_ATTENTION_MARKER):
+        marked = output.startswith(TOOL_ATTENTION_MARKER)
+        if marked:
             output = output[len(TOOL_ATTENTION_MARKER):]
         if not output or not output.strip() or output.lstrip().startswith("Error"):
             continue
+        attention = attention or marked
         blocks.append(
             f"You just wrote `{target}`. Its current line ids are below — edit it "
-            "in place with edit; no separate beginTransaction needed:\n"
+            "in place with replace; no separate read_file needed:\n"
             f"{output}"
         )
     if not blocks:
         return ""
     remaining = len(targets) - _AUTO_READ_MAX_FILES
     if remaining > 0:
-        blocks.append(f"(+{remaining} more written file(s); open them with beginTransaction when needed.)")
-    return "\n\n".join(blocks)
+        blocks.append(f"(+{remaining} more written file(s); open them with read_file when needed.)")
+    joined = "\n\n".join(blocks)
+    # A written file with syntax errors must escalate the bash result the same
+    # way an edit would: re-mark the joined block so the dispatch loop can
+    # strip the marker and flag is_error.
+    return TOOL_ATTENTION_MARKER + joined if attention else joined
+
+
+# Shown-issue cap for the plain post-write report, mirroring the hashline
+# anchors cap so a pathological file cannot flood the model.
+_MAX_SHOWN_POST_WRITE_ISSUES = 5
+
+
+def build_post_write_report(command: str, edit_hint: bool = True, memory=None) -> str:
+    """Validation report for the files a successful bash command just authored,
+    for agents that do NOT speak the hashline dialect.
+
+    The plain counterpart of :func:`build_auto_read_block`: no anchor ids, no
+    ``read_file``, no hashline session state — the freestyle executor's
+    `edit` sub-agent tool takes plain line numbers. A clean file gets a
+    one-line confirmation (its content is already verbatim in the model's
+    context from the write itself); a file with errors gets the issue list with
+    plain ``line N:`` content rows, and the whole block is prefixed with
+    TOOL_ATTENTION_MARKER so the dispatch loop flags the bash result is_error
+    exactly like the hashline path. Rows the calling agent instance was already
+    shown (``memory``, its per-agent DiagnosticsMemory) are summarised instead
+    of repeated; headline counts always reflect the file's CURRENT state, so a
+    still-broken file keeps its attention flag. ``edit_hint=False`` drops the
+    `edit`-tool clause for agents without that tool. Returns ``""`` when there
+    is nothing to report. May block a bounded moment warming a language server —
+    call from a worker thread, never the event loop.
+    """
+    if not isinstance(command, str) or not command:
+        return ""
+    targets = _authored_write_targets(command)
+    if not targets:
+        return ""
+    blocks: list[str] = []
+    attention = False
+    for target in targets[:_AUTO_READ_MAX_FILES]:
+        try:
+            text = Path(target).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not text.strip():
+            continue
+        try:
+            warm_lsp(target)
+            v = validate_file(target, text)
+        except Exception:  # noqa: BLE001 - validation is best-effort
+            continue
+        if v is None:
+            continue
+        report = v.report()
+        if not report:
+            continue  # unknown language / nothing checkable
+        file_lines = text.splitlines()
+        sifted = memory.sift(target, v, text) if memory is not None else None
+        if not v.errors:
+            if sifted is not None and clean_validation_report is not None:
+                report = clean_validation_report(v, sifted, _MAX_SHOWN_POST_WRITE_ISSUES)
+            blocks.append(f"Wrote `{target}` ({len(file_lines)} lines). {report}")
+            continue
+        attention = True
+        if sifted is not None and sifted.all_prior:
+            blocks.append(
+                f"You just wrote `{target}` — it still has problems. Syntax check "
+                f"({v.label}) — {len(v.errors)} issue(s), {ALL_UNCHANGED}."
+            )
+            continue
+        new_errors = sifted.errors if sifted is not None else list(v.errors)
+        new_warnings = sifted.warnings if sifted is not None else list(v.warnings)
+        prior_errors = sifted.prior_errors if sifted is not None else 0
+        prior_warnings = sifted.prior_warnings if sifted is not None else 0
+        if edit_hint:
+            header = (
+                f"You just wrote `{target}` — it has problems. Syntax check "
+                f"({v.label}) — {len(v.errors)} issue(s). Fix ONLY these lines "
+                "with the `edit` tool (filename, line ranges, instructions); "
+                "do NOT rewrite the file through bash:"
+            )
+        else:
+            header = (
+                f"You just wrote `{target}` — it has problems. Syntax check "
+                f"({v.label}) — {len(v.errors)} issue(s):"
+            )
+        lines = [header]
+        shown = new_errors[:_MAX_SHOWN_POST_WRITE_ISSUES]
+        for line_no, _col, message in shown:
+            lines.append(f"- {message}")
+            if 1 <= line_no <= len(file_lines):
+                lines.append(f"  line {line_no}: {file_lines[line_no - 1]}")
+        extra = len(new_errors) - len(shown)
+        if extra > 0:
+            lines.append(f"- … and {extra} more")
+        if prior_errors:
+            lines.append(unchanged_note(prior_errors))
+        warn_shown = new_warnings[:_MAX_SHOWN_POST_WRITE_ISSUES]
+        if warn_shown or prior_warnings:
+            lines.append(f"Warnings (not blocking) — {len(v.warnings)}:")
+            lines.extend(f"- {message}" for _line, _col, message in warn_shown)
+            warn_extra = len(new_warnings) - len(warn_shown)
+            if warn_extra > 0:
+                lines.append(f"- … and {warn_extra} more")
+            if prior_warnings:
+                lines.append(unchanged_note(prior_warnings, "warning"))
+        if sifted is not None:
+            sifted.mark_rendered(shown, warn_shown)
+        blocks.append("\n".join(lines))
+    if not blocks:
+        return ""
+    remaining = len(targets) - _AUTO_READ_MAX_FILES
+    if remaining > 0:
+        blocks.append(f"(+{remaining} more written file(s) not shown.)")
+    joined = "\n\n".join(blocks)
+    return TOOL_ATTENTION_MARKER + joined if attention else joined
 
 
 import mascot
@@ -272,13 +415,38 @@ except Exception:  # pragma: no cover - defensive fallback
         return ""
 
 
+try:  # post-write validation is best-effort too.
+    from tools.syntax import validate_file, warm_lsp
+except Exception:  # pragma: no cover - defensive fallback
+
+    def validate_file(path, source):  # type: ignore[misc]
+        return None
+
+    def warm_lsp(path):  # type: ignore[misc]
+        return False
+
+
+try:  # diagnostics presentation (per-agent dedup wording); same guard.
+    from tools.diagnostics import ALL_UNCHANGED, clean_validation_report, unchanged_note
+except Exception:  # pragma: no cover - defensive fallback
+    clean_validation_report = None  # type: ignore[assignment]
+    ALL_UNCHANGED = "all unchanged and already reported above"
+
+    def unchanged_note(count: int, noun: str = "issue") -> str:  # type: ignore[misc]
+        return f"- {count} unchanged {noun}(s) already reported above (not repeated)"
+
+
 class AgentUI(Protocol):
     chat: object  # ChatLog, with add_* helpers
 
     def set_state(self, state: mascot.State) -> None: ...
     def begin_generation(self) -> None: ...
     def set_prefill(
-        self, percent: float, processed: int | None = None, total: int | None = None
+        self,
+        percent: float,
+        processed: int | None = None,
+        total: int | None = None,
+        session_ctx: int | None = None,
     ) -> None: ...
     def add_reasoning_delta(self, text: str) -> None: ...
     def set_usage(self, usage: dict, timings: dict | None = None) -> None: ...
@@ -286,16 +454,134 @@ class AgentUI(Protocol):
     def pop_queued_user_batch(self) -> str | None: ...
 
 
-class Agent:
-    def __init__(self, client, registry: ToolRegistry, config: Config, ui: AgentUI) -> None:
+@dataclass(frozen=True)
+class BudgetDecision:
+    """What to do when a stage's round budget runs out (see
+    ``TurnRunner.on_round_budget_reached``). ``"stop"`` reproduces today's
+    silent cutoff; ``"grow"`` raises ``max_rounds`` (to ``max_rounds``, the
+    field) and keeps looping; ``"force"`` seeds a named ``tool_choice`` (the
+    ``forced_tool`` field) on the next stream so the model is guaranteed to
+    call that tool instead of trailing off.
+    """
+
+    kind: Literal["stop", "grow", "force"]
+    max_rounds: int | None = None
+    forced_tool: str | None = None
+
+
+# How many times a forced tool_choice (BudgetDecision(kind="force")) is
+# re-armed after a malformed/failed attempt before giving up and falling
+# back to the stop path — bounds the worst case instead of looping forever
+# on a model that can't produce valid XML even when forced.
+FORCE_TOOL_CHOICE_MAX_ATTEMPTS = 3
+
+
+class TurnRunner:
+    """The reusable streaming → tool-dispatch → guard loop.
+
+    Owns one caller-provided message list plus the client/registry/config/ui
+    plumbing, and drives the model until it ends its turn. Every loop guard
+    (malformed-XML retry, continuation nudge, repeated-bash denial,
+    wholesale-rewrite escalation) lives here so every driver — the freestyle
+    :class:`Agent` today, the smart-mode orchestrator's stages next — gets
+    the same discipline without re-implementing the loop.
+    """
+
+    # Stage discipline (smart mode): when set, a tool call outside this set is
+    # denied with an error tool-result instead of executing, keeping a
+    # restricted stage honest without changing the wire toolset. ``None``
+    # (the default, and the freestyle behavior) allows every registered tool.
+    # A class-level default so instances built via ``__new__`` inherit it.
+    allowed_tools: frozenset[str] | None = None
+    # Post-bash-write feedback dialect (see AgentSpec.write_feedback):
+    # "hashline" = anchor ids via the registry's hashline engine (the NORMAL
+    # agent, which holds read_file/replace/insert/delete); "subedit" =
+    # plain validation report naming the `edit` delegator tool; "report" =
+    # validation report only. Class default keeps NORMAL mode unchanged; the
+    # orchestrator overrides it per stage from the AgentSpec.
+    write_feedback: str = "hashline"
+    # Extra request fields merged over config.gen_params() for every stream —
+    # the orchestrator uses this for `qw35_session` (per-stage GPU sessions).
+    # None (default) sends the plain params.
+    request_overrides: dict | None = None
+    # Session-transcript observer: called with (kind, fields) whenever a
+    # message is appended to history (assistant turns with reasoning, tool
+    # results, guard feedback, queued user input). Failures are swallowed —
+    # the observer can never break the loop. None (default) records nothing.
+    event_sink: Callable[[str, dict], None] | None = None
+    # qw35_timings of the most recent stream (session_path, cached tokens,
+    # checkpoint depth...); the orchestrator's prefix-discipline tripwire
+    # reads it. None until a stream carrying usage completes.
+    last_timings: dict | None = None
+    # Hidden reasoning of the most recent assistant turn in THIS loop.
+    # Reasoning never enters the message list (only content + tool_calls are
+    # persisted), so this is the one place the orchestrator can read the
+    # thinking that led to the tool call it is currently executing — captured
+    # for the editor spawn's background block. Assigned right after the turn
+    # is appended and before its tools dispatch, so mid-dispatch readers see
+    # the ISSUING turn's reasoning. A class default so ``__new__``-built test
+    # instances inherit it.
+    last_reasoning: str = ""
+    # Round budget: when set, run_loop stops cleanly (returns True) after
+    # this many model streams — a machine transition mirroring the explore
+    # budget, so no stage can thrash unboundedly. None (default) = unbounded
+    # (classic freestyle behavior).
+    max_rounds: int | None = None
+    # Called when the round budget is spent, before the loop actually stops —
+    # gives the driver a chance to intervene (grow the budget, force a
+    # specific tool call) instead of a silent cutoff. None (default) = the
+    # classic behavior above, unchanged. See BudgetDecision.
+    on_round_budget_reached: Callable[[], Awaitable[BudgetDecision]] | None = None
+    # One-shot tool_choice for the next stream only (see BudgetDecision.force
+    # handling in run_loop / _stream_assistant). None = no forcing.
+    _pending_tool_choice: dict | None = None
+    # Remaining re-arms of a forced tool_choice after a failed/malformed
+    # attempt, without re-asking the driver. 0 = not currently forcing.
+    _force_attempts_remaining: int = 0
+    # State-predicate stop: when set, checked after each tool-call turn —
+    # a True return ends the loop cleanly. The driver declares "this state
+    # means the stage is done" (e.g. planning ends the moment a todo goes
+    # in_progress: the model marked work as STARTING, so stop planning).
+    stop_when = None
+    # Stall exit: when True, once ANY tool has executed in this loop, a
+    # no-progress turn (content only, or nothing but denials) ends the loop
+    # cleanly instead of nudging. This is the natural stage handoff — a
+    # planner that wrote its todos and starts narrating "let me implement"
+    # is DONE planning; nudging it once produced an endless
+    # narrate → repeat-denied → narrate cycle that starved the executors.
+    stop_on_stall: bool = False
+    # Per-tool-name last-executed signatures (see reset_turn_guards). A
+    # class default so instances built via ``__new__`` inherit it; the dict
+    # is created by reset_turn_guards()/__init__.
+    _last_signatures: dict | None = None
+    # Signature of the last call that EXECUTED (any tool) — the consecutive
+    # guard for shell/web_fetch: re-running the same command after other
+    # work (edit -> re-run tests) is legitimate and must never be denied.
+    _last_executed_signature: str | None = None
+    # Rewrite advice speaks only of `edit`: both modes run the same
+    # executor toolset (run_shell_command + edit) now.
+    rewrite_advice_notes: tuple = REWRITE_ADVICE_NOTES
+
+    def __init__(
+        self,
+        client,
+        registry: ToolRegistry,
+        config: Config,
+        ui: AgentUI,
+        messages: list[dict] | None = None,
+    ) -> None:
         self.client = client
         self.registry = registry
         self.config = config
         self.ui = ui
-        self.messages: list[dict] = [build_system_message(registry=self.registry)]
-        # Signature of the last tool call we actually executed this turn, used
-        # to deny an immediately repeated identical call. Reset per user turn.
-        self._last_tool_signature: str | None = None
+        self.messages: list[dict] = messages if messages is not None else []
+        # Last-executed signature PER TOOL NAME, used to deny a repeated
+        # identical `plan` call. Per-tool (not a single slot): a planner once
+        # looped identical todo rewrites interleaved with
+        # ask_user_question, and the interleaving cleared a single-slot
+        # guard every time. Reset per user turn.
+        self._last_signatures: dict[str, str] = {}
+        self._last_executed_signature = None
         # The denial note used for the previous consecutive repeat, so the next
         # one picks a different wording. Reset whenever a distinct call runs.
         self._last_repeat_msg: str | None = None
@@ -307,20 +593,23 @@ class Agent:
         # The soft nudge used last, so consecutive soft nudges differ in wording.
         self._last_rewrite_advice: str | None = None
 
-    def clear(self) -> None:
-        """Reset the conversation, keeping only the system message.
-
-        Mirrors qw35-client's ``/clear``: preserve the system prompt, drop the
-        rest, and reset the per-conversation guards so the next turn starts fresh.
-        """
-        system = next((m for m in self.messages if m.get("role") == "system"), None)
-        self.messages = (
-            [system] if system is not None else [build_system_message(registry=self.registry)]
-        )
-        self._last_tool_signature = None
+    def reset_turn_guards(self) -> None:
+        """Start a fresh user turn: it may legitimately repeat the last call."""
+        self._last_signatures = {}
+        self._last_executed_signature = None
         self._last_repeat_msg = None
+        self.last_reasoning = ""
+
+    def reset_conversation_guards(self) -> None:
+        """Forget all per-conversation guard state (a cleared conversation)."""
+        self.reset_turn_guards()
         self._bash_rewrite_counts.clear()
         self._last_rewrite_advice = None
+        # The cleared context no longer contains any previously-shown
+        # diagnostics, so the active per-agent memory must forget them too.
+        memory = getattr(self.registry, "diag_memory", None)
+        if memory is not None:
+            memory.clear()
 
     @staticmethod
     def _tool_signature(name: str, arguments: object) -> str:
@@ -363,17 +652,19 @@ class Agent:
         )
         return any(marker in last_line for marker in intent_markers)
 
-    async def run_turn(self, user_text: str) -> bool:
-        """Run one user turn to completion. Returns True on success."""
-        self._compact_completed_history()
-        self.ui.set_state(mascot.State.WAKEUP)
-        self._append_user_message(user_text)
-        # A fresh user turn may legitimately repeat the previous turn's call.
-        self._last_tool_signature = None
-        self._last_repeat_msg = None
+    async def run_loop(self) -> bool:
+        """Stream and dispatch until the model ends its turn. True on success.
+
+        The caller has already appended whatever user/directive message opens
+        the turn (and reset the per-turn guards if that message starts a fresh
+        user turn).
+        """
         malformed_tool_retries = 0
         continuation_nudges = 0
-        await asyncio.sleep(WAKEUP_HOLD_SECONDS)  # let the wake animation play
+        rounds = 0
+        executed_any = False  # any tool actually ran in this loop
+        if self._last_signatures is None:  # instances built via __new__
+            self._last_signatures = {}
 
         while True:
             try:
@@ -383,8 +674,18 @@ class Agent:
                 self.ui.chat.flush_assistant()
                 self.ui.set_error(exc.short_code(), exc.message)
                 return False
+            rounds += 1
 
             self.messages.append(self._assistant_message(turn))
+            self.last_reasoning = turn.reasoning or ""
+            self._emit_event(
+                "assistant",
+                content=turn.content or "",
+                tool_calls=[
+                    {"id": call.id, "name": call.name, "arguments": call.arguments}
+                    for call in turn.tool_calls
+                ],
+            )
 
             if not turn.tool_calls:
                 if self._has_malformed_tool_call_text(turn.content):
@@ -401,6 +702,11 @@ class Agent:
                 if self._inject_queued_user_batch():
                     malformed_tool_retries = 0
                     continue
+                if self.stop_on_stall and executed_any:
+                    # Work happened and the model is done tooling: that IS
+                    # the stage handoff — no continuation nudge.
+                    self.ui.set_state(mascot.State.OK)
+                    return True
                 if (
                     self._looks_unfinished(turn.content)
                     and continuation_nudges < CONTINUATION_MAX_NUDGES
@@ -415,20 +721,36 @@ class Agent:
                 return True
 
             malformed_tool_retries = 0
+            executed_this_turn = False
             for call in turn.tool_calls:
-                state = mascot.State.BASH if call.name == "bash" else mascot.State.EDIT
-                self.ui.set_state(state)
+                self.ui.set_state(mascot.state_for_tool(call.name))
+                # Stage discipline: a call outside the active stage's toolset is
+                # denied with an error result — never executed. Inert (None) in
+                # freestyle mode.
+                if self.allowed_tools is not None and call.name not in self.allowed_tools:
+                    result = stage_violation_message(call.name, self.allowed_tools)
+                    self.ui.chat.add_tool_result(call.index, call.name, result, is_error=True)
+                    self._append_tool_message(call, result, is_error=True)
+                    continue
                 # The call box was already streamed in during _stream_assistant.
                 signature = self._tool_signature(call.name, call.arguments)
-                # Dedup only bash (its original purpose). For edit tools a
-                # content-free "already did that" note is misleading — the model
-                # may think the edit landed when it did not — so always re-run them
-                # and return the true current state.
-                if (
-                    call.name == "bash"
-                    and signature == self._last_tool_signature
-                    and not self._tool_arguments_invalid(call.arguments)
-                ):
+                # Dedup semantics differ by tool. `plan` and `explore`:
+                # per-tool and turn-persistent (a planner once laundered
+                # identical lists through interleaved ask_user_question
+                # calls; an identical `explore` re-spawn burns a whole
+                # sub-agent run for a report it already has). Shell and
+                # web_fetch: STRICTLY CONSECUTIVE — an identical command is
+                # denied only when nothing else executed since, because a
+                # re-run after other work (edit -> re-run the tests) is
+                # meaningful. Edit tools are never deduped: a content-free
+                # "already did that" note would misreport the file state.
+                if call.name in ("plan", "explore"):
+                    is_repeat = signature == self._last_signatures.get(call.name)
+                elif call.name in (*SHELL_TOOL_NAMES, "web_fetch"):
+                    is_repeat = signature == self._last_executed_signature
+                else:
+                    is_repeat = False
+                if is_repeat and not self._tool_arguments_invalid(call.arguments):
                     # Repeated identical call: deny without executing and feed
                     # back a randomly-worded note (different from the previous
                     # one). Leave the guard set so a third identical call is
@@ -436,11 +758,11 @@ class Agent:
                     result = repeated_tool_message(call.name, exclude=self._last_repeat_msg)
                     self._last_repeat_msg = result
                     self.ui.chat.add_tool_result(call.index, call.name, result, is_error=True)
-                    self.messages.append(
-                        {"role": "tool", "tool_call_id": call.id, "content": result}
-                    )
+                    self._append_tool_message(call, result, is_error=True)
                     continue
                 is_error = False
+                executed_this_turn = True
+                executed_any = True
                 try:
                     result = await self.registry.execute(call.name, call.arguments)
                 except Exception as exc:  # noqa: BLE001 - feed errors back to the model
@@ -453,7 +775,7 @@ class Agent:
                     result = result[len(TOOL_ATTENTION_MARKER):]
                     is_error = True
                 if (
-                    call.name == "bash"
+                    call.name in SHELL_TOOL_NAMES
                     and not is_error
                     and not result.startswith(_BASH_NOT_RUN_PREFIXES)
                 ):
@@ -471,26 +793,92 @@ class Agent:
                     if syntax:
                         result = f"{result}\n\n{syntax}"
                     # If the command authored a file, hand the model its fresh line
-                    # anchors so it can edit in place without a separate read.
+                    # anchors so it can edit in place without a separate read. A
+                    # marked block means a written file failed its syntax/LSP check;
+                    # surface it as an error exactly like an edit would be.
                     anchors = await self._auto_read_written_files(call.arguments)
                     if anchors:
+                        if anchors.startswith(TOOL_ATTENTION_MARKER):
+                            anchors = anchors[len(TOOL_ATTENTION_MARKER):]
+                            is_error = True
                         result = f"{result}\n\n{anchors}"
                 self.ui.chat.add_tool_result(call.index, call.name, result, is_error=is_error)
-                self.messages.append(
-                    {"role": "tool", "tool_call_id": call.id, "content": result}
-                )
-                # A distinct call ran: it becomes the new guard target and the
-                # repeat streak restarts.
-                self._last_tool_signature = signature
+                self._append_tool_message(call, result, is_error=is_error)
+                # A distinct call ran: it becomes ITS TOOL'S new guard target
+                # (`plan`) and the overall last-executed one (shell/
+                # web_fetch), and the repeat streak restarts.
+                self._last_signatures[call.name] = signature
+                self._last_executed_signature = signature
                 self._last_repeat_msg = None
             # Tools ran this turn — real progress, so refresh the continuation budget.
             continuation_nudges = 0
             self._inject_queued_user_batch()
+            # The driver's state predicate says the stage is done (e.g. the
+            # plan was just approved through the gate).
+            if self.stop_when is not None and self.stop_when():
+                self.ui.set_state(mascot.State.OK)
+                return True
+            # A turn of nothing but denials after real work is a stall: the
+            # stage has what it needs — transition instead of spinning
+            # (observed live: narrate → repeat-denied plan rewrite → narrate,
+            # forever, while the executors starved).
+            if self.stop_on_stall and executed_any and not executed_this_turn:
+                self.ui.set_state(mascot.State.OK)
+                return True
+            # Round budget spent: stop cleanly — a machine transition, not an
+            # error (the caller decides what the stage produced) — unless the
+            # driver wants a say first (grow the budget, force a specific
+            # tool call) via on_round_budget_reached.
+            if self.max_rounds is not None and rounds >= self.max_rounds:
+                if self._force_attempts_remaining > 0:
+                    # Re-arm the same forced tool_choice without re-asking
+                    # the driver — the previous forced attempt didn't land
+                    # (malformed XML, wrong tool, etc.).
+                    self._force_attempts_remaining -= 1
+                    continue
+                if self.on_round_budget_reached is not None:
+                    decision = await self.on_round_budget_reached()
+                    if decision.kind == "grow" and decision.max_rounds:
+                        self.max_rounds = decision.max_rounds
+                        continue
+                    if decision.kind == "force" and decision.forced_tool:
+                        self._pending_tool_choice = {
+                            "type": "function",
+                            "function": {"name": decision.forced_tool},
+                        }
+                        self._force_attempts_remaining = FORCE_TOOL_CHOICE_MAX_ATTEMPTS - 1
+                        continue
+                self.ui.set_info("stage round budget reached")
+                self.ui.set_state(mascot.State.OK)
+                return True
             # Loop again so the model sees the tool results.
+
+    def _emit_event(self, kind: str, **fields) -> None:
+        if self.event_sink is None:
+            return
+        try:
+            self.event_sink(kind, fields)
+        except Exception:
+            pass
+
+    def _append_tool_message(
+        self, call, result: str, *, is_error: bool
+    ) -> None:
+        self.messages.append(
+            {"role": "tool", "tool_call_id": call.id, "content": result}
+        )
+        self._emit_event(
+            "tool_result",
+            id=call.id,
+            name=call.name,
+            result=result,
+            is_error=is_error,
+        )
 
     def _append_user_message(self, user_text: str) -> None:
         self.ui.chat.add_user(user_text)
         self.messages.append({"role": "user", "content": user_text})
+        self._emit_event("user", text=user_text)
 
     def _inject_queued_user_batch(self) -> bool:
         pop_batch = getattr(self.ui, "pop_queued_user_batch", None)
@@ -505,78 +893,6 @@ class Agent:
         self._last_repeat_msg = None
         return True
 
-    def _compact_completed_history(self) -> None:
-        """Replace old tool-call payloads with compact summaries.
-
-        Completed tool calls can include whole-file heredocs or large edit bodies.
-        Keeping those exact arguments in later turns burns context without adding
-        new state; the filesystem already holds the applied change. We preserve
-        the user/assistant text and a short record of each completed tool call.
-        """
-        if len(self.messages) < 2:
-            return
-
-        compacted: list[dict] = []
-        i = 0
-        while i < len(self.messages):
-            msg = self.messages[i]
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                lines = ["Completed tool calls:"]
-                for tc in msg.get("tool_calls") or []:
-                    lines.append(f"- {self._compact_tool_call(tc)}")
-                i += 1
-                results: list[str] = []
-                while i < len(self.messages) and self.messages[i].get("role") == "tool":
-                    content = self.messages[i].get("content") or ""
-                    results.append(self._shorten(str(content), COMPACT_RESULT_CHARS))
-                    i += 1
-                if results:
-                    lines.append("Results: " + " | ".join(results))
-                compacted.append({"role": "assistant", "content": "\n".join(lines)})
-                continue
-            if msg.get("role") == "tool":
-                i += 1
-                continue
-            compacted.append(msg)
-            i += 1
-        self.messages = compacted
-
-    @classmethod
-    def _compact_tool_call(cls, tc: dict) -> str:
-        fn = tc.get("function") or {}
-        name = str(fn.get("name") or "tool")
-        try:
-            args = json.loads(fn.get("arguments") or "{}")
-        except json.JSONDecodeError:
-            args = {}
-        if not isinstance(args, dict):
-            args = {}
-
-        if name == "bash":
-            command = str(args.get("command") or "")
-            first_line = command.splitlines()[0] if command else ""
-            return f"bash: {cls._shorten(first_line, COMPACT_ARG_CHARS)!r}"
-
-        parts = [name]
-        file = args.get("file")
-        if isinstance(file, str) and file:
-            parts.append(f"on {file}")
-        anchor = args.get("id")
-        if isinstance(anchor, str) and anchor:
-            parts.append(f"at {anchor}")
-        content = args.get("content")
-        if isinstance(content, str):
-            line_count = 0 if content == "" else len(content.splitlines())
-            parts.append(f"with {line_count} lines/{len(content)} chars")
-        return " ".join(parts)
-
-    @staticmethod
-    def _shorten(text: str, limit: int) -> str:
-        text = " ".join(text.splitlines()).strip()
-        if len(text) <= limit:
-            return text
-        return text[: max(0, limit - 3)].rstrip() + "..."
-
     async def _stream_assistant(self) -> AssistantTurn:
         self.ui.begin_generation()
         self.ui.set_state(mascot.State.PREFILL)
@@ -584,14 +900,24 @@ class Agent:
         thinking_started = False
         generating = False
 
+        params = dict(self.config.gen_params())
+        if self.request_overrides:
+            params.update(self.request_overrides)
+        if self._pending_tool_choice is not None:
+            # One-shot: forces exactly this stream, then falls back to the
+            # model's own choice again (re-armed by run_loop if it fails).
+            params["tool_choice"] = self._pending_tool_choice
+            self._pending_tool_choice = None
         async for event in self.client.stream_chat(
             messages=self.messages,
             tools=self.registry.schemas(),
-            **self.config.gen_params(),
+            **params,
         ):
             acc.add(event)
             if isinstance(event, PrefillProgress):
-                self.ui.set_prefill(event.percent, event.processed, event.total)
+                self.ui.set_prefill(
+                    event.percent, event.processed, event.total, event.session_ctx
+                )
             elif isinstance(event, ReasoningDelta):
                 if not thinking_started:
                     self.ui.set_state(mascot.State.THINKING)
@@ -612,16 +938,12 @@ class Agent:
                 self.ui.chat.flush_assistant()
                 generating = False
                 if event.name:
-                    self.ui.set_state(
-                        mascot.State.BASH if event.name == "bash" else mascot.State.EDIT
-                    )
+                    self.ui.set_state(mascot.state_for_tool(event.name))
                 self.ui.chat.begin_tool_call(event.index, event.name)
             elif isinstance(event, ToolCallArgsDelta):
                 self.ui.chat.update_tool_call(event.index, event.fragment)
             elif isinstance(event, ToolCallName):
-                self.ui.set_state(
-                    mascot.State.BASH if event.name == "bash" else mascot.State.EDIT
-                )
+                self.ui.set_state(mascot.state_for_tool(event.name))
                 self.ui.chat.name_tool_call(event.index, event.name)
             elif isinstance(event, ToolCallFinal):
                 self.ui.chat.finalize_tool_call(event.index, event.arguments)
@@ -631,6 +953,7 @@ class Agent:
                 # logic sees it in the accumulated turn).
                 self.ui.chat.demote_tool_call(event.index)
             elif isinstance(event, Usage):
+                self.last_timings = event.timings or {}
                 self.ui.set_usage(event.usage, event.timings)
             elif isinstance(event, Finish):
                 pass  # recorded by the accumulator
@@ -650,7 +973,7 @@ class Agent:
                     "function": {
                         "name": call.name,
                         "arguments": json.dumps(
-                            Agent._history_tool_arguments(call.arguments),
+                            TurnRunner._history_tool_arguments(call.arguments),
                             ensure_ascii=False,
                         ),
                     },
@@ -698,25 +1021,156 @@ class Agent:
             return None, False
         if repeated_count >= 3:
             return escalated_rewrite_message(repeated, repeated_count), True
-        advice = rewrite_advice_message(repeated, exclude=self._last_rewrite_advice)
+        advice = rewrite_advice_message(
+            repeated, exclude=self._last_rewrite_advice, pool=self.rewrite_advice_notes
+        )
         self._last_rewrite_advice = advice
         return advice, False
 
     async def _auto_read_written_files(self, arguments: dict) -> str:
-        """Anchors for files a bash command just wrote, to append to its result.
+        """Post-write feedback for files a bash command just wrote.
 
-        Lets the model edit a freshly-written file immediately, without a separate
-        read. Best-effort: returns ``""`` on any problem.
+        Dialect per :attr:`write_feedback`: hashline anchors for agents that
+        hold the hashline tools, a plain validation report otherwise. Lets the
+        model fix a freshly-written file immediately, without a separate read.
+        Best-effort: returns ``""`` on any problem.
         """
         command = arguments.get("command") if isinstance(arguments, dict) else None
         if not isinstance(command, str) or not command:
             return ""
         if not _authored_write_targets(command):
             return ""
-        files_tool = getattr(self.registry, "files", None)
-        if files_tool is None:
-            return ""
         try:
-            return await asyncio.to_thread(build_auto_read_block, files_tool, command)
+            if self.write_feedback == "hashline":
+                files_tool = getattr(self.registry, "files", None)
+                if files_tool is None:
+                    return ""
+                return await asyncio.to_thread(build_auto_read_block, files_tool, command)
+            # The plain report dedups against the CURRENT agent's diagnostics
+            # memory (the registry points at it; hashline reads its own via
+            # the files engine inside build_auto_read_block).
+            return await asyncio.to_thread(
+                build_post_write_report,
+                command,
+                self.write_feedback == "subedit",
+                getattr(self.registry, "diag_memory", None),
+            )
         except Exception:  # noqa: BLE001 - convenience only
             return ""
+
+
+class Agent(TurnRunner):
+    """The freestyle agent: one persistent conversation over the full toolset.
+
+    A thin wrapper over :class:`TurnRunner` that owns the conversation
+    semantics — the system message, ``/clear``, and the between-turn history
+    compaction. Smart-mode stages drive :class:`TurnRunner` directly instead.
+    """
+
+    def __init__(self, client, registry: ToolRegistry, config: Config, ui: AgentUI) -> None:
+        super().__init__(
+            client,
+            registry,
+            config,
+            ui,
+            messages=[build_system_message(registry=registry)],
+        )
+
+    def clear(self) -> None:
+        """Reset the conversation, keeping only the system message.
+
+        Mirrors qw35-client's ``/clear``: preserve the system prompt, drop the
+        rest, and reset the per-conversation guards so the next turn starts fresh.
+        """
+        system = next((m for m in self.messages if m.get("role") == "system"), None)
+        self.messages = (
+            [system] if system is not None else [build_system_message(registry=self.registry)]
+        )
+        self.reset_conversation_guards()
+
+    async def run_turn(self, user_text: str) -> bool:
+        """Run one user turn to completion. Returns True on success."""
+        self._compact_completed_history()
+        self.ui.set_state(mascot.State.WAKEUP)
+        self._append_user_message(user_text)
+        # A fresh user turn may legitimately repeat the previous turn's call.
+        self.reset_turn_guards()
+        await asyncio.sleep(WAKEUP_HOLD_SECONDS)  # let the wake animation play
+        return await self.run_loop()
+
+    def _compact_completed_history(self) -> None:
+        """Replace old tool-call payloads with compact summaries.
+
+        Completed tool calls can include whole-file heredocs or large edit bodies.
+        Keeping those exact arguments in later turns burns context without adding
+        new state; the filesystem already holds the applied change. We preserve
+        the user/assistant text and a short record of each completed tool call.
+
+        Freestyle-only: it rewrites history in place, which is exactly what the
+        smart-mode pipeline must never do (its prompts must stay byte-identical
+        prefixes for the server's checkpoint stack), so the orchestrator prunes
+        at stage boundaries instead of compacting.
+        """
+        if len(self.messages) < 2:
+            return
+
+        compacted: list[dict] = []
+        i = 0
+        while i < len(self.messages):
+            msg = self.messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                lines = ["Completed tool calls:"]
+                for tc in msg.get("tool_calls") or []:
+                    lines.append(f"- {self._compact_tool_call(tc)}")
+                i += 1
+                results: list[str] = []
+                while i < len(self.messages) and self.messages[i].get("role") == "tool":
+                    content = self.messages[i].get("content") or ""
+                    results.append(self._shorten(str(content), COMPACT_RESULT_CHARS))
+                    i += 1
+                if results:
+                    lines.append("Results: " + " | ".join(results))
+                compacted.append({"role": "assistant", "content": "\n".join(lines)})
+                continue
+            if msg.get("role") == "tool":
+                i += 1
+                continue
+            compacted.append(msg)
+            i += 1
+        self.messages = compacted
+
+    @classmethod
+    def _compact_tool_call(cls, tc: dict) -> str:
+        fn = tc.get("function") or {}
+        name = str(fn.get("name") or "tool")
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+
+        if name in SHELL_TOOL_NAMES:
+            command = str(args.get("command") or "")
+            first_line = command.splitlines()[0] if command else ""
+            return f"bash: {cls._shorten(first_line, COMPACT_ARG_CHARS)!r}"
+
+        parts = [name]
+        file = args.get("file")
+        if isinstance(file, str) and file:
+            parts.append(f"on {file}")
+        anchor = args.get("id")
+        if isinstance(anchor, str) and anchor:
+            parts.append(f"at {anchor}")
+        content = args.get("content")
+        if isinstance(content, str):
+            line_count = 0 if content == "" else len(content.splitlines())
+            parts.append(f"with {line_count} lines/{len(content)} chars")
+        return " ".join(parts)
+
+    @staticmethod
+    def _shorten(text: str, limit: int) -> str:
+        text = " ".join(text.splitlines()).strip()
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip() + "..."

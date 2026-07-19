@@ -25,6 +25,14 @@ ALLOWED_THINK = ("auto", "on", "off")
 # unset; xhigh falls back to the 16% backstop, not uncapped).
 ALLOWED_EFFORTS = ("low", "medium", "high", "xhigh")
 
+# Scorer for the web-result rerank lane (tools/compress/rerank):
+#   cross-encoder → the server's native Qwen3-Reranker via POST /v1/rerank
+#                   (the default; qw35 auto-loads the reranker GGUF when
+#                   present, or serve it explicitly with --reranker-model)
+#   bm25          → lexical only; never touches the server
+# cross-encoder silently degrades to bm25 when the server has no reranker.
+ALLOWED_RERANK_SCORERS = ("cross-encoder", "bm25")
+
 # Input prompt: paste-collapsing thresholds (little-coder parity). Message-history
 # persistence now lives in its own container — see ``history.py``.
 PASTE_LINE_THRESHOLD = 10
@@ -32,6 +40,10 @@ PASTE_CHAR_THRESHOLD = 1000
 
 # Tool result preview length before Ctrl+O expands it.
 TOOL_PREVIEW_LINES = 20
+
+# The bash mini terminal window's body budget (command + output rows shown
+# inline) before the head view truncates with a "... +N lines" marker.
+TERMINAL_BODY_LINES = 10
 
 
 @dataclass(frozen=True)
@@ -52,11 +64,36 @@ class Config:
     # gated only by the interactive approval modal.
     restricted_bash: bool = False
 
+    # Master switch for tool-output compression (tools/compress): large tool
+    # results are shrunk once, at production time, before they become prompt
+    # tokens. Per-call recovery: re-call the tool with `compress:false`.
+    # Disabled with --no-compress.
+    compress: bool = True
+
+    # Query-aware semantic rerank of web_fetch results (tools/compress/rerank):
+    # part of compression, so compress=False disables it too. Scored by the
+    # server's native cross-encoder reranker by default (qw35 auto-loads it
+    # when the reranker GGUF is present); degrades to pure-Python BM25 when
+    # the server has no reranker. Disabled with --no-rerank.
+    rerank: bool = True
+    # Which scorer the rerank lane uses (see ALLOWED_RERANK_SCORERS);
+    # set with --rerank-scorer.
+    rerank_scorer: str = "cross-encoder"
+
+    # LSP semantic diagnostics (tools/lsp via multilspy) as the primary
+    # validation layer for read/edit results; degrades per-language to the
+    # tree-sitter checker when multilspy or a language-server binary is
+    # unavailable, a server is still starting, or diagnostics time out.
+    # Disabled with --no-lsp.
+    lsp: bool = True
+
     def __post_init__(self) -> None:
         if self.think not in ALLOWED_THINK:
             object.__setattr__(self, "think", "auto")
         if self.reasoning_effort is not None and self.reasoning_effort not in ALLOWED_EFFORTS:
             object.__setattr__(self, "reasoning_effort", None)
+        if self.rerank_scorer not in ALLOWED_RERANK_SCORERS:
+            object.__setattr__(self, "rerank_scorer", "cross-encoder")
 
     def gen_params(self) -> dict:
         """Request fields spread into a chat-completions request.
@@ -101,6 +138,10 @@ def load_config(
     reasoning_effort: str | None = None,
     restricted_bash: bool | None = None,
     max_tokens: int | None = None,
+    compress: bool | None = None,
+    rerank: bool | None = None,
+    rerank_scorer: str | None = None,
+    lsp: bool | None = None,
 ) -> Config:
     """Build a Config from dataclass defaults, overridden by explicit args.
 
@@ -120,5 +161,13 @@ def load_config(
         cfg = replace(cfg, restricted_bash=restricted_bash)
     if max_tokens is not None and max_tokens > 0:
         cfg = replace(cfg, max_tokens=max_tokens)
+    if compress is not None:
+        cfg = replace(cfg, compress=compress)
+    if rerank is not None:
+        cfg = replace(cfg, rerank=rerank)
+    if rerank_scorer and rerank_scorer.lower() in ALLOWED_RERANK_SCORERS:
+        cfg = replace(cfg, rerank_scorer=rerank_scorer.lower())
+    if lsp is not None:
+        cfg = replace(cfg, lsp=lsp)
 
     return cfg

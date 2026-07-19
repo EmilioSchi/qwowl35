@@ -1,7 +1,7 @@
 """A minimal, keyboard-driven "are you sure you want to quit?" confirmation.
 
 Mirrors :class:`~widgets.theme_selector.ThemeSelector` and
-:class:`~widgets.approval.ApprovalModal`: a transparent, centered overlay so the
+:class:`~widgets.approval_modal.ApprovalModal`: a transparent, centered overlay so the
 app painted below stays visible. Two options — No (default) and Yes — toggled
 with Left/Right or Up/Down; Enter confirms the highlighted option.
 

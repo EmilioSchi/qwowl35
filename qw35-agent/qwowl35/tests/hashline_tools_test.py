@@ -38,7 +38,7 @@ def assert_true(value, label: str) -> None:
 
 
 def _line_id(output: str, line_no: int) -> str:
-    """Extract the ``<line><hash>`` id for ``line_no`` from a beginTransaction body.
+    """Extract the ``<line><hash>`` id for ``line_no`` from a read_file body.
 
     The id has no separator (the ``:`` was dropped for token efficiency); the hash
     is the fixed final two hex chars, so the line is the leading digits.
@@ -69,14 +69,19 @@ def test_line_ref_has_no_separator_and_round_trips() -> None:
     assert_equal(parse_anchor("12:af").short, 0xAF, "optional ':' still parses (hash)")
 
 
-def test_schema_advertises_begin_transaction_only() -> None:
+def test_schema_advertises_read_file_only() -> None:
     tools = HashlineTools()
     schemas = {s["function"]["name"]: s["function"] for s in tools.schemas()}
-    assert_true("beginTransaction" in schemas, "beginTransaction advertised")
+    assert_true("read_file" in schemas, "read_file advertised")
     assert_true("read" not in schemas, "old 'read' name gone")
-    props = schemas["beginTransaction"]["parameters"]["properties"]
-    assert_equal(sorted(props), ["file"], "beginTransaction takes only 'file'")
-    for name in ("edit", "insert", "delete"):
+    assert_true("beginTransaction" not in schemas, "old 'beginTransaction' name gone")
+    props = schemas["read_file"]["parameters"]["properties"]
+    assert_true("file_path" in props, "read_file takes 'file_path'")
+    assert_equal(
+        schemas["read_file"]["parameters"]["required"], ["file_path"],
+        "only file_path is required",
+    )
+    for name in ("replace", "insert", "delete"):
         assert_true("id" in schemas[name]["parameters"]["properties"], f"{name} uses 'id'")
         assert_true("anchor" not in schemas[name]["parameters"]["properties"], f"{name} has no 'anchor'")
     # The retired tool name is not dispatchable.
@@ -88,29 +93,29 @@ def test_schema_advertises_begin_transaction_only() -> None:
         )
 
 
-def test_begin_transaction_edit_insert_delete_flow() -> None:
+def test_read_file_edit_insert_delete_flow() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = os.getcwd()
         os.chdir(tmp)
         try:
             Path("m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("beginTransaction", {"file": "m.py"})
+            shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
             return_id = _line_id(shown, 2)
 
-            edited = tools.execute("edit", {"file": "m.py", "id": return_id, "content": "    return 2"})
+            edited = tools.execute("replace",{"file": "m.py", "id": return_id, "content": "    return 2"})
             assert_true(edited.startswith("Edited line 2"), f"edit result: {edited}")
             assert_true("|    return 2" in edited, "fresh ids after edit")
             assert_true(_line_id(edited, 2), "edit snippet shows a line-2 id")
             assert_equal(Path("m.py").read_text(encoding="utf-8"), "def f():\n    return 2\n", "file edited")
 
-            reread = tools.execute("beginTransaction", {"file": "m.py"})
+            reread = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
             def_id = _line_id(reread, 1)
             inserted = tools.execute("insert", {"file": "m.py", "id": def_id, "position": "before", "content": "import os"})
             assert_true(inserted.startswith("Inserted line 1"), f"insert result: {inserted}")
             assert_true(Path("m.py").read_text(encoding="utf-8").startswith("import os\n"), "file inserted")
 
-            after_insert = tools.execute("beginTransaction", {"file": "m.py"})
+            after_insert = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
             import_id = _line_id(after_insert, 1)
             deleted = tools.execute("delete", {"file": "m.py", "id": import_id})
             assert_true(deleted.startswith("Deleted line 1"), f"delete result: {deleted}")
@@ -126,7 +131,7 @@ def test_insert_range_id_reports_single_id_guidance() -> None:
         try:
             Path("m.py").write_text("import math\n\ndef f():\n    return 1\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("beginTransaction", {"file": "m.py"})
+            shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
             import_id = _line_id(shown, 1)
             def_id = _line_id(shown, 3)
             result = tools.execute(
@@ -154,13 +159,13 @@ def test_stale_id_reports_context_and_flips_on_edit() -> None:
         try:
             Path("m.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("beginTransaction", {"file": "m.txt"})
+            shown = tools.execute("read_file", {"file_path": os.path.abspath("m.txt")})
             beta_id = _line_id(shown, 2)
             # The content cross-check must flip when the line content changes.
             Path("m.txt").write_text("alpha\nchanged\ngamma\n", encoding="utf-8")
-            reopened = tools.execute("beginTransaction", {"file": "m.txt", "_force": True})
+            reopened = tools.execute("read_file", {"file_path": "m.txt", "_force": True})
             assert_true(_line_id(reopened, 2) != beta_id, "id flips when line content changes")
-            result = tools.execute("edit", {"file": "m.txt", "id": beta_id, "content": "new"})
+            result = tools.execute("replace",{"file": "m.txt", "id": beta_id, "content": "new"})
             assert_true(result.startswith("Error: stale anchor"), f"stale result: {result}")
             assert_true(">>> 2" in result, "stale context points at current line")
         finally:
@@ -219,7 +224,7 @@ def test_start_end_keyword_ids_resolve_positionally() -> None:
         try:
             Path("m.py").write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
             tools = HashlineTools()
-            tools.execute("beginTransaction", {"file": "m.py"})
+            tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
 
             appended = tools.execute(
                 "insert",
@@ -243,7 +248,7 @@ def test_start_end_keyword_ids_resolve_positionally() -> None:
             )
 
             edited = tools.execute(
-                "edit", {"file": "m.py", "id": "END", "content": "d = 40"}
+                "replace", {"file": "m.py", "id": "END", "content": "d = 40"}
             )
             assert_true(edited.startswith("Edited line 5"), f"edit end (caps): {edited}")
             assert_true(
@@ -260,10 +265,10 @@ def test_start_end_keyword_ids_resolve_positionally() -> None:
                 "start deletes the first line",
             )
 
-            shown = tools.execute("beginTransaction", {"file": "m.py"})
-            assert_true("d = 40" in shown, f"beginTransaction shows the tail: {shown}")
+            shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
+            assert_true("d = 40" in shown, f"read_file shows the tail: {shown}")
 
-            bogus = tools.execute("edit", {"file": "m.py", "id": "nope", "content": "x"})
+            bogus = tools.execute("replace",{"file": "m.py", "id": "nope", "content": "x"})
             assert_true(bogus.startswith("Error: invalid anchor"), f"bogus id still errors: {bogus}")
         finally:
             os.chdir(cwd)
@@ -278,11 +283,11 @@ def test_noop_edit_reports_no_changes() -> None:
         try:
             Path("m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("beginTransaction", {"file": "m.py"})
+            shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
             return_id = _line_id(shown, 2)
 
             # Resend the exact existing content: a byte-identical no-op edit.
-            result = tools.execute("edit", {"file": "m.py", "id": return_id, "content": "    return 1"})
+            result = tools.execute("replace",{"file": "m.py", "id": return_id, "content": "    return 1"})
             assert_true("No changes were made" in result, f"no-op edit must say so: {result}")
             assert_true("byte-identical" in result, f"no-op note explains why: {result}")
             assert_true("Diff:" not in result, f"no-op edit has no diff: {result}")
@@ -292,7 +297,7 @@ def test_noop_edit_reports_no_changes() -> None:
 
 
 def test_mutation_denied_without_begin_transaction() -> None:
-    """edit/insert/delete on a file never opened with beginTransaction are denied
+    """replace/insert/delete on a file never opened with read_file are denied
     with advice to open it first, and the file on disk stays untouched."""
     with tempfile.TemporaryDirectory() as tmp:
         cwd = os.getcwd()
@@ -304,40 +309,161 @@ def test_mutation_denied_without_begin_transaction() -> None:
             tools = HashlineTools()
 
             for name, extra in (
-                ("edit", {"content": "    return 2"}),
+                ("replace", {"content": "    return 2"}),
                 ("insert", {"content": "import os", "position": "before"}),
                 ("delete", {}),
             ):
                 result = tools.execute(name, {"file": "m.py", "id": "1aa", **extra})
                 assert_true(result.startswith(f"Error: {name} denied"), f"{name} denied: {result}")
-                assert_true("beginTransaction" in result, f"{name} denial advises beginTransaction: {result}")
+                assert_true("read_file" in result, f"{name} denial advises read_file: {result}")
                 assert_equal(Path("m.py").read_text(encoding="utf-8"), original, f"file untouched after denied {name}")
 
             # Opening a DIFFERENT file does not unlock this one.
-            tools.execute("beginTransaction", {"file": "other.py"})
-            still = tools.execute("edit", {"file": "m.py", "id": "1aa", "content": "x"})
-            assert_true(still.startswith("Error: edit denied"), f"gate is per-file: {still}")
+            tools.execute("read_file", {"file_path": os.path.abspath("other.py")})
+            still = tools.execute("replace",{"file": "m.py", "id": "1aa", "content": "x"})
+            assert_true(still.startswith("Error: replace denied"), f"gate is per-file: {still}")
 
             # After opening the file, the same mutation with a real id succeeds.
-            shown = tools.execute("beginTransaction", {"file": "m.py"})
+            shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
             return_id = _line_id(shown, 2)
-            edited = tools.execute("edit", {"file": "m.py", "id": return_id, "content": "    return 2"})
+            edited = tools.execute("replace",{"file": "m.py", "id": return_id, "content": "    return 2"})
             assert_true(edited.startswith("Edited line 2"), f"edit allowed after open: {edited}")
 
             # A follow-up mutation without re-opening still passes the gate
             # (the session remembers the file; stale ids stay covered by hashes).
             second_id = _line_id(edited, 2)
-            second = tools.execute("edit", {"file": "m.py", "id": second_id, "content": "    return 3"})
+            second = tools.execute("replace",{"file": "m.py", "id": second_id, "content": "    return 3"})
             assert_true(second.startswith("Edited line 2"), f"second edit allowed: {second}")
         finally:
             os.chdir(cwd)
 
 
+def _in_tmp(fn) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            fn()
+        finally:
+            os.chdir(cwd)
+
+
+def test_read_file_relative_path_rejected_force_accepted() -> None:
+    def body() -> None:
+        Path("m.txt").write_text("a\nb\n", encoding="utf-8")
+        tools = HashlineTools()
+        rejected = tools.execute("read_file", {"file_path": "m.txt"})
+        assert_equal(rejected, "Error: File path must be absolute: m.txt", "relative path rejected")
+        forced = tools.execute("read_file", {"file_path": "m.txt", "_force": True})
+        assert_true("|a" in forced, f"_force waives the absolute check: {forced}")
+
+    _in_tmp(body)
+
+
+def test_read_file_offset_limit_window() -> None:
+    def body() -> None:
+        Path("m.txt").write_text("".join(f"line{i}\n" for i in range(1, 11)), encoding="utf-8")
+        tools = HashlineTools()
+        paged = tools.execute(
+            "read_file", {"file_path": os.path.abspath("m.txt"), "offset": 4, "limit": 3}
+        )
+        assert_true(
+            "Showing lines 5-7 of 10 total lines." in paged, f"window banner: {paged}"
+        )
+        assert_true("|line5" in paged and "|line7" in paged, f"window rows shown: {paged}")
+        assert_true("|line4" not in paged and "|line8" not in paged, f"rows outside window absent: {paged}")
+        # The rendered ids keep their true 1-based line numbers.
+        assert_true(_line_id(paged, 5), "id for line 5 present")
+        # A paged read satisfies the mutation gate: its ids are genuine.
+        edited = tools.execute(
+            "replace", {"file": "m.txt", "id": _line_id(paged, 5), "content": "LINE5"}
+        )
+        assert_true(edited.startswith("Edited line 5"), f"paged read unlocks mutations: {edited}")
+
+    _in_tmp(body)
+
+
+def test_read_file_offset_past_end_errors() -> None:
+    def body() -> None:
+        Path("m.txt").write_text("a\nb\nc\n", encoding="utf-8")
+        tools = HashlineTools()
+        result = tools.execute(
+            "read_file", {"file_path": os.path.abspath("m.txt"), "offset": 50, "limit": 5}
+        )
+        assert_equal(
+            result, "Error: offset 50 is past the end of the file (3 lines).",
+            "past-end offset errors",
+        )
+
+    _in_tmp(body)
+
+
+def test_read_file_offset_without_limit_reads_to_end() -> None:
+    def body() -> None:
+        Path("m.txt").write_text("a\nb\nc\nd\ne\n", encoding="utf-8")
+        tools = HashlineTools()
+        paged = tools.execute("read_file", {"file_path": os.path.abspath("m.txt"), "offset": 2})
+        assert_true("Showing lines 3-5 of 5 total lines." in paged, f"lenient offset-only: {paged}")
+        assert_true("|c" in paged and "|e" in paged and "|a" not in paged, f"tail window: {paged}")
+
+    _in_tmp(body)
+
+
+def test_read_file_string_offset_limit_coerced() -> None:
+    # XML tool-call parameters can reach the tool as strings.
+    def body() -> None:
+        Path("m.txt").write_text("a\nb\nc\nd\n", encoding="utf-8")
+        tools = HashlineTools()
+        paged = tools.execute(
+            "read_file", {"file_path": os.path.abspath("m.txt"), "offset": "1", "limit": "2"}
+        )
+        assert_true("Showing lines 2-3 of 4 total lines." in paged, f"string args coerced: {paged}")
+
+    _in_tmp(body)
+
+
+def test_paged_read_does_not_set_or_consult_f1_baseline() -> None:
+    def body() -> None:
+        Path("m.txt").write_text("a\nb\nc\nd\n", encoding="utf-8")
+        tools = HashlineTools()
+        # Paged first: must not record the full-read baseline...
+        tools.execute("read_file", {"file_path": os.path.abspath("m.txt"), "offset": 1, "limit": 2})
+        full = tools.execute("read_file", {"file_path": os.path.abspath("m.txt")})
+        assert_true("Skipped re-opening" not in full, f"full read after paged is served: {full}")
+        # ...while after a full read, an explicit page always serves too.
+        paged = tools.execute(
+            "read_file", {"file_path": os.path.abspath("m.txt"), "offset": 0, "limit": 2}
+        )
+        assert_true("Skipped re-opening" not in paged, f"explicit page never suppressed: {paged}")
+        assert_true("|a" in paged and "|b" in paged, f"page served with rows: {paged}")
+        # The full-read baseline recorded above no longer suppresses a redundant full read.
+        again = tools.execute("read_file", {"file_path": os.path.abspath("m.txt")})
+        assert_true("Skipped re-opening" not in again, f"full read always served: {again}")
+
+    _in_tmp(body)
+
+
+def test_read_file_ids_header_only_on_first_open() -> None:
+    def body() -> None:
+        Path("m.txt").write_text("a\nb\nc\nd\n", encoding="utf-8")
+        tools = HashlineTools()
+        first = tools.execute(
+            "read_file", {"file_path": os.path.abspath("m.txt"), "offset": 0, "limit": 2}
+        )
+        assert_true("(ids: each line is" in first, f"first open carries the ids header: {first}")
+        second = tools.execute(
+            "read_file", {"file_path": os.path.abspath("m.txt"), "offset": 2, "limit": 2}
+        )
+        assert_true("(ids: each line is" not in second, f"header not repeated: {second}")
+
+    _in_tmp(body)
+
+
 def main() -> None:
     test_xxh32_matches_hashline_reference_values()
     test_line_ref_has_no_separator_and_round_trips()
-    test_schema_advertises_begin_transaction_only()
-    test_begin_transaction_edit_insert_delete_flow()
+    test_schema_advertises_read_file_only()
+    test_read_file_edit_insert_delete_flow()
     test_mutation_denied_without_begin_transaction()
     test_noop_edit_reports_no_changes()
     test_insert_range_id_reports_single_id_guidance()
@@ -347,6 +473,13 @@ def main() -> None:
     test_document_stats_and_stream_replace_line()
     test_document_content_len_uses_utf8_bytes_and_loads_meta()
     test_start_end_keyword_ids_resolve_positionally()
+    test_read_file_relative_path_rejected_force_accepted()
+    test_read_file_offset_limit_window()
+    test_read_file_offset_past_end_errors()
+    test_read_file_offset_without_limit_reads_to_end()
+    test_read_file_string_offset_limit_coerced()
+    test_paged_read_does_not_set_or_consult_f1_baseline()
+    test_read_file_ids_header_only_on_first_open()
     print("hashline tool tests passed")
 
 

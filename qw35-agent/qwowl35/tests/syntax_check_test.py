@@ -145,16 +145,16 @@ def test_read_appends_syntax_block() -> None:
         try:
             Path("broken.py").write_text("def f()\n    return 1\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("beginTransaction", {"file": "broken.py"})
+            shown = tools.execute("read_file", {"file_path": os.path.abspath("broken.py")})
             assert_true("issue(s)" in shown and "Syntax check (python)" in shown, f"read should warn: {shown}")
             # A clean recognized file gets a positive OK confirmation.
             Path("ok.py").write_text("def g():\n    return 1\n", encoding="utf-8")
-            clean = tools.execute("beginTransaction", {"file": "ok.py"})
+            clean = tools.execute("read_file", {"file_path": os.path.abspath("ok.py")})
             assert_true("Syntax check (python): OK" in clean, f"clean read should confirm OK: {clean}")
             assert_true("issue(s)" not in clean, f"clean read has no error list: {clean}")
             # Unknown language gets neither warning nor OK line.
             Path("notes.md").write_text("# hi {[(\n", encoding="utf-8")
-            md = tools.execute("beginTransaction", {"file": "notes.md"})
+            md = tools.execute("read_file", {"file_path": os.path.abspath("notes.md")})
             assert_true("Syntax check" not in md, f"unknown ext stays silent: {md}")
         finally:
             os.chdir(cwd)
@@ -167,21 +167,21 @@ def test_edit_introducing_error_warns_and_clean_edit_does_not() -> None:
         try:
             Path("m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("beginTransaction", {"file": "m.py"})
+            shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
 
             # Clean edit: line 2 stays valid → no syntax block.
             line2 = _anchor(shown, 2)
             clean = tools.execute(
-                "edit",
+                "replace",
                 {"file": "m.py", "id": line2, "content": "    return 2"},
             )
             assert_true("Syntax check (python): OK" in clean, f"clean edit should confirm OK: {clean}")
 
             # Breaking edit: drop the colon on line 1 → file no longer parses.
-            reread = tools.execute("beginTransaction", {"file": "m.py"})
+            reread = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
             line1 = _anchor(reread, 1)
             broken = tools.execute(
-                "edit",
+                "replace",
                 {"file": "m.py", "id": line1, "content": "def f("},
             )
             assert_true("issue(s)" in broken, f"breaking edit should list issues: {broken}")

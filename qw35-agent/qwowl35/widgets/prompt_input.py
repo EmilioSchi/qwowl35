@@ -67,6 +67,33 @@ class PromptInput(TextArea):
             self.prompt = prompt
             self.text = text
 
+    # While the command palette is open the app sets ``palette_open`` and these
+    # navigation keys drive the palette instead of the input's own history/submit
+    # (see ``_on_key``). One message per intent, mirroring ``Submitted``.
+    class PaletteNavigate(Message):
+        """Move the palette highlight. ``delta`` is -1 (up) or +1 (down)."""
+
+        def __init__(self, prompt: "PromptInput", delta: int) -> None:
+            super().__init__()
+            self.prompt = prompt
+            self.delta = delta
+
+    class PaletteAccept(Message):
+        """Accept the highlighted command. ``complete_only`` is True for Tab
+        (fill the input text) and False for Enter (run it)."""
+
+        def __init__(self, prompt: "PromptInput", complete_only: bool) -> None:
+            super().__init__()
+            self.prompt = prompt
+            self.complete_only = complete_only
+
+    class PaletteDismiss(Message):
+        """Close the palette (Escape), leaving the typed text in place."""
+
+        def __init__(self, prompt: "PromptInput") -> None:
+            super().__init__()
+            self.prompt = prompt
+
     def __init__(self, *, history: MessageHistory | None = None, **kwargs) -> None:
         super().__init__(soft_wrap=True, show_line_numbers=False, **kwargs)
         # Keep the cursor visible without rapid flashing. A static caret is the
@@ -77,6 +104,9 @@ class PromptInput(TextArea):
         self._history = history or MessageHistory()
         self._pastes: dict[int, str] = {}
         self._paste_counter = 0
+        # Set by the app while the slash-command palette is open; a plain bool
+        # read synchronously in ``_on_key`` (a reactive would race the handler).
+        self.palette_open = False
 
     # ------------------------------------------------------------------ #
     # Submission + history persistence
@@ -101,6 +131,30 @@ class PromptInput(TextArea):
     # ------------------------------------------------------------------ #
     async def _on_key(self, event: events.Key) -> None:
         key = event.key
+        # When the command palette is open, these keys drive it instead of the
+        # input's own history/submit. Must precede the enter/up/down branches;
+        # prevent_default + stop keep the key out of the TextArea, and the early
+        # return keeps up/down off history and enter off submit.
+        if self.palette_open:
+            if key in ("up", "down"):
+                event.prevent_default()
+                event.stop()
+                self.post_message(
+                    self.PaletteNavigate(self, -1 if key == "up" else 1)
+                )
+                return
+            if key in ("enter", "tab"):
+                event.prevent_default()
+                event.stop()
+                self.post_message(
+                    self.PaletteAccept(self, complete_only=(key == "tab"))
+                )
+                return
+            if key == "escape":
+                event.prevent_default()
+                event.stop()
+                self.post_message(self.PaletteDismiss(self))
+                return
         if key == "enter":
             event.prevent_default()
             event.stop()

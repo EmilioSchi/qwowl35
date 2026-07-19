@@ -50,12 +50,12 @@ def test_syntax_error_read_is_marked_and_anchored() -> None:
     def body() -> None:
         Path("broken.py").write_text("a = 1\nb = 2\ndef f()\n    return 1\n", encoding="utf-8")
         tools = HashlineTools()
-        shown = tools.execute("beginTransaction", {"file": "broken.py"})
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("broken.py")})
         assert_true(shown.startswith(TOOL_ATTENTION_MARKER), f"syntax error flags attention: {shown!r}")
         clean = shown[len(TOOL_ATTENTION_MARKER):]
         assert_true("Syntax check (python)" in clean and "issue(s)" in clean, f"keeps issue header: {clean}")
         # The error row (line 3) is offered as a ready edit anchor.
-        assert_true(re.search(r"edit id: 3[0-9a-f]{2}\|", clean), f"line-3 edit id present: {clean}")
+        assert_true(re.search(r"replace id: 3[0-9a-f]{2}\|", clean), f"line-3 edit id present: {clean}")
 
     _in_tmp(body)
 
@@ -64,7 +64,7 @@ def test_clean_read_has_no_marker_and_keeps_ok() -> None:
     def body() -> None:
         Path("ok.py").write_text("def g():\n    return 1\n", encoding="utf-8")
         tools = HashlineTools()
-        clean = tools.execute("beginTransaction", {"file": "ok.py"})
+        clean = tools.execute("read_file", {"file_path": os.path.abspath("ok.py")})
         assert_true(not clean.startswith(TOOL_ATTENTION_MARKER), "clean read is not flagged")
         assert_true("Syntax check (python): OK" in clean, f"clean read confirms OK: {clean}")
 
@@ -75,12 +75,87 @@ def test_mutation_introducing_error_is_marked_and_anchored() -> None:
     def body() -> None:
         Path("m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
         tools = HashlineTools()
-        shown = tools.execute("beginTransaction", {"file": "m.py"})
-        broken = tools.execute("edit", {"file": "m.py", "id": _anchor(shown, 1), "content": "def f("})
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
+        broken = tools.execute("replace",{"file": "m.py", "id": _anchor(shown, 1), "content": "def f("})
         assert_true(broken.startswith(TOOL_ATTENTION_MARKER), f"breaking edit flags attention: {broken!r}")
         body_text = broken[len(TOOL_ATTENTION_MARKER):]
         assert_true("issue(s)" in body_text, f"lists the issue: {body_text}")
-        assert_true("edit id:" in body_text, f"offers an edit id: {body_text}")
+        assert_true("replace id:" in body_text, f"offers an replace id: {body_text}")
+
+    _in_tmp(body)
+
+
+def test_repeat_validation_dedups_unchanged_rows_but_keeps_flag() -> None:
+    # One agent instance: the read lists the error rows once; a later edit that
+    # leaves the same error untouched keeps the attention flag and the honest
+    # count but does NOT repeat the rows (no edit id spam).
+    def body() -> None:
+        Path("broken.py").write_text(
+            "a = 1\nb = 2\ndef f()\n    return 1\n", encoding="utf-8"
+        )
+        tools = HashlineTools()
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("broken.py")})
+        clean = shown[len(TOOL_ATTENTION_MARKER):]
+        assert_true(re.search(r"replace id: 3[0-9a-f]{2}\|", clean), "first sight lists the row")
+        # Edit line 1 only: the line-3 error is untouched, message and content identical.
+        result = tools.execute(
+            "replace", {"file": "broken.py", "id": _anchor(clean, 1), "content": "a = 9"}
+        )
+        assert_true(result.startswith(TOOL_ATTENTION_MARKER), "still-broken file stays flagged")
+        text = result[len(TOOL_ATTENTION_MARKER):]
+        assert_true(
+            "all unchanged and already reported above" in text,
+            f"repeat collapses to the honest one-liner: {text}",
+        )
+        assert_true("replace id:" not in text, f"rows not repeated: {text}")
+        assert_true("issue(s)" in text, "headline count kept")
+
+    _in_tmp(body)
+
+
+def test_fresh_tools_instance_sees_rows_again() -> None:
+    # A fresh HashlineTools (a freshly spawned agent's engine state) has no
+    # memory of what the previous agent saw: the rows list again in full.
+    def body() -> None:
+        Path("broken.py").write_text(
+            "a = 1\nb = 2\ndef f()\n    return 1\n", encoding="utf-8"
+        )
+        first = HashlineTools().execute("read_file", {"file_path": os.path.abspath("broken.py")})
+        second = HashlineTools().execute("read_file", {"file_path": os.path.abspath("broken.py")})
+        for label, output in (("first", first), ("second", second)):
+            clean = output[len(TOOL_ATTENTION_MARKER):]
+            assert_true(
+                re.search(r"replace id: 3[0-9a-f]{2}\|", clean),
+                f"{label} fresh instance lists the row: {clean}",
+            )
+
+    _in_tmp(body)
+
+
+def test_repointed_diag_memory_scopes_dedup_per_agent() -> None:
+    # The orchestrator repoints `diag_memory` at each agent seam: the same
+    # engine serves agent A (sees rows), agent B (fresh store → sees rows
+    # again), then A again (its store restored → still suppressed).
+    def body() -> None:
+        from tools.diagnostics import DiagnosticsMemory
+
+        Path("broken.py").write_text(
+            "a = 1\nb = 2\ndef f()\n    return 1\n", encoding="utf-8"
+        )
+        tools = HashlineTools()
+        memory_a, memory_b = DiagnosticsMemory(), DiagnosticsMemory()
+        tools.diag_memory = memory_a
+        first = tools.execute("read_file", {"file_path": "broken.py", "_force": True})
+        assert_true("replace id:" in first, "agent A sees the rows once")
+        tools.diag_memory = memory_b
+        fresh = tools.execute("read_file", {"file_path": "broken.py", "_force": True})
+        assert_true("replace id:" in fresh, "agent B (fresh store) sees them too")
+        tools.diag_memory = memory_a
+        repeat = tools.execute("read_file", {"file_path": "broken.py", "_force": True})
+        assert_true(
+            "all unchanged and already reported above" in repeat,
+            f"agent A's restored store still suppresses: {repeat}",
+        )
 
     _in_tmp(body)
 
@@ -92,9 +167,9 @@ def test_edit_leaving_duplicate_is_autodeleted() -> None:
     def body() -> None:
         Path("m.py").write_text("x = 1\nx = 2\ny = 3\n", encoding="utf-8")
         tools = HashlineTools()
-        shown = tools.execute("beginTransaction", {"file": "m.py"})
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
         # Edit line 2 to equal line 1 → an adjacent duplicate the pass removes.
-        result = tools.execute("edit", {"file": "m.py", "id": _anchor(shown, 2), "content": "x = 1"})
+        result = tools.execute("replace",{"file": "m.py", "id": _anchor(shown, 2), "content": "x = 1"})
         assert_true("Removed 1 adjacent duplicate line(s): 2." in result, f"reports the removal: {result}")
         assert_equal(Path("m.py").read_text(encoding="utf-8"), "x = 1\ny = 3\n", "duplicate deleted on disk")
 
@@ -105,7 +180,7 @@ def test_read_does_not_autodelete() -> None:
     def body() -> None:
         Path("d.txt").write_text("a\na\nb\n", encoding="utf-8")
         tools = HashlineTools()
-        tools.execute("beginTransaction", {"file": "d.txt"})
+        tools.execute("read_file", {"file_path": os.path.abspath("d.txt")})
         assert_equal(Path("d.txt").read_text(encoding="utf-8"), "a\na\nb\n", "read must not mutate the file")
 
     _in_tmp(body)
@@ -120,8 +195,8 @@ def test_all_exact_collapses_blank_double_line() -> None:
         try:
             Path("m.py").write_text("x = 1\n\n\ny = 2\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("beginTransaction", {"file": "m.py"})
-            tools.execute("edit", {"file": "m.py", "id": _anchor(shown, 1), "content": "x = 0"})
+            shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
+            tools.execute("replace",{"file": "m.py", "id": _anchor(shown, 1), "content": "x = 0"})
             assert_equal(Path("m.py").read_text(encoding="utf-8"), "x = 0\n\ny = 2\n", "all_exact collapses blanks")
         finally:
             tool_calling.DUP_POLICY = original
@@ -137,8 +212,8 @@ def test_dup_policy_smart_spares_blanks_but_drops_real_dups() -> None:
             # Blank double line is spared; a real duplicate content line is removed.
             Path("m.py").write_text("x = 1\n\n\nvalue = 42\nvalue = 42\n", encoding="utf-8")
             tools = HashlineTools()
-            shown = tools.execute("beginTransaction", {"file": "m.py"})
-            tools.execute("edit", {"file": "m.py", "id": _anchor(shown, 1), "content": "x = 0"})
+            shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
+            tools.execute("replace",{"file": "m.py", "id": _anchor(shown, 1), "content": "x = 0"})
             text = Path("m.py").read_text(encoding="utf-8")
             assert_true("\n\n\n" in text, f"smart policy spares the blank double line: {text!r}")
             assert_equal(text.count("value = 42"), 1, "smart policy still drops a real duplicate")
@@ -156,8 +231,8 @@ def test_smart_default_spares_blanks_and_brackets() -> None:
         # 1:a=1  2:blank  3:blank  4:}  5:}  6:dup  7:dup  (.txt skips the syntax check)
         Path("t.txt").write_text("a = 1\n\n\n}\n}\ndup\ndup\n", encoding="utf-8")
         tools = HashlineTools()
-        shown = tools.execute("beginTransaction", {"file": "t.txt"})
-        result = tools.execute("edit", {"file": "t.txt", "id": _anchor(shown, 1), "content": "a = 0"})
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("t.txt")})
+        result = tools.execute("replace",{"file": "t.txt", "id": _anchor(shown, 1), "content": "a = 0"})
         assert_equal(
             Path("t.txt").read_text(encoding="utf-8"),
             "a = 0\n\n\n}\n}\ndup\n",
@@ -172,9 +247,9 @@ def test_combined_syntax_error_and_duplicate() -> None:
     def body() -> None:
         Path("m.py").write_text("def f():\n    return 1\n    return 1\n", encoding="utf-8")
         tools = HashlineTools()
-        shown = tools.execute("beginTransaction", {"file": "m.py"})
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
         # Break the header (syntax error) — the duplicate body lines are auto-removed.
-        result = tools.execute("edit", {"file": "m.py", "id": _anchor(shown, 1), "content": "def f("})
+        result = tools.execute("replace",{"file": "m.py", "id": _anchor(shown, 1), "content": "def f("})
         assert_true(result.startswith(TOOL_ATTENTION_MARKER), "combined result is flagged")
         text = result[len(TOOL_ATTENTION_MARKER):]
         assert_true("Removed 1 adjacent duplicate line(s)" in text, f"dedup reported: {text}")
@@ -191,6 +266,9 @@ def main() -> None:
     test_syntax_error_read_is_marked_and_anchored()
     test_clean_read_has_no_marker_and_keeps_ok()
     test_mutation_introducing_error_is_marked_and_anchored()
+    test_repeat_validation_dedups_unchanged_rows_but_keeps_flag()
+    test_fresh_tools_instance_sees_rows_again()
+    test_repointed_diag_memory_scopes_dedup_per_agent()
     test_edit_leaving_duplicate_is_autodeleted()
     test_read_does_not_autodelete()
     test_all_exact_collapses_blank_double_line()

@@ -384,12 +384,33 @@ def test_absolute_path_inside_cwd_is_not_outside() -> None:
 
 def test_tool_schema() -> None:
     tool = BashTool()
-    assert_equal(tool.name, "bash", "tool name")
+    assert_equal(tool.name, "run_shell_command", "tool name")
     schema = tool.schema()
-    assert_equal(schema["name"], "bash", "schema name")
+    assert_equal(schema["name"], "run_shell_command", "schema name")
     assert_equal(schema["parameters"]["type"], "object", "schema parameters type")
     assert_true("command" in schema["parameters"]["properties"], "schema exposes command property")
-    assert_equal(schema["parameters"]["required"], ["command"], "command is required")
+    assert_equal(
+        schema["parameters"]["required"],
+        ["command", "is_background"],
+        "command and the explicit background choice are required",
+    )
+
+
+def test_background_execution_returns_immediately() -> None:
+    import time
+
+    tool = BashTool()
+    start = time.monotonic()
+    result = tool.execute({"command": "sleep 5", "is_background": True})
+    assert_true(time.monotonic() - start < 2.0, "background launch does not block")
+    assert_true("background" in result and "PID" in result, f"background notice: {result!r}")
+    # The XML tool-call path delivers booleans as strings.
+    stringly = tool.execute({"command": "echo fg", "is_background": "false"})
+    assert_equal(stringly.strip(), "fg", "string 'false' runs foreground")
+    start = time.monotonic()
+    stringly_bg = tool.execute({"command": "sleep 5", "is_background": "true"})
+    assert_true(time.monotonic() - start < 2.0, "string 'true' runs background")
+    assert_true("background" in stringly_bg, f"string true notice: {stringly_bg!r}")
 
 
 def test_capped_buffer_truncates_stdout() -> None:
@@ -440,6 +461,7 @@ def main() -> None:
     test_is_command_outside_cwd()
     test_absolute_path_inside_cwd_is_not_outside()
     test_tool_schema()
+    test_background_execution_returns_immediately()
     test_capped_buffer_truncates_stdout()
     test_capped_buffer_keeps_small_output()
     test_tool_rejects_missing_command()

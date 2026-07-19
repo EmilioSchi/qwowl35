@@ -14,9 +14,10 @@ its ``tint`` blend, not the exact math.
 
 Each mode's ``palette`` provides: ``neutral, ink, primary, success, warning,
 error, info`` (always) and ``accent, diffAdd, diffDelete, interactive``
-(optional). ``overrides`` are mostly ``syntax-*``/``markdown-*`` tokens the app
-doesn't use; we honor only ``text-weak`` (a hand-tuned muted text color) when it
-is a plain hex.
+(optional). From ``overrides`` we honor ``text-weak`` (a hand-tuned muted text
+color) and the hand-tuned ``markdown-*`` element colors (heading, link, code,
+block-quote, list-item, horizontal-rule) when they are plain hex; ``syntax-*``
+and the remaining ``markdown-*`` keys are unused.
 """
 
 from __future__ import annotations
@@ -139,4 +140,12 @@ def resolve_theme(theme_json: dict[str, Any], mode: Mode) -> theme.Palette:
         DIFF_ADD_BG=mix(neutral, diff_add, 0.15),
         DIFF_REMOVE_BG=mix(neutral, diff_delete, 0.15),
         DIFF_CONTEXT_BG=neutral,
+        # Hand-tuned markdown element colors when the theme ships them,
+        # otherwise derived from the same sources as the general tokens.
+        MD_HEADING=_hex_or(overrides.get("markdown-heading"), primary),
+        MD_LINK=_hex_or(overrides.get("markdown-link"), accent),
+        MD_CODE=_hex_or(overrides.get("markdown-code"), mix(success, ink, 0.30)),
+        MD_QUOTE=_hex_or(overrides.get("markdown-block-quote"), mix(ink, neutral, 0.48)),
+        MD_LIST=_hex_or(overrides.get("markdown-list-item"), accent),
+        MD_HR=_hex_or(overrides.get("markdown-horizontal-rule"), mix(ink, neutral, 0.58)),
     )

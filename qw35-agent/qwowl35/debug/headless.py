@@ -34,9 +34,7 @@ import asyncio
 import json
 import os
 import sys
-import time
 from pathlib import Path
-from typing import Callable
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG = os.path.dirname(_HERE)  # the qwowl35 package dir
@@ -48,6 +46,7 @@ from agent import Agent  # noqa: E402
 from approval import ApprovalDecision  # noqa: E402
 from client import Qw35Client  # noqa: E402
 from config import load_config  # noqa: E402
+from sessions.transcript import TranscriptWriter  # noqa: E402
 from tools_registry import ToolRegistry  # noqa: E402
 
 # Default task: the cal.py benchmark shipped alongside the repo (qw35-agent/benchmark).
@@ -56,7 +55,7 @@ DEFAULT_TASK = Path(_PKG).parent / "benchmark" / "cal_task.md"
 # stdout echo truncates long fields; the JSONL file always keeps them in full.
 ECHO_TRUNCATE = 2000
 # These record kinds are written to the file but not echoed to stdout (too noisy).
-_QUIET_KINDS = {"raw_chunk", "prefill", "state"}
+_QUIET_KINDS = {"raw_chunk", "prefill", "state", "request"}
 
 
 def _truncate(text: str, limit: int = ECHO_TRUNCATE) -> str:
@@ -65,18 +64,16 @@ def _truncate(text: str, limit: int = ECHO_TRUNCATE) -> str:
     return text[:limit] + f"… (+{len(text) - limit} chars, see transcript)"
 
 
-class Transcript:
-    """Append-only JSONL event log, mirrored to stdout in human-readable form."""
+class Transcript(TranscriptWriter):
+    """The shared session JSONL writer, mirrored to stdout in human-readable
+    form for live debug runs."""
 
     def __init__(self, path: Path, echo: bool = True) -> None:
-        self._fh = path.open("w", encoding="utf-8")
-        self._t0 = time.monotonic()
+        super().__init__(path)
         self._echo = echo
 
     def record(self, kind: str, **fields) -> None:
-        rec = {"t": round(time.monotonic() - self._t0, 3), "kind": kind, **fields}
-        self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        self._fh.flush()
+        super().record(kind, **fields)
         if self._echo and kind not in _QUIET_KINDS:
             self._echo_human(kind, fields)
 
@@ -112,11 +109,18 @@ class Transcript:
             print(f"\n!! {_truncate(fields.get('text', ''))}")
         elif kind == "timeout":
             print(f"\n!! TIMEOUT after {fields.get('seconds')}s")
+        elif kind == "gate":
+            mark = "USEFUL" if fields.get("kept") else "NOT USEFUL"
+            subject = fields.get("subject") or ""
+            label = f" [{subject}]" if subject else ""
+            print(f"[{mark}]{label} {_truncate(fields.get('meaning', ''), 200)}")
+        elif kind == "findings":
+            rows = fields.get("findings") or []
+            print(f"[FINDINGS] {len(rows)} kept, {fields.get('dropped', 0)} discarded")
+            for subject, meaning in rows:
+                print(f"  + {subject} — {_truncate(meaning, 160)}")
         elif kind == "verdict":
             print(f"\n=== verdict: {fields.get('verdict')} ===")
-
-    def close(self) -> None:
-        self._fh.close()
 
 
 class LoggingChat:
@@ -183,6 +187,9 @@ class LoggingChat:
     def add_error(self, text: str) -> None:
         self.t.record("error", text=text)
 
+    def add_system(self, text: str) -> None:
+        self.t.record("system_note", text=text)
+
 
 class LoggingUI:
     """Implements the top-level AgentUI contract (state + errors)."""
@@ -201,8 +208,16 @@ class LoggingUI:
             self.t.record("state", state=name)
             self._last_state = name
 
-    def set_prefill(self, percent: float, processed: int | None = None, total: int | None = None) -> None:
-        self.t.record("prefill", percent=percent, processed=processed, total=total)
+    def set_prefill(
+        self,
+        percent: float,
+        processed: int | None = None,
+        total: int | None = None,
+        session_ctx: int | None = None,
+    ) -> None:
+        self.t.record(
+            "prefill", percent=percent, processed=processed, total=total, session_ctx=session_ctx
+        )
 
     def add_reasoning_delta(self, text: str) -> None:
         # Reasoning text is already captured via chat.add_reasoning_chunk; no-op here.
@@ -220,22 +235,8 @@ class LoggingUI:
     def set_info(self, message: str) -> None:
         self.t.record("info", message=message)
 
-
-class DebugClient(Qw35Client):
-    """Qw35Client that tees every raw SSE chunk into the transcript.
-
-    The Agent calls ``stream_chat`` without a ``raw_sink``; we inject the sink
-    here so no change to the agent loop is needed.
-    """
-
-    def __init__(self, base_url: str, timeout: float, raw_sink: Callable[[str], None] | None) -> None:
-        super().__init__(base_url, timeout=timeout)
-        self._raw_sink = raw_sink
-
-    def stream_chat(self, *, messages, tools=None, **gen_params):  # type: ignore[override]
-        return super().stream_chat(
-            messages=messages, tools=tools, raw_sink=self._raw_sink, **gen_params
-        )
+    def set_mode(self, mode) -> None:
+        self.t.record("mode", mode=getattr(mode, "value", str(mode)))
 
 
 def _make_approver(transcript: Transcript):
@@ -246,6 +247,42 @@ def _make_approver(transcript: Transcript):
         return ApprovalDecision(kind="accept")
 
     return _approve
+
+
+def _build_agent(client, cfg, ui, transcript: Transcript, args, artifacts_dir: Path):
+    """The orchestrator with scripted (unattended) gates: plans auto-approve,
+    planner questions answer themselves with the first option. Run artifacts
+    land in the debug artifacts dir (never the user cache, and never the
+    agent's workspace)."""
+    from orchestrator import Orchestrator
+    from sessions.store import SessionStore
+    from tools.plan import PlanDecision
+
+    async def auto_answer(questions: list[dict]) -> dict:
+        answers = {}
+        for question in questions:
+            options = question.get("options") or []
+            label = str(options[0].get("label", "")) if options else "proceed as you see fit"
+            answers[str(question.get("question", ""))] = label
+        transcript.record("auto_answer", answers=answers)
+        return answers
+
+    async def auto_approve(plan: str) -> PlanDecision:
+        transcript.record("plan_approval", plan=plan, decision="approve")
+        return PlanDecision(kind="approve")
+
+    # Unattended operation is EXPLICIT here: real callbacks that auto-decide
+    # and log it, bound at construction like every interactive callback.
+    return Orchestrator(
+        client,
+        cfg,
+        ui,
+        approval=_make_approver(transcript),
+        restricted_bash=args.restricted_bash,
+        session_store=SessionStore(root=artifacts_dir / "sessions"),
+        question_callback=auto_answer,
+        plan_callback=auto_approve,
+    )
 
 
 def _resolve_workdir(workdir: str | None, task_label: str) -> Path:
@@ -285,6 +322,42 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "no /-qualified paths) for safer unattended runs",
     )
     p.add_argument("--no-raw", action="store_true", help="do not record raw SSE chunks")
+    p.add_argument(
+        "--no-compress",
+        dest="compress",
+        action="store_false",
+        default=None,
+        help="disable tool-output compression (full raw tool results)",
+    )
+    p.add_argument(
+        "--no-rerank",
+        dest="rerank",
+        action="store_false",
+        default=None,
+        help="disable the query-aware semantic rerank of web results",
+    )
+    p.add_argument(
+        "--rerank-scorer",
+        choices=["cross-encoder", "bm25"],
+        help="rerank scorer: cross-encoder (default; server /v1/rerank, "
+        "degrades to bm25 without a server reranker), bm25 (lexical only)",
+    )
+    p.add_argument(
+        "--no-lsp",
+        dest="lsp",
+        action="store_false",
+        default=None,
+        help="disable LSP semantic diagnostics on read/edit results "
+        "(tree-sitter syntax checks only)",
+    )
+    p.add_argument(
+        "--mode",
+        choices=["normal", "plan", "web", "chat"],
+        default="normal",
+        help="debug-only: which TUI mode the turn runs under (default normal); "
+        "in plan mode approvals are scripted to auto-approve and planner "
+        "questions answer themselves with the first option",
+    )
     return p.parse_args(argv)
 
 
@@ -306,11 +379,27 @@ async def _run(args: argparse.Namespace) -> int:
         think=args.think,
         reasoning_effort=args.reasoning_effort,
         max_tokens=args.max_tokens,
+        compress=args.compress,
+        rerank=args.rerank,
+        rerank_scorer=args.rerank_scorer,
+        lsp=args.lsp,
     )
+    try:  # LSP validation is optional; a broken install must not stop the run.
+        from tools.lsp import configure as _configure_lsp
+
+        _configure_lsp(cfg.lsp)
+    except Exception:  # noqa: BLE001 - degrades to tree-sitter checks
+        pass
 
     run_dir = _resolve_workdir(args.workdir, task_label)
     run_dir.mkdir(parents=True, exist_ok=True)
-    transcript = Transcript(run_dir / "transcript.jsonl")
+    # Debug artifacts live OUTSIDE the agent's workspace: an in-workdir
+    # transcript is workspace contamination — the explorer once found the
+    # growing transcript.jsonl of its own session, inspected it, and blew the
+    # server context (50K tokens in one result).
+    artifacts_dir = run_dir.with_name(run_dir.name + "-artifacts")
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    transcript = Transcript(artifacts_dir / "transcript.jsonl")
 
     print(f"=== qwowl35 headless run ===")
     transcript.record(
@@ -326,8 +415,18 @@ async def _run(args: argparse.Namespace) -> int:
     )
 
     raw_sink = None if args.no_raw else (lambda data: transcript.record("raw_chunk", data=data))
-    client = DebugClient(cfg.base_url, cfg.request_timeout, raw_sink)
-    registry = ToolRegistry(approval=_make_approver(transcript), restricted_bash=args.restricted_bash)
+    request_sink = lambda payload: transcript.record("request", **payload)  # noqa: E731
+    client = Qw35Client(
+        cfg.base_url,
+        timeout=cfg.request_timeout,
+        raw_sink=raw_sink,
+        request_sink=request_sink,
+    )
+    registry = ToolRegistry(
+        approval=_make_approver(transcript),
+        restricted_bash=args.restricted_bash,
+        compress=cfg.compress,
+    )
     ui = LoggingUI(transcript)
 
     # Pre-flight: a clear message beats a wall of connection errors mid-stream.
@@ -345,30 +444,41 @@ async def _run(args: argparse.Namespace) -> int:
     # against the process cwd. Both must see the scratch dir, not the launch dir.
     prev_cwd = os.getcwd()
     os.chdir(run_dir)
-    agent = Agent(client, registry, cfg, ui)
+    # Every run drives the orchestrator; --mode picks the dispatch (normal =
+    # the direct freestyle executor, plan = planner pipeline, web, chat).
+    agent = _build_agent(client, cfg, ui, transcript, args, artifacts_dir)
     transcript.record("cwd", path=str(run_dir))
     verdict = "finished"
     try:
-        ok = await asyncio.wait_for(agent.run_turn(task_text), timeout=args.timeout)
+        from modes import Mode
+
+        ok = await asyncio.wait_for(
+            agent.run_turn(task_text, Mode(args.mode)), timeout=args.timeout
+        )
         verdict = "finished" if ok else "stream-error"
     except asyncio.TimeoutError:
         transcript.record("timeout", seconds=args.timeout)
         verdict = "timed-out"
     finally:
         os.chdir(prev_cwd)
-        (run_dir / "messages.json").write_text(
+        (artifacts_dir / "messages.json").write_text(
             json.dumps(agent.messages, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        try:  # stop any language servers started during the run.
+            from tools.lsp import shutdown_all as _shutdown_lsp
+
+            _shutdown_lsp()
+        except Exception:  # noqa: BLE001 - teardown is best-effort
+            pass
         await client.aclose()
         transcript.record("verdict", verdict=verdict)
         transcript.close()
 
-    artifacts = sorted(p.name for p in run_dir.iterdir())
-    created = [a for a in artifacts if a not in {"transcript.jsonl", "messages.json"}]
+    created = sorted(p.name for p in run_dir.iterdir())
     print(f"\nrun dir: {run_dir}")
     print(f"files the agent created: {created or '(none)'}")
-    print(f"transcript: {run_dir / 'transcript.jsonl'}")
-    print(f"messages:   {run_dir / 'messages.json'}")
+    print(f"transcript: {artifacts_dir / 'transcript.jsonl'}")
+    print(f"messages:   {artifacts_dir / 'messages.json'}")
     return 0 if verdict == "finished" else 1
 
 

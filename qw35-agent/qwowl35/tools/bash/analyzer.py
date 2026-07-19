@@ -155,8 +155,6 @@ _SUBSTRING_PATTERNS: tuple[tuple[str, str], ...] = (
     ("/dev/sda", "Accesses raw disks"),
     ("/dev/nvme", "Accesses raw disks"),
     ("/dev/hd", "Accesses raw disks"),
-    ("> /dev/", "Writes to a device"),
-    (">/dev/", "Writes to a device"),
     ("/etc/shadow", "Accesses password hashes"),
     ("/etc/passwd", "Accesses account file"),
     ("/etc/sudoers", "Accesses sudo rules"),
@@ -319,6 +317,21 @@ def _normalize_redirect_target(target: str) -> str:
     return target.strip("\"'")
 
 
+# Pseudo-devices whose reads/writes are everyday shell idiom (`2>/dev/null`,
+# `read < /dev/tty`, `head -c8 /dev/urandom`) — redirecting to or from these
+# is not a signal. Real devices (raw disks, /dev/disk*, ...) stay flagged.
+_HARMLESS_DEVICES = frozenset({
+    "/dev/null",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/tty",
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+})
+
+
 def _is_history_path(target: str) -> bool:
     for history_file in _HISTORY_FILES:
         if target == history_file or target == "~/" + history_file or target.endswith("/" + history_file):
@@ -338,7 +351,7 @@ def _collect_redirection_reasons(command: str) -> list[str]:
         target = _normalize_redirect_target(raw_target)
         if ">" in operator and _is_history_path(target):
             append("Redirects to history file")
-        if target.startswith("/dev/"):
+        if target.startswith("/dev/") and target not in _HARMLESS_DEVICES:
             append("Reads from a device" if "<" in operator else "Writes to a device")
     return reasons
 

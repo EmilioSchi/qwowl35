@@ -121,9 +121,24 @@ def check_file_structured(path: str | Path, source: str) -> list[tuple[int, int,
     unavailable, the file is too large, or it parses clean. Never raises.
     """
     try:
-        return _check_structured(language_for_path(path), source)
+        return _check_structured(language_for_path(path), source)[0]
     except Exception:  # noqa: BLE001 - best-effort
         return []
+
+
+def check_file_structured_checked(
+    path: str | Path, source: str
+) -> tuple[list[tuple[int, int, str]], bool]:
+    """:func:`check_file_structured` plus the ``checked`` flag.
+
+    The validation router (``validate.py``) needs to distinguish "parsed clean"
+    from "could not check" on its tree-sitter fallback path, the same way
+    :func:`syntax_report` does via :func:`_check`. Never raises.
+    """
+    try:
+        return _check_structured(language_for_path(path), source)
+    except Exception:  # noqa: BLE001 - best-effort
+        return [], False
 
 
 def syntax_report(path: str | Path, source: str) -> str:
@@ -205,16 +220,20 @@ def _check(language: str | None, source: str) -> tuple[list[str], bool]:
     return issues, True
 
 
-def _check_structured(language: str | None, source: str) -> list[tuple[int, int, str]]:
-    """Structured counterpart of :func:`_check`: ``(line, col, message)`` tuples."""
-    root, source_bytes, _checked = _parse_root(language, source)
-    if root is None or not bool(_attr(root, "has_error", False)):
-        return []
+def _check_structured(
+    language: str | None, source: str
+) -> tuple[list[tuple[int, int, str]], bool]:
+    """Structured counterpart of :func:`_check`: ``((line, col, message) tuples, checked)``."""
+    root, source_bytes, checked = _parse_root(language, source)
+    if root is None:
+        return [], checked
+    if not bool(_attr(root, "has_error", False)):
+        return [], True  # parsed clean
     issues: list[tuple[int, int, str]] = []
     _collect_structured(root, source_bytes, issues)
     if not issues:
         issues.append((1, 1, "syntax error detected (could not localise)"))
-    return issues
+    return issues, True
 
 
 def _get_parser(language: str) -> Any | None:

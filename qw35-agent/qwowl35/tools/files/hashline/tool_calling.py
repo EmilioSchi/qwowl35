@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,33 +19,46 @@ from .anchor import looks_like_range_anchor
 from .document import Document
 from .error import HashlineError
 from .mutation import delete_adjacent_duplicates
-from .output import line_view, unified_diff
+from .output import line_view, render_lines, unified_diff
 
-try:  # syntax warnings are best-effort; never let them break the file tools.
-    from ...syntax.checker import (
-        check_file_structured,
-        language_for_path,
-        syntax_report,
-    )
+try:  # validation is best-effort; never let it break the file tools.
+    from ...syntax.validate import Validation, validate_file
 except Exception:  # pragma: no cover - defensive fallback
 
-    def syntax_report(path, source):  # type: ignore[misc]
-        return ""
+    class Validation:  # type: ignore[no-redef]
+        errors: list = []
+        warnings: list = []
+        label = "syntax"
+        checked = False
 
-    def check_file_structured(path, source):  # type: ignore[misc]
-        return []
+        def report(self):
+            return ""
 
-    def language_for_path(path):  # type: ignore[misc]
-        return None
+    def validate_file(path, source):  # type: ignore[misc]
+        return Validation()
+
+
+try:  # diagnostics presentation (section grammar + per-agent dedup); same guard.
+    from ...diagnostics import (
+        ALL_UNCHANGED,
+        DiagnosticsMemory,
+        clean_validation_report,
+        join_section,
+        unchanged_note,
+    )
+except Exception:  # pragma: no cover - defensive fallback
+    DiagnosticsMemory = None  # type: ignore[assignment]
+    clean_validation_report = None  # type: ignore[assignment]
+    ALL_UNCHANGED = "all unchanged and already reported above"
+
+    def join_section(body: str, section: str) -> str:  # type: ignore[misc]
+        return f"{body}\n\n{section}" if body and section else body or section
+
+    def unchanged_note(count: int, noun: str = "issue") -> str:  # type: ignore[misc]
+        return f"- {count} unchanged {noun}(s) already reported above (not repeated)"
 
 
 MAX_READ_CHARS = 24_000
-
-# F1: a full (anchorless) re-read of a file already fully read this session is
-# suppressed when its byte size moved less than this fraction since that read.
-# Anchored reads and the internal ``_force`` flag always bypass. Compile-time
-# tunable per the project's no-env-vars convention.
-REDUNDANT_READ_SIZE_DELTA = 0.40
 
 # F3: which consecutive-identical-line pairs the post-mutation pass auto-deletes.
 # "smart" (default) spares lines that legitimately repeat — blank/whitespace lines,
@@ -121,47 +135,78 @@ class HashlineTools:
         # by a FULL read. The fingerprint lets the post-write auto-read tell whether
         # the model still holds CURRENT anchors (suppress) or the file has since
         # changed — by this write, an external editor, or another process — and
-        # needs fresh ones (re-show). The byte length powers the F1 re-read gate.
+        # needs fresh ones (re-show).
         self._read_records: dict[str, ReadRecord] = {}
-        # file → fingerprint already suppressed once this session. Lets a redundant
-        # full re-read self-clear: ask again while still unchanged and it is served
-        # (a prompt-free escape hatch that also prevents a read loop).
-        self._suppressed_once: dict[str, str] = {}
+        # Which diagnostic rows the CURRENT agent instance has already been shown
+        # (per-agent, NOT per-session like the read records above): the
+        # orchestrator repoints this at each running agent's own store, so a
+        # fresh editor spawn sees a broken file's diagnostics once in full while
+        # repeat validations within one agent only report what changed.
+        self.diag_memory = DiagnosticsMemory() if DiagnosticsMemory is not None else None
 
     def schemas(self) -> list[dict]:
         file_schema = {"type": "string", "description": "Path to the file."}
         range_id_schema = {
             "type": "string",
             "description": (
-                "Line id copied from beginTransaction, such as '12af'; ranges use "
+                "Line id copied from read_file, such as '12af'; ranges use "
                 "'12af..189c'. A range is inclusive of both endpoints: '12af..189c' "
                 "covers lines 12 through 18, including 12 and 18."
             ),
         }
         single_id_schema = {
             "type": "string",
-            "description": "Single line id copied from beginTransaction, such as '12af'. Use position before/after for placement.",
+            "description": "Single line id copied from read_file, such as '12af'. Use position before/after for placement.",
         }
         content_schema = {"type": "string", "description": "Literal replacement or inserted content."}
         return [
             {
                 "type": "function",
                 "function": {
-                    "name": "beginTransaction",
-                    "description": "Open a file for editing and read its line ids. Call this before edit/insert/delete.",
+                    "name": "read_file",
+                    "description": (
+                        "Open a file and read its line ids: each row is "
+                        "'<line><hash>|<content>'."
+                        "If the file is large the result is truncated; page through it "
+                        "with 'offset' and 'limit'."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "file": file_schema,
+                            "file_path": {
+                                "type": "string",
+                                "description": (
+                                    "The absolute path to the file to read (e.g., "
+                                    "'/home/user/project/file.txt'). Relative paths are not "
+                                    "supported. You must provide an absolute path."
+                                ),
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": (
+                                    "Optional: For text files, the 0-based line number to "
+                                    "start reading from. Requires 'limit' to be set. Use for "
+                                    "paginating through large files."
+                                ),
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": (
+                                    "Optional: For text files, maximum number of lines to "
+                                    "read. Use with 'offset' to paginate through large "
+                                    "files. If omitted, reads the entire file (if feasible, "
+                                    "up to a default limit)."
+                                ),
+                            },
                         },
-                        "required": ["file"],
+                        "required": ["file_path"],
                     },
                 },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "edit",
+                    "name": "replace",
                     "description": "Replace one line or range by id only in an existing non-empty file. This tool cannot create files.",
                     "parameters": {
                         "type": "object",
@@ -223,9 +268,9 @@ class HashlineTools:
                 message += f" Details: {detail}."
             return message
         try:
-            if name == "beginTransaction":
+            if name == "read_file":
                 return self.begin_transaction(args)
-            if name == "edit":
+            if name == "replace":
                 return self.edit(args)
             if name == "insert":
                 return self.insert(args)
@@ -233,7 +278,7 @@ class HashlineTools:
                 return self.delete(args)
             return f"Error: unknown tool {name!r}."
         except FileNotFoundError:
-            file = args.get("file") or self._last_file or ""
+            file = args.get("file_path") or args.get("file") or self._last_file or ""
             return f"Error: file not found: {file}"
         except HashlineError as exc:
             return f"Error: {exc}"
@@ -241,74 +286,85 @@ class HashlineTools:
             return f"Error running {name}: {exc}"
 
     def begin_transaction(self, args: dict[str, Any]) -> str:
-        """Open a file for editing: return its whole-file line ids.
+        """Open a file: return its whole-file line ids.
 
-        Renamed from ``read`` and stripped of the old windowed ``anchor``/``context``
-        params — the model begins a transaction on a file it intends to edit, and
-        this always returns the full set of line ids (the F1 gate still suppresses a
-        redundant re-open of an unchanged file; ``_force`` bypasses it).
+        Wire name ``read_file`` (qwen's trained name; previously
+        ``beginTransaction``, before that ``read``). Takes an absolute
+        ``file_path`` and returns the full set of line ids, or an explicit
+        ``offset``/``limit`` window of them.
         """
-        file = self._file(args)
-        if not bool(args.get("_force")):
-            suppressed = self._maybe_suppress_full_read(file)
-            if suppressed is not None:
-                return suppressed
+        file = self._file_path(args)
+        key = self._key(file)
+        offset = self._window_arg(args.get("offset"))
+        limit = self._window_arg(args.get("limit"))
+        if offset or limit:
+            return self._paged_read(file, key, offset, limit or None)
         output = self._cap(run_read(ReadCmd(file=Path(file), anchor=[], context=0)))
         if not output.strip():
             return output
         # Read the full file so warnings use absolute line numbers and the
-        # fingerprint covers the whole file; this records the F1 gate baseline.
+        # fingerprint covers the whole file for has_current_anchors.
         text = self._read_text(file)
         warnings, attention = self._syntax_section(file, text)
-        self._read_records[file] = ReadRecord(
+        self._read_records[key] = ReadRecord(
             fingerprint=self._content_fingerprint(text),
             byte_len=len(text.encode("utf-8")),
         )
-        self._suppressed_once.pop(file, None)
-        headered = file in self._read_headered
-        self._read_headered.add(file)
+        headered = key in self._read_headered
+        self._read_headered.add(key)
         if headered:
-            body = self._with_warnings(output, warnings)
+            body = join_section(output, warnings)
         else:
             header = f"{file} (ids: each line is '<line><hash>|<content>'):"
-            body = self._with_warnings(f"{header}\n{output}", warnings)
+            body = join_section(f"{header}\n{output}", warnings)
         return mark_attention(body) if attention else body
 
-    def _maybe_suppress_full_read(self, file: str) -> str | None:
-        """Informational message for a redundant full re-read, or ``None`` to run it.
+    @staticmethod
+    def _window_arg(value: Any) -> int:
+        """Lenient positive-int coercion for offset/limit: ints, floats, and
+        numeric strings (XML parameters can reach us as strings); anything
+        else — or a non-positive value — means "not set" (0). The schema says
+        offset "requires 'limit'", but the runtime is deliberately lenient,
+        matching run_inspect_file: an offset alone reads to the end (byte cap
+        permitting) instead of burning a round-trip on an error."""
+        if isinstance(value, str) and value.strip().isdigit():
+            value = int(value.strip())
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+        return 0
 
-        Suppresses only when the file was already fully read this session AND its
-        byte size moved < :data:`REDUNDANT_READ_SIZE_DELTA` since. A first read, a
-        missing/empty/unreadable file, or a size swing past the gate all return
-        ``None``. Self-clears: asking again while still unchanged serves the read.
+    def _paged_read(self, file: str, key: str, offset: int, limit: int | None) -> str:
+        """An explicit offset/limit window of line ids (0-based offset; the
+        rendered ids keep their true 1-based line numbers).
+
+        Satisfies the mutation gate — the ids returned are genuine — but never
+        records the F1 full-read baseline: a paged read must not later
+        suppress a full read with "you still hold its current line ids", which
+        would be false. It never consults the suppress gate either (an
+        explicit page always serves). Diagnostics run on the FULL text, never
+        the window — the language server reads the file from disk.
         """
-        if file not in self._read_headered:
-            return None
-        record = self._read_records.get(file)
-        if record is None:
-            return None
+        doc = Document.load(Path(file))
+        total = len(doc.lines)
+        if offset >= total and total > 0:
+            return f"Error: offset {offset} is past the end of the file ({total} lines)."
+        end = min(offset + limit, total) if limit is not None else total
+        body = self._cap(render_lines(doc, range(offset, end)))
+        if not body.strip():
+            return body
         text = self._read_text(file)
-        if not text:
-            return None  # deleted/emptied/unreadable → let the real read surface it
-        new_bytes = len(text.encode("utf-8"))
-        delta = abs(new_bytes - record.byte_len) / max(record.byte_len, 1)
-        if delta >= REDUNDANT_READ_SIZE_DELTA:
-            return None  # changed enough that fresh full anchors are worth it
-        fingerprint = self._content_fingerprint(text)
-        if self._suppressed_once.get(file) == fingerprint:
-            return None  # already suppressed this exact state once → serve it now
-        self._suppressed_once[file] = fingerprint
-        if fingerprint == record.fingerprint:
-            return (
-                f"Skipped re-opening {file}: it is unchanged since your last "
-                "beginTransaction this session — you still hold its current line ids. "
-                "Edit with them, or beginTransaction again to refresh."
-            )
-        return (
-            f"Skipped re-opening {file}: it changed only ~{delta * 100:.0f}% by size "
-            "since your last beginTransaction this session. Most ids still hold, but "
-            "those near edits may be stale — beginTransaction again to refresh."
-        )
+        warnings, attention = self._syntax_section(file, text)
+        headered = key in self._read_headered
+        self._read_headered.add(key)
+        parts: list[str] = []
+        if not headered:
+            parts.append(f"{file} (ids: each line is '<line><hash>|<content>'):")
+        if offset > 0 or end < total:
+            # 1-based inclusive line numbers, matching read-file.ts.
+            parts.append(f"Showing lines {offset + 1}-{end} of {total} total lines.")
+        parts.append(body)
+        out = join_section("\n".join(parts), warnings)
+        return mark_attention(out) if attention else out
 
     def has_current_anchors(self, file: str) -> bool:
         """Whether the model already holds this file's CURRENT line anchors.
@@ -318,7 +374,7 @@ class HashlineTools:
         bash write, an external editor, or another process) returns False and earns
         a fresh post-write auto-read. Used to suppress redundant auto-reads.
         """
-        record = self._read_records.get(file)
+        record = self._read_records.get(self._key(file))
         if record is None:
             return False
         return record.fingerprint == self._content_fingerprint(self._read_text(file))
@@ -328,38 +384,82 @@ class HashlineTools:
         return xxhash.xxh3_64_hexdigest(text.encode("utf-8"))
 
     def _syntax_section(self, file: str, text: str) -> tuple[str, bool]:
-        """Trailing syntax block and an attention flag.
+        """Trailing validation block and an attention flag.
 
-        When the file has syntax errors, returns a block that lists each error with
-        a ready ``edit id: <line><hash>|<content>`` so the model can fix that
-        exact row, plus ``True`` (the result should be flagged is_error). When clean
-        or unknown, returns the existing OK/"" confirmation and ``False``. Reuses
-        :func:`check_file_structured` and ``line_view``. Never raises.
+        Runs the LSP-first validation router (:func:`validate_file`; tree-sitter
+        fallback). When the file has errors, returns a block that lists each NEW
+        one with a ready ``replace id: <line><hash>|<content>`` so the model can fix
+        that exact row, plus ``True`` (the result should be flagged is_error).
+        Rows this agent instance was already shown (``diag_memory``) are
+        summarised instead of repeated — the headline count always reflects the
+        file's CURRENT state, so a still-broken file keeps its flag even when
+        every row is old news, and a suppressed row whose line content later
+        changes re-shows with a fresh id (the memory keys on content, so a
+        stale ``replace id`` is never left as the model's only anchor). When clean
+        or unknown, returns the OK/"" confirmation and ``False`` — built from
+        the same :class:`Validation` (a second check would repeat the LSP
+        round-trip). LSP warnings ride along informationally and never flip the
+        flag. Never raises.
         """
         try:
             if not text:
                 return "", False
-            errors = check_file_structured(file, text)
-            if not errors:
-                return self._syntax_warnings(file, text), False
-            label = language_for_path(file) or "syntax"
+            v = validate_file(file, text)
+            sifted = (
+                self.diag_memory.sift(file, v, text)
+                if self.diag_memory is not None
+                else None
+            )
+            if not v.errors:
+                return self._clean_report(v, sifted), False
+            if sifted is not None and sifted.all_prior:
+                return (
+                    f"Syntax check ({v.label}) — {len(v.errors)} issue(s), "
+                    f"{ALL_UNCHANGED}; fix them with replace, then they are re-checked.",
+                    True,
+                )
+            if sifted is None:
+                new_errors, new_warnings = list(v.errors), list(v.warnings)
+                prior_errors = prior_warnings = 0
+            else:
+                new_errors, new_warnings = sifted.errors, sifted.warnings
+                prior_errors, prior_warnings = sifted.prior_errors, sifted.prior_warnings
             doc = Document.load(Path(file))
             n = len(doc.lines)
-            shown = errors[:MAX_SHOWN_SYNTAX_ANCHORS]
+            shown = new_errors[:MAX_SHOWN_SYNTAX_ANCHORS]
             lines = [
-                f"Syntax check ({label}) — {len(errors)} issue(s); fix each line "
-                "below with edit, then it is re-checked:"
+                f"Syntax check ({v.label}) — {len(v.errors)} issue(s); fix each line "
+                "below with replace, then it is re-checked:"
             ]
             for line_no, _col, message in shown:
                 lines.append(f"- {message}")
                 if 1 <= line_no <= n:
-                    lines.append(f"  edit id: {line_view(line_no, doc.lines[line_no - 1])}")
-            extra = len(errors) - len(shown)
+                    lines.append(f"  replace id: {line_view(line_no, doc.lines[line_no - 1])}")
+            extra = len(new_errors) - len(shown)
             if extra > 0:
                 lines.append(f"- … and {extra} more")
+            if prior_errors:
+                lines.append(unchanged_note(prior_errors))
+            warn_shown = new_warnings[:MAX_SHOWN_SYNTAX_ANCHORS]
+            if warn_shown or prior_warnings:
+                lines.append(f"Warnings (not blocking) — {len(v.warnings)}:")
+                lines.extend(f"- {message}" for _line, _col, message in warn_shown)
+                warn_extra = len(new_warnings) - len(warn_shown)
+                if warn_extra > 0:
+                    lines.append(f"- … and {warn_extra} more")
+                if prior_warnings:
+                    lines.append(unchanged_note(prior_warnings, "warning"))
+            if sifted is not None:
+                sifted.mark_rendered(shown, warn_shown)
             return "\n".join(lines), True
         except Exception:  # noqa: BLE001 - syntax warnings are best-effort
             return "", False
+
+    def _clean_report(self, v: Validation, sifted) -> str:
+        """The clean-file confirmation, with riding warnings deduped per agent."""
+        if clean_validation_report is None:
+            return v.report()
+        return clean_validation_report(v, sifted, MAX_SHOWN_SYNTAX_ANCHORS)
 
     def _autodelete_dups(self, file: str) -> list[int]:
         """Remove adjacent exactly-identical lines from ``file`` per :data:`DUP_POLICY`.
@@ -377,23 +477,23 @@ class HashlineTools:
             return []
 
     def _require_transaction(self, file: str, action: str) -> None:
-        """Deny a mutation on a file never opened with beginTransaction this session.
+        """Deny a mutation on a file never opened with read_file this session.
 
         The model only holds line ids for files it has opened; without a prior
-        beginTransaction any id it sends is a guess.
+        read_file any id it sends is a guess.
         """
-        if file in self._read_headered:
+        if self._key(file) in self._read_headered:
             return
         raise HashlineError(
-            f"{action} denied: {file} was not opened with beginTransaction in this "
-            "session, so you do not hold its line ids. Call the beginTransaction "
+            f"{action} denied: {file} was not opened with read_file in this "
+            "session, so you do not hold its line ids. Call the read_file "
             f"tool on {file} first to read its current '<line><hash>' ids, then "
             "retry using an id copied from that output."
         )
 
     def edit(self, args: dict[str, Any]) -> str:
         file = self._file(args)
-        self._require_transaction(file, "edit")
+        self._require_transaction(file, "replace")
         anchor = self._id(args, required=not self._has_start_query(args))
         content = self._content(args)
         before = self._read_text(file)
@@ -465,10 +565,9 @@ class HashlineTools:
         after = self._read_text(file)
         if before != after:
             # The file changed (this edit and/or the dedup), so the model's
-            # full-read baseline is stale: drop it so a follow-up full read returns
-            # the current file instead of being suppressed by the F1 gate.
-            self._read_records.pop(file, None)
-            self._suppressed_once.pop(file, None)
+            # full-read baseline is stale: drop it so has_current_anchors returns
+            # False and the post-write auto-read surfaces fresh ids.
+            self._read_records.pop(self._key(file), None)
         diff = unified_diff(file, before, after)
         # A mutation that leaves the file byte-identical is a no-op: the command
         # still emits "Edited lines X-Y", but nothing changed and there is no diff
@@ -505,27 +604,13 @@ class HashlineTools:
                     "each line is '<line><hash>|<content>'):"
                 )
                 parts.extend(snippet)
-        # Report every syntax error now present in the post-mutation file so an
-        # edit/insert/delete that broke (or left) the file malformed is visible.
+        # Report the post-mutation validation state as a canonical trailing
+        # section (tools/diagnostics grammar): the mutation body above and the
+        # diagnostics below stay structurally separate, so the TUI and any
+        # other consumer can carve them apart without guessing.
         warnings, attention = self._syntax_section(file, after)
-        body = self._with_warnings("\n".join(parts), warnings)
+        body = join_section("\n".join(parts), warnings)
         return mark_attention(body) if attention else body
-
-    def _syntax_warnings(self, file: str, text: str) -> str:
-        """Syntax-status block for ``text`` (as ``file``): errors, a clean-parse
-        confirmation, or ``""`` when the language is unknown/unchecked."""
-        try:
-            if not text:
-                return ""
-            return syntax_report(file, text)
-        except Exception:  # noqa: BLE001 - syntax warnings are best-effort
-            return ""
-
-    @staticmethod
-    def _with_warnings(body: str, warnings: str) -> str:
-        if not warnings:
-            return body
-        return f"{body}\n\n{warnings}"
 
     def _changed_window(self, before: str, after: str, context: int = 2) -> tuple[int, int] | None:
         """1-based inclusive line range in ``after`` that changed, plus context."""
@@ -568,6 +653,27 @@ class HashlineTools:
         self._last_file = file
         return file
 
+    def _file_path(self, args: dict[str, Any]) -> str:
+        """The read tool's target: an absolute ``file_path`` (qwen's trained
+        schema; ``file`` accepted as a fallback). Internal callers pass
+        ``_force``, which also waives the absolute-path requirement."""
+        file = args.get("file_path") or args.get("file") or self._last_file
+        if not isinstance(file, str) or not file:
+            raise HashlineError("'file_path' is required")
+        if not os.path.isabs(file) and not bool(args.get("_force")):
+            raise HashlineError(f"File path must be absolute: {file}")
+        self._last_file = file
+        return file
+
+    @staticmethod
+    def _key(path: str) -> str:
+        """Canonical per-file key for the session dicts (read gate, F1
+        fingerprints): absolute-ized but NOT symlink-resolved — resolving would
+        diverge from the paths LSP, grep, and the TUI display. Lets read_file's
+        absolute file_path and a mutation's relative ``file`` land on the same
+        record."""
+        return os.path.abspath(path)
+
     def _id(self, args: dict[str, Any], required: bool = True) -> str:
         value = args.get("id")
         if not isinstance(value, str) or not value:
@@ -575,7 +681,7 @@ class HashlineTools:
                 return ""
             raise HashlineError(
                 "'id' is required; file mutations cannot create files or target empty files. "
-                "Use bash to create the file, then beginTransaction for line ids before editing."
+                "Use bash to create the file, then read_file for line ids before editing."
             )
         return value
 
@@ -600,4 +706,4 @@ class HashlineTools:
     def _cap(self, text: str) -> str:
         if len(text) <= MAX_READ_CHARS:
             return text.rstrip("\n")
-        return text[:MAX_READ_CHARS].rstrip("\n") + "\n... (truncated: file too large to show all ids; use bash to view the rest)"
+        return text[:MAX_READ_CHARS].rstrip("\n") + "\n... (truncated: file too large to show all ids; page through the rest with read_file offset/limit)"

@@ -19,8 +19,14 @@ from .analyzer import (
     parse_bash,
     truncating_write_targets,
 )
-from .executor import BASH_TIMEOUT_SECONDS, MAX_OUTPUT_SIZE, BashTool, CappedBuffer
-from .guidance import GUIDANCE
+from .executor import (
+    BASH_TIMEOUT_SECONDS,
+    MAX_OUTPUT_SIZE,
+    SHELL_NAME,
+    BashTool,
+    CappedBuffer,
+)
+from .guidance import GUIDANCE, GUIDANCE_EXECUTOR
 
 __all__ = [
     "AnalysisResult",
@@ -32,7 +38,9 @@ __all__ = [
     "CappedBuffer",
     "BASH_TIMEOUT_SECONDS",
     "MAX_OUTPUT_SIZE",
+    "SHELL_NAME",
     "GUIDANCE",
+    "GUIDANCE_EXECUTOR",
     "analyze_command",
     "append_write_targets",
     "build_bash_approval_options",

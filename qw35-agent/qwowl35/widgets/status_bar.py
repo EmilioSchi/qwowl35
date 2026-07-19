@@ -9,6 +9,7 @@ from rich.text import Text
 from textual.widget import Widget
 
 import theme
+from modes import MODE_COLOR_TOKENS, Mode
 
 
 # Mirrors the server's thinking-budget computation (qw35-server
@@ -24,7 +25,6 @@ EFFORT_CAP_PERCENT = {
 }
 SERVER_DEFAULT_TOKEN_BASIS = 8192
 SERVER_MIN_CAP_TOKENS = 16
-
 
 def rough_token_count(text: str) -> int:
     """Cheap live estimate for streamed reasoning text."""
@@ -159,16 +159,71 @@ def think_summary(
     return f"{label} think {fmt_percent(used_percent)}"
 
 
+def active_ctx(state: "StatusState") -> int | None:
+    """The context size the percentage is measured against: the live ceiling
+    of the session that is actually streaming (server-reported, grows on
+    demand), falling back to the main size from /health//props."""
+    return state.active_ctx_size or state.ctx_size
+
+
 def context_line(state: "StatusState") -> str:
-    """Footer-left text: context fill plus live thinking-budget usage."""
+    """Footer-left text: context fill plus live thinking-budget usage.
+
+    The active mode is drawn separately as the mode box (see
+    :func:`mode_box`); this line carries only decode/context/think.
+    """
     cap = effort_cap_percent(state.think, state.effort, state.inferred_thinking)
     cap_tokens = thinking_cap_tokens(cap, state.max_tokens)
     think_used = percent(state.reasoning_estimate, cap_tokens) if state.reasoning_estimate else None
     return (
         f"{decode_summary(state.decode_tps)}  "
-        f"{context_summary(state.prompt_tokens, state.ctx_size)}  "
+        f"{context_summary(state.prompt_tokens, active_ctx(state))}  "
         f"{think_summary(state.think, state.effort, think_used, state.inferred_thinking)}"
     )
+
+
+def context_text(state: "StatusState") -> Text:
+    """:func:`context_line` with styling: ONLY the tok/s figure and the
+    context percentage carry the active agent's mode color — each agent runs
+    on its own GPU session, so the color says WHOSE context is filling — and
+    the ctx size and think summary stay plain. The fill token is looked up per
+    render (``getattr(theme, ...)``) so a live theme switch recolors it.
+    """
+    fill = getattr(theme, MODE_COLOR_TOKENS[state.mode])
+    ctx = active_ctx(state)
+    cap = effort_cap_percent(state.think, state.effort, state.inferred_thinking)
+    cap_tokens = thinking_cap_tokens(cap, state.max_tokens)
+    think_used = percent(state.reasoning_estimate, cap_tokens) if state.reasoning_estimate else None
+    out = Text()
+    out.append(decode_summary(state.decode_tps), style=fill)
+    out.append("  ")
+    out.append(fmt_percent(percent(state.prompt_tokens, ctx), 1), style=fill)
+    out.append(f"/{compact_count(ctx)}", style=theme.FG_DIM)
+    out.append("  ")
+    out.append(
+        think_summary(state.think, state.effort, think_used, state.inferred_thinking),
+        style=theme.FG_DIM,
+    )
+    return out
+
+
+def mode_label(state: "StatusState") -> str:
+    """The mode-box text: the active mode, uppercased (NORMAL/VISUAL/INSERT/
+    PLAN/WEB/CHAT)."""
+    return state.mode.value.upper()
+
+
+def mode_box(state: "StatusState") -> Text:
+    """Vim-style inverted mode box: dark text on the mode's own fill color.
+
+    The fill token is looked up per render (``getattr(theme, ...)``) so a live
+    theme switch recolors the box; it lives on the label span (not the whole
+    ``Text``) so anything the caller appends after the box keeps its own style.
+    """
+    fill = getattr(theme, MODE_COLOR_TOKENS[state.mode])
+    box = Text()
+    box.append(f" {mode_label(state)} ", style=f"{theme.BG_BASE} on {fill} bold")
+    return box
 
 
 @dataclass
@@ -180,11 +235,18 @@ class StatusState:
     model: str | None = None
     ready: bool | None = None
     ctx_size: int | None = None
+    # Live ceiling of the session serving the CURRENT stream (qw35 servers
+    # report it per request and grow it on demand); None until a request
+    # carries it, then the fallback is the main ctx_size above.
+    active_ctx_size: int | None = None
     prompt_tokens: int | None = None
     cached_tokens: int | None = None
     reasoning_estimate: int = 0
     inferred_thinking: bool = False
     decode_tps: float | None = None
+    # The active TUI mode (the user's selection, or a transient display mode
+    # like VISUAL/INSERT pushed by the orchestrator while a sub-agent runs).
+    mode: Mode = Mode.NORMAL
 
 
 class StatusBar(Widget):
@@ -235,9 +297,17 @@ class StatusBar(Widget):
         self.state.inferred_thinking = False
         self.refresh()
 
-    def update_prefill(self, total: int | None) -> None:
+    def set_mode(self, mode: Mode) -> None:
+        """Show the active mode in the Vim-style box."""
+        self.state.mode = mode
+        self.refresh()
+
+    def update_prefill(self, total: int | None, session_ctx: int | None = None) -> None:
+        if session_ctx is not None:
+            self.state.active_ctx_size = session_ctx
         if total is not None:
             self.state.prompt_tokens = total
+        if total is not None or session_ctx is not None:
             self.refresh()
 
     def update_reasoning(self, text: str) -> None:
@@ -255,12 +325,20 @@ class StatusBar(Widget):
         self.refresh()
 
     def update_timings(self, timings: dict | None) -> None:
-        """Pick up the server's measured decode rate (qw35_timings.eval_tps)."""
+        """Pick up the server's measured decode rate (qw35_timings.eval_tps)
+        and the serving session's live context ceiling (session_ctx)."""
         if not timings:
             return
+        changed = False
         tps = _float_or_none(timings.get("eval_tps"))
         if tps is not None:
             self.state.decode_tps = tps
+            changed = True
+        session_ctx = _int_or_none(timings.get("session_ctx"))
+        if session_ctx:
+            self.state.active_ctx_size = session_ctx
+            changed = True
+        if changed:
             self.refresh()
 
     def _host_text(self) -> Text:
@@ -278,7 +356,9 @@ class StatusBar(Widget):
         return out
 
     def render(self) -> Text:
-        left = Text(context_line(self.state), style=theme.ACCENT)
+        left = mode_box(self.state)
+        left.append("  ")
+        left.append_text(context_text(self.state))
         right = self._host_text()
         return compose_status_bar(left, right, self.size.width)
 

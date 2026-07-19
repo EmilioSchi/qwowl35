@@ -1,9 +1,54 @@
 # qwowl35
 
-A minimal terminal coding agent for the local **qw35-server**. It streams the
-model's response and calls tools in a loop — a safety-aware **bash** tool and
-anchor-backed **file** read/edit tools — with an animated owl mascot pinned
+A terminal coding agent for the local **qw35-server**. It streams the model's
+response and calls tools in a loop, with an animated owl mascot pinned
 top-left that reflects the agent's live state.
+
+The user picks the operating mode BEFORE sending a prompt — a Vim-style
+inverted label in the bottom-left corner shows the active mode, **Shift+Tab**
+(or the `/mode` command) cycles it, and it locks while the model is
+generating. Every new conversation starts in NORMAL.
+
+- **NORMAL (default).** The freestyle executor: a safety-aware
+  `run_shell_command` plus `edit`, where `edit` delegates the change to a
+  dedicated **editor** sub-agent (hashline `edit`/`insert`/`delete`, no
+  bash) — the label flips to **INSERT** while the editor runs.
+- **PLAN.** The **planner** (`plan`, `ask_user_question`, `explore`) designs
+  an ordered todo plan behind an approval modal. It cannot read code itself:
+  its `explore` tool spawns a stateless read-only **explorer** sub-agent
+  (`list_directory`/`glob`/`grep_search`/`inspect_file` + a restricted
+  shell) that searches freely and reports back through one `resume` call —
+  only that findings summary returns to the planner (label: **VISUAL** while
+  it runs). After approval, todos execute one at a time on ONE persistent
+  executor conversation (each todo appends a slim directive, so consecutive
+  executors inherit the full context of their predecessors and the server's
+  checkpoint stack prefills only the new message), with a bounded planner
+  review ping after each todo (label: NORMAL while executors run, PLAN
+  during reviews).
+- **WEB.** A web agent restricted to `search_engine` + `web_fetch`: finds
+  and fetches what the request needs and answers with findings + URLs.
+- **CHAT.** A lightweight, tool-less conversational agent on one persistent
+  conversation.
+
+Every agent is segregated: it starts from a fresh context with its OWN
+system prompt, advertises only its OWN tools, and receives exactly the data
+handed over to it. The editor and explorer sub-agents run on the server's
+scratch GPU session (`qw35_session: scratch`), the planner persists on its
+own `plan` session, so nothing disturbs a stage in progress. Agents live
+one-per-module under `agents/`; the mode dispatch is `orchestrator.py`.
+
+Every conversation is persisted as a session under the user cache dir
+(`sessions/` package): one `sessions/{session_hash}/turns/{NNNN}/` directory
+per turn holding the stage artifacts (exploration reports, plan, per-task
+results), a `meta.json` (goal, mode, outcome, session-path tallies), and a
+`transcript.jsonl` with the raw model I/O — the exact requests sent, the raw
+SSE chunks received (malformed tool-call XML included), parsed assistant
+turns, and tool results — the on-disk source of truth for debugging what the
+TUI renders. `/sessions` lists past sessions and restores one: the display
+replays, the turn log and CHAT conversation rehydrate verbatim, and the
+server re-primes its KV cache with a normal full prefill on the next
+request. Stale sessions are garbage-collected by age and count at app
+startup/exit.
 
 ```
    _   z
@@ -23,6 +68,18 @@ python -m qwowl35 --base-url http://127.0.0.1:8080 --reasoning-effort xhigh
 Configuration is CLI-only — no environment-variable overrides. The bash analyzer
 gains an AST mode if the optional `tree-sitter-language-pack` is installed, but
 falls back to substring matching without it.
+
+Read/edit results carry a validation block with two layers. The primary layer
+(`tools/lsp/`, on by default, `--no-lsp` to disable) runs real language servers
+through the optional `multilspy` package for semantic diagnostics — unresolved
+symbols, type errors — and needs the per-language binary on `PATH`
+(`jedi-language-server` for Python — syntax-level only, jedi is not a type
+checker — `rust-analyzer`, `gopls`, …). Whenever LSP cannot answer (package or
+binary missing, server still warming up, diagnostics timeout, unsupported
+language), the check silently falls back to the second layer: the tree-sitter
+syntax checker, which needs only `tree-sitter-language-pack`. Without either
+package the block simply disappears; edits never fail because validation is
+unavailable.
 
 The `/theme` picker is the one exception: the last committed theme is remembered
 across launches (written to `theme.json` in the OS config dir). Set
@@ -53,7 +110,8 @@ that saved choice for a session.
 ## Keys
 
 `Enter` send · `Shift+Enter` newline · `Up/Down` history · `Ctrl+O` expand tools ·
-`Ctrl+C` quit. Approval: `1/2/3` or arrows + `Enter`, `Tab` to write an alternative.
+`Shift+Tab` (or `/mode [normal|plan|web|chat]`) cycle mode · `Ctrl+C` quit.
+Approval: `1/2/3` or arrows + `Enter`, `Tab` to write an alternative.
 
 ## Headless runners (`debug/`)
 
@@ -66,6 +124,7 @@ running.
 # one task, one turn (defaults to the bundled benchmark/cal_task.md)
 python qwowl35/debug/headless.py --task benchmark/cal_task.md --timeout 300
 python qwowl35/debug/headless.py --prompt "write hello.py" --restricted-bash
+python qwowl35/debug/headless.py --prompt "refactor foo" --mode plan   # planner pipeline, scripted approvals
 
 # several steps through ONE persistent session — tests incremental editing
 python qwowl35/debug/headless_steps.py \
@@ -81,7 +140,8 @@ Pass `--help` to either for the full flag list.
 |------|------|
 | `app.py` / `agent.py` / `client.py` | TUI app · agent loop + mascot states · httpx SSE client |
 | `tools/bash/`, `tools/files/` | Bash tool · anchored file tools (`adapter.py` + `hashline/` core) |
+| `tools/lsp/`, `tools/syntax/` | LSP semantic diagnostics (primary edit validation) · tree-sitter checker (fallback) + the `validate.py` router |
 | `tools_registry.py` / `prompts.py` / `config.py` | Tool schemas + dispatch · system prompt · defaults |
-| `widgets/` | `mascot_widget`, `chat_log`, `prompt_input`, `approval`, `status_panel` |
+| `widgets/` | `chat/` (transcript: `chat_view`, `tool_block`, `thinking_block`, `card`, `renderers/`), `prompt_input`, `approval_modal`, `status_bar`, `mascot` |
 | `debug/` | Headless runners (`headless.py`, `headless_steps.py`) |
 | `tests/` | All tests (incl. `hashline_parity_test.py`, an optional upstream audit) |

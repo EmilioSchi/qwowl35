@@ -41,6 +41,36 @@ def main() -> None:
         default=None,
         help="run the bash tool in restricted mode",
     )
+    parser.add_argument(
+        "--no-compress",
+        dest="compress",
+        action="store_false",
+        default=None,
+        help="disable tool-output compression (full raw tool results)",
+    )
+    parser.add_argument(
+        "--no-rerank",
+        dest="rerank",
+        action="store_false",
+        default=None,
+        help="disable the query-aware semantic rerank of web results "
+        "(statistical compression only)",
+    )
+    parser.add_argument(
+        "--rerank-scorer",
+        choices=["cross-encoder", "bm25"],
+        help="rerank scorer: cross-encoder = the server's native reranker via "
+        "/v1/rerank (default; qw35 auto-loads the reranker GGUF when present; "
+        "degrades to bm25 when the server has no reranker), bm25 = lexical only",
+    )
+    parser.add_argument(
+        "--no-lsp",
+        dest="lsp",
+        action="store_false",
+        default=None,
+        help="disable LSP semantic diagnostics on read/edit results "
+        "(tree-sitter syntax checks only)",
+    )
     parsed = parser.parse_args()
 
     config = load_config(
@@ -48,6 +78,10 @@ def main() -> None:
         think=parsed.think,
         reasoning_effort=parsed.reasoning_effort,
         restricted_bash=parsed.restricted_bash,
+        compress=parsed.compress,
+        rerank=parsed.rerank,
+        rerank_scorer=parsed.rerank_scorer,
+        lsp=parsed.lsp,
     )
     QwowlApp(config).run()
 

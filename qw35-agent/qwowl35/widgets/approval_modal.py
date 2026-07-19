@@ -22,7 +22,7 @@ from textual.widgets import Input, Static
 
 import theme
 from approval import ApprovalDecision
-from widgets.chat_log import _shell_text
+from widgets.chat.renderers.shell import _shell_text
 
 _OPTIONS = ("Accept", "Deny", "Write to do differently")
 

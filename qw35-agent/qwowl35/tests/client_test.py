@@ -98,6 +98,23 @@ def test_sse_error_payload_maps_to_qw35_error() -> None:
     assert_true("4203" in err.message, "error message")
 
 
+def test_prefill_chunk_carries_session_ctx() -> None:
+    from client import PrefillProgress, _classify_chunk
+
+    chunk = {
+        "choices": [],
+        "qw35_prefill": {"processed": 512, "total": 4096, "percent": 12.5, "session_ctx": 24576},
+    }
+    events = list(_classify_chunk(chunk))
+    assert_equal(
+        events,
+        [PrefillProgress(percent=12.5, processed=512, total=4096, session_ctx=24576)],
+        "prefill chunk with the serving session's live ctx",
+    )
+    legacy = list(_classify_chunk({"choices": [], "qw35_prefill": {"processed": 1, "total": 2}}))
+    assert_equal(legacy[0].session_ctx, None, "absent session_ctx stays None")
+
+
 def main() -> None:
     test_invalid_tool_args_are_compact()
     test_malformed_bash_args_are_invalid_json()
@@ -108,6 +125,7 @@ def main() -> None:
     test_non_object_tool_args_are_invalid()
     test_unquoted_escaped_content_is_recovered()
     test_sse_error_payload_maps_to_qw35_error()
+    test_prefill_chunk_carries_session_ctx()
     print("client tests passed")
 
 

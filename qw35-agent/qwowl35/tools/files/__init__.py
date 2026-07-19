@@ -1,4 +1,4 @@
-"""Id-based file tools (beginTransaction/edit/insert/delete), backed by the hashline library.
+"""Id-based file tools (read_file/replace/insert/delete), backed by the hashline library.
 
 Exposes ``HashlineTools`` (the OpenAI-schema adapter) and ``GUIDANCE`` (the
 system-prompt section for these tools). The vendored ``hashline`` package holds

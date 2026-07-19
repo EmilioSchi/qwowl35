@@ -61,26 +61,31 @@ def _format_output(stdout: CappedBuffer, stderr: CappedBuffer) -> str:
     return "".join(parts)
 
 
+# Wire name, verbatim from qwen-code's tool-names.ts (SHELL). The tool was
+# once advertised as "bash"; the model — trained on qwen-code — kept reaching
+# for `run_shell_command` anyway, so the trained name is the real one.
+SHELL_NAME = "run_shell_command"
+
+
 class BashTool:
-    """Executes a bash command, capping output and surfacing exit status.
+    """Executes a shell command, capping output and surfacing exit status.
 
     Suspicious-command analysis is available via :func:`approval_options` and the
     :mod:`tools.bash.analyzer` helpers; it is intended to gate execution behind an
     approval prompt, not to block it outright.
     """
 
-    name = "bash"
+    name = SHELL_NAME
     description = (
-        "Execute a bash command on the system. Use this to run shell commands, "
-        "inspect files, create new files, run programs, and verify changes. "
-        "For existing non-empty files, read anchors and use the file edit tools "
-        "instead of rewriting the whole file from bash."
+        "Executes a given shell command (as `bash -c <command>`) in a "
+        "subprocess, ensuring proper handling and security measures."
     )
 
     def __init__(self, restricted: bool = False) -> None:
         # When restricted, commands run under ``bash -r`` (restricted shell):
         # no ``cd``, no output redirection, no ``/``-qualified command paths, and
-        # no ``PATH``/``SHELL`` reassignment. Used by unattended debug runs.
+        # no ``PATH``/``SHELL`` reassignment. Used by unattended debug runs and
+        # the explorer's under-the-hood shell.
         self._restricted = restricted
 
     def schema(self) -> dict[str, Any]:
@@ -92,10 +97,29 @@ class BashTool:
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The bash command to execute",
+                        "description": "The exact shell command to execute.",
+                    },
+                    "is_background": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether to run the command in background. This "
+                            "parameter is required to ensure explicit "
+                            "decision-making about command execution mode. Set "
+                            "to true for long-running processes like "
+                            "development servers, watchers, or daemons that "
+                            "should continue running without blocking further "
+                            "commands. Set to false for one-time commands that "
+                            "should complete before proceeding."
+                        ),
+                    },
+                    "compress": {
+                        "type": "boolean",
+                        "description": (
+                            "Optional: false returns the full uncompressed output."
+                        ),
                     },
                 },
-                "required": ["command"],
+                "required": ["command", "is_background"],
             },
         }
 
@@ -107,11 +131,32 @@ class BashTool:
         command = args.get("command")
         if not isinstance(command, str) or command == "":
             raise ValueError("command parameter is required")
+        # The schema requires an explicit choice; a compliant model always
+        # sends it. Runtime tolerance: a missing flag runs foreground, and the
+        # XML tool-call path delivers booleans as strings ("true"/"false").
+        raw_background = args.get("is_background")
+        is_background = raw_background is True or (
+            isinstance(raw_background, str) and raw_background.strip().lower() == "true"
+        )
+
+        argv = ["bash", "-r", "-c", command] if self._restricted else ["bash", "-c", command]
+
+        if is_background:
+            process = subprocess.Popen(
+                argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return (
+                f"Command running in background (PID {process.pid}). Its output "
+                "is not captured; check its effects (files, ports, logs) with "
+                "follow-up commands."
+            )
 
         stdout = CappedBuffer(limit=MAX_OUTPUT_SIZE)
         stderr = CappedBuffer(limit=MAX_OUTPUT_SIZE)
-
-        argv = ["bash", "-r", "-c", command] if self._restricted else ["bash", "-c", command]
         try:
             completed = subprocess.run(
                 argv,

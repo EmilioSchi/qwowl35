@@ -1,10 +1,22 @@
 # qwowl35 runtime dependencies
 textual>=1.0         # TUI framework (native Theme API for theme switching) — https://github.com/Textualize/textual
 rich>=13.0           # rendering primitives (pulled in by textual) — https://github.com/Textualize/rich
-httpx>=0.27          # async streaming HTTP client — https://github.com/encode/httpx
+httpx[http2]>=0.27   # async streaming HTTP client; h2 extra needed — some sites (e.g. Wikipedia) block HTTP/1.1-only clients — https://github.com/encode/httpx
 xxhash>=3.4          # hashline-compatible xxh3_64 sidecar/content hashes
 platformdirs>=4.0    # OS-correct cache dir for prompt history — https://github.com/tox-dev/platformdirs
 tree-sitter-language-pack>=0.2   # deterministic syntax checks for read/edit/bash + bash AST analysis — https://github.com/Goldziher/tree-sitter-language-pack
+magika>=0.6           # ML content-type detection routing compression's language-aware passes — https://github.com/google/magika
+multilspy>=0.0.15     # LSP client: semantic diagnostics as the primary read/edit validation (tools/lsp) — https://github.com/microsoft/multilspy
+jedi-language-server>=0.41   # python LSP backend multilspy launches from PATH (jedi = syntax-level diagnostics, not a type checker)
 
 # Note: imports of tree-sitter-language-pack stay guarded throughout, so a missing
-# install degrades to a no-op (no syntax warnings) rather than crashing.
+# install degrades to a no-op (no syntax warnings) rather than crashing. magika
+# imports are guarded the same way, degrading to extension-based detection.
+# multilspy is guarded too, per language: a missing package, missing server
+# binary (jedi-language-server, rust-analyzer, gopls, …), slow startup, or a
+# diagnostics timeout degrades that check to the tree-sitter block.
+
+# The web-result rerank has NO python-side model dependency: it scores through
+# qw35-server's native reranker (POST /v1/rerank, auto-loaded GGUF) over the
+# already-required httpx, degrading to the built-in pure-Python BM25 when the
+# server has no reranker.

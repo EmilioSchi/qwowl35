@@ -25,6 +25,8 @@ from agent import (  # noqa: E402
     REPEATED_TOOL_NOTES,
     REWRITE_ADVICE_NOTES,
     Agent,
+    BudgetDecision,
+    TurnRunner,
     _authored_write_targets,
     _bash_syntax_warning,
     build_auto_read_block,
@@ -110,9 +112,13 @@ class FakeRegistry:
         return f"ran {name}"
 
 
-def make_agent(turns: list[AssistantTurn], queued_batches: list[str] | None = None):
+def make_agent(
+    turns: list[AssistantTurn],
+    queued_batches: list[str] | None = None,
+    registry=None,
+):
     """Build an Agent whose _stream_assistant yields the given turns in order."""
-    registry = FakeRegistry()
+    registry = registry if registry is not None else FakeRegistry()
     ui = FakeUI(queued_batches)
     # Config/client/prompts are untouched because _stream_assistant is replaced.
     agent = Agent.__new__(Agent)
@@ -246,8 +252,8 @@ def test_file_edits_are_not_deduped() -> None:
     # Edit tools must always re-run: a content-free "already did that" denial can
     # mislead the model into thinking a failed edit landed.
     turns = [
-        AssistantTurn(tool_calls=[call("edit", {"file": "a.py", "id": "1af", "content": "x"})]),
-        AssistantTurn(tool_calls=[call("edit", {"file": "a.py", "id": "1af", "content": "x"})]),  # identical
+        AssistantTurn(tool_calls=[call("replace", {"file": "a.py", "id": "1af", "content": "x"})]),
+        AssistantTurn(tool_calls=[call("replace", {"file": "a.py", "id": "1af", "content": "x"})]),  # identical
         AssistantTurn(content="done"),
     ]
     agent, registry, _ = make_agent(turns)
@@ -494,8 +500,8 @@ def test_repeated_rewrite_escalates() -> None:
         firm = results[i].split("\n\n", 1)[1]
         assert_true(firm not in pool, "third+ write escalates beyond the soft pool")
         assert_true("STOP" in firm, "escalation is firm")
-        assert_true("beginTransaction" in firm and "edit" in firm,
-                    "escalation names the edit tools")
+        assert_true("`edit`" in firm and "read_file" not in firm,
+                    "escalation names the edit tool and nothing absent")
     # The escalated rewrites are flagged as errors (not appended to a success).
     bash_errors = [is_err for name, _, is_err in ui.chat.tool_results if name == "bash"]
     assert_equal(bash_errors, [False, False, True, True], "3rd+ rewrites flagged is_error")
@@ -599,6 +605,75 @@ def test_bash_write_appends_anchors_to_result() -> None:
             os.chdir(cwd)
 
 
+def test_build_auto_read_block_marks_attention_on_syntax_error() -> None:
+    # A bash-written file goes through the same syntax/LSP validation as an
+    # edit: errors re-mark the whole block so the loop can flag is_error.
+    from tools.files.adapter import TOOL_ATTENTION_MARKER
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            Path("broken.py").write_text("def f()\n    return 1\n", encoding="utf-8")
+            Path("clean.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+            tools = HashlineTools()
+            block = build_auto_read_block(tools, "cat > broken.py <<EOF\n...\nEOF")
+            assert_true(block.startswith(TOOL_ATTENTION_MARKER), "syntax error → marked block")
+            assert_true("Syntax check (python" in block, f"syntax block present: {block}")
+            assert_true("replace id:" in block, "error rows carry edit anchors")
+            clean = build_auto_read_block(tools, "cat > clean.py <<EOF\n...\nEOF")
+            assert_true(not clean.startswith(TOOL_ATTENTION_MARKER), "clean file → unmarked")
+            assert_true("You just wrote `clean.py`" in clean, "clean file still auto-read")
+        finally:
+            os.chdir(cwd)
+
+
+def test_build_auto_read_block_marks_attention_on_any_broken_target() -> None:
+    # One clean + one broken file in the same command: the joined block is marked.
+    from tools.files.adapter import TOOL_ATTENTION_MARKER
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            Path("ok.py").write_text("x = 1\n", encoding="utf-8")
+            Path("bad.py").write_text("def f(:\n", encoding="utf-8")
+            tools = HashlineTools()
+            block = build_auto_read_block(tools, "echo x > ok.py && echo y > bad.py")
+            assert_true(block.startswith(TOOL_ATTENTION_MARKER), "any broken target marks the block")
+            assert_true("`ok.py`" in block and "`bad.py`" in block, "both targets auto-read")
+        finally:
+            os.chdir(cwd)
+
+
+def test_bash_write_syntax_error_flags_result_is_error() -> None:
+    # run_turn-level: a bash command writing a file with syntax errors surfaces
+    # the syntax block AND flags the tool result is_error, like an edit would.
+    from tools.files.adapter import TOOL_ATTENTION_MARKER
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            Path("broken.py").write_text("def f()\n    return 1\n", encoding="utf-8")
+            turns = [
+                AssistantTurn(tool_calls=[call("bash", {"command": "cat > broken.py <<EOF\n...\nEOF"})]),
+                AssistantTurn(content="done"),
+            ]
+            agent, registry, ui = make_agent(turns)
+            registry.files = HashlineTools()
+            asyncio.run(agent.run_turn("hi"))
+            name, result, is_err = ui.chat.tool_results[0]
+            assert_equal(name, "bash", "bash result inspected")
+            assert_true(is_err, "written-file syntax error flags the bash result")
+            assert_true("Syntax check (python" in result, f"syntax block present: {result}")
+            assert_true(TOOL_ATTENTION_MARKER not in result, "marker stripped from the UI result")
+            tool_msgs = [m for m in agent.messages if m.get("role") == "tool"]
+            assert_true(TOOL_ATTENTION_MARKER not in tool_msgs[-1]["content"], "marker absent from history")
+        finally:
+            os.chdir(cwd)
+
+
 def test_auto_read_suppressed_while_anchors_current_reshown_when_changed() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = os.getcwd()
@@ -617,6 +692,165 @@ def test_auto_read_suppressed_while_anchors_current_reshown_when_changed() -> No
             again = build_auto_read_block(tools, cmd)
             assert_true("You just wrote `app.py`" in again, "re-shown after external change")
             assert_true("|    return 99" in again, "re-shown anchors reflect new content")
+        finally:
+            os.chdir(cwd)
+
+
+def test_build_post_write_report_clean_file_one_liner() -> None:
+    # The non-hashline dialect: a clean write earns ONE confirmation line —
+    # never anchor ids, never read_file (the freestyle executor does not
+    # speak hashline; its content is already verbatim in context).
+    from agent import build_post_write_report
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            Path("app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+            block = build_post_write_report("cat > app.py <<EOF\n...\nEOF")
+            assert_true(block.startswith("Wrote `app.py` (2 lines)."), f"one-liner: {block}")
+            assert_true("Syntax check (python" in block, f"validation present: {block}")
+            assert_true(": OK" in block, f"clean verdict: {block}")
+            assert_true("read_file" not in block, "no hashline tool reference")
+            assert_true("line ids" not in block, "no hashline preamble")
+            assert_true("|def f():" not in block, "no hashline anchor rows")
+            assert_equal(build_post_write_report("ls -la"), "", "non-write → empty")
+            assert_equal(
+                build_post_write_report("cat > gone.py <<EOF\nEOF"), "", "missing file → empty"
+            )
+        finally:
+            os.chdir(cwd)
+
+
+def test_build_post_write_report_errors_use_plain_line_rows() -> None:
+    from agent import build_post_write_report
+    from tools.files.adapter import TOOL_ATTENTION_MARKER
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            Path("broken.py").write_text("def f()\n    return 1\n", encoding="utf-8")
+            block = build_post_write_report("cat > broken.py <<EOF\n...\nEOF")
+            assert_true(block.startswith(TOOL_ATTENTION_MARKER), "errors mark the block")
+            assert_true("You just wrote `broken.py` — it has problems." in block, f"header: {block}")
+            assert_true("Syntax check (python" in block, f"label present: {block}")
+            assert_true("\n  line 1: def f()" in block, f"plain-numbered content row: {block}")
+            assert_true("replace id:" not in block, "no hashline anchors")
+            assert_true("read_file" not in block, "no hashline tool reference")
+            assert_true("`edit` tool" in block, f"names the edit delegator: {block}")
+            plain = build_post_write_report("cat > broken.py <<EOF\n...\nEOF", edit_hint=False)
+            assert_true("`edit`" not in plain, f"report dialect drops the edit hint: {plain}")
+            assert_true("issue(s)" in plain, f"report dialect keeps the issues: {plain}")
+        finally:
+            os.chdir(cwd)
+
+
+def test_build_post_write_report_caps_file_count() -> None:
+    from agent import build_post_write_report
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            for name in ("a.py", "b.py", "c.py", "d.py"):
+                Path(name).write_text("x = 1\n", encoding="utf-8")
+            command = "echo x > a.py && echo x > b.py && echo x > c.py && echo x > d.py"
+            block = build_post_write_report(command)
+            assert_true("`a.py`" in block and "`c.py`" in block, "first targets reported")
+            assert_true("`d.py`" not in block, "fourth target capped out")
+            assert_true("+1 more written file(s) not shown." in block, f"overflow line: {block}")
+            assert_true("read_file" not in block, "overflow avoids hashline terms")
+        finally:
+            os.chdir(cwd)
+
+
+def test_subedit_write_feedback_skips_hashline_and_flags_errors() -> None:
+    # run_turn-level: with write_feedback="subedit" (the freestyle executor),
+    # the bash result carries the plain report — registry.files is never needed
+    # — and a broken written file still flags is_error with the marker stripped.
+    from tools.files.adapter import TOOL_ATTENTION_MARKER
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            Path("app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+            Path("broken.py").write_text("def f()\n    return 1\n", encoding="utf-8")
+            turns = [
+                AssistantTurn(tool_calls=[call("bash", {"command": "cat > app.py <<EOF\n...\nEOF"})]),
+                AssistantTurn(tool_calls=[call("bash", {"command": "cat > broken.py <<EOF\n...\nEOF"}, index=1)]),
+                AssistantTurn(content="done"),
+            ]
+            agent, registry, ui = make_agent(turns)
+            agent.write_feedback = "subedit"
+            asyncio.run(agent.run_turn("hi"))
+            (name1, clean_result, clean_err), (name2, broken_result, broken_err) = (
+                ui.chat.tool_results[0],
+                ui.chat.tool_results[1],
+            )
+            assert_true("Wrote `app.py` (2 lines)." in clean_result, f"clean report: {clean_result}")
+            assert_true(not clean_err, "clean write is not an error")
+            assert_true("You just wrote `broken.py` — it has problems." in broken_result, f"broken report: {broken_result}")
+            assert_true(broken_err, "broken write flags is_error")
+            for result in (clean_result, broken_result):
+                assert_true(TOOL_ATTENTION_MARKER not in result, "marker stripped from UI result")
+                assert_true("read_file" not in result, "no hashline terms on this surface")
+                assert_true("line ids" not in result, "no hashline preamble on this surface")
+            tool_msgs = [m for m in agent.messages if m.get("role") == "tool"]
+            assert_true(
+                all(TOOL_ATTENTION_MARKER not in m["content"] for m in tool_msgs),
+                "marker absent from history",
+            )
+        finally:
+            os.chdir(cwd)
+
+
+def test_post_write_report_dedups_repeat_rows_per_conversation() -> None:
+    # The freestyle conversation is ONE context: re-writing the same broken
+    # file lists its rows once; the repeat keeps the flag and the honest
+    # count but not the rows. A conversation reset re-arms everything.
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            Path("broken.py").write_text("def f()\n    return 1\n", encoding="utf-8")
+            # Two DISTINCT commands (the consecutive-repeat guard would deny an
+            # identical re-run) writing the SAME broken content, so the second
+            # validation reports the exact rows the first already showed.
+            turns = [
+                AssistantTurn(tool_calls=[call("bash", {"command": "cat > broken.py <<EOF\ndef f(\nEOF"})]),
+                AssistantTurn(tool_calls=[call("bash", {"command": "cat >broken.py <<EOF\ndef f(\nEOF"}, index=1)]),
+                AssistantTurn(content="done"),
+            ]
+            agent, registry, ui = make_agent(turns)
+            agent.write_feedback = "subedit"
+            # Real registries carry the conversation's diagnostics memory; the
+            # FakeRegistry does not, so attach one (its absence = no dedup).
+            from tools.diagnostics import DiagnosticsMemory
+
+            registry.diag_memory = DiagnosticsMemory()
+            asyncio.run(agent.run_turn("hi"))
+            (_n1, first, first_err), (_n2, second, second_err) = (
+                ui.chat.tool_results[0],
+                ui.chat.tool_results[1],
+            )
+            assert_true("- line 1" in first, f"first report lists the row: {first}")
+            assert_true(first_err and second_err, "both broken writes flag is_error")
+            assert_true(
+                "it still has problems" in second
+                and "all unchanged and already reported above" in second,
+                f"repeat collapses to the honest one-liner: {second}",
+            )
+            assert_true("- line 1" not in second, f"row not repeated: {second}")
+            # A conversation reset (the /clear seam) forgets the seen rows.
+            agent.reset_conversation_guards()
+            sifted = registry.diag_memory.sift(
+                "broken.py",
+                type("V", (), {"errors": [(1, 1, "line 1, col 1: x")], "warnings": []})(),
+                "def f()\n",
+            )
+            assert_true(sifted.errors, "cleared conversation sees rows as new again")
         finally:
             os.chdir(cwd)
 
@@ -649,7 +883,10 @@ def test_model_sees_raw_tool_result_not_the_rendered_view() -> None:
             assert_true(re.search(r"\d+[0-9a-f]{2}\|def f", model_content), "raw pipe ids present")
             # ...and NONE of the render-only decoration.
             assert_true("Model also received" not in model_content, "preview label must not reach the model")
-            assert_true(">_" not in model_content and "<>" not in model_content, "badges must not reach the model")
+            # Badge words are render-only; they must not appear as standalone
+            # badge rows (word + two spaces at line start) in model content.
+            assert_true(not re.search(r"^(?:Sh|Read|View|Grep|Glob|List|Add|Del|Edit|Fetch|Search|Plan|Ask|Expl|Resm)  ", model_content, re.MULTILINE),
+                        "badges must not reach the model")
             assert_true("\x1b[" not in model_content, "no ANSI in the model content")
             assert_true(re.search(r"\d+:[0-9a-f]{2}  ", model_content) is None, "no file-view gutter in the model content")
         finally:
@@ -672,7 +909,7 @@ def test_auto_read_suppressed_after_model_read_unchanged_file() -> None:
         try:
             Path("util.py").write_text("x = 1\n", encoding="utf-8")
             tools = HashlineTools()
-            tools.execute("beginTransaction", {"file": "util.py"})  # model already has ids
+            tools.execute("read_file", {"file_path": os.path.abspath("util.py")})  # model already has ids
             # The file is unchanged, so a write command that does not alter it is
             # suppressed (model already holds the current anchors).
             assert_equal(
@@ -699,7 +936,7 @@ def test_attention_marker_is_stripped_and_flags_error() -> None:
             return TOOL_ATTENTION_MARKER + "Edited line 1.\n\nSyntax check (python) — 1 issue(s):"
 
     turns = [
-        AssistantTurn(tool_calls=[call("edit", {"file": "a.py", "id": "1af", "content": "x"})]),
+        AssistantTurn(tool_calls=[call("replace", {"file": "a.py", "id": "1af", "content": "x"})]),
         AssistantTurn(content="done"),
     ]
     agent, _registry, ui = make_agent(turns)
@@ -712,6 +949,301 @@ def test_attention_marker_is_stripped_and_flags_error() -> None:
     assert_true(result.startswith("Edited line 1."), f"clean text preserved: {result!r}")
     tool_msgs = [m for m in agent.messages if m.get("role") == "tool"]
     assert_true(TOOL_ATTENTION_MARKER not in tool_msgs[-1]["content"], "marker absent from history")
+
+
+def test_interleaved_identical_calls_are_still_denied() -> None:
+    # Regression: a planner looped identical `plan` calls interleaved
+    # with ask_user_question; the old single-slot guard was cleared by the
+    # interleaving. The guard is per tool name now.
+    plan_args = {"plan": "p", "todos": ["x"]}
+    turns = [
+        AssistantTurn(tool_calls=[call("plan", plan_args)]),
+        AssistantTurn(tool_calls=[call("ask_user_question", {"questions": []})]),
+        AssistantTurn(tool_calls=[call("plan", plan_args)]),  # identical → denied
+        AssistantTurn(content="done"),
+    ]
+    agent, registry, ui = make_agent(turns)
+    asyncio.run(agent.run_turn("hi"))
+
+    executed_names = [name for name, _ in registry.executed]
+    assert_equal(
+        executed_names,
+        ["plan", "ask_user_question"],
+        "the laundered repeat did not execute",
+    )
+    denied = [r for n, r, err in ui.chat.tool_results if n == "plan" and err]
+    assert_equal(len(denied), 1, "the repeat was denied")
+    assert_true(denied[0] in _denial_pool("plan"), "denial from the note pool")
+
+
+def test_max_rounds_stops_the_loop_cleanly() -> None:
+    # A stage round budget is a machine transition: after max_rounds streams
+    # the loop returns True with whatever was done; the remaining script is
+    # never consumed.
+    turns = [
+        AssistantTurn(tool_calls=[call("bash", {"command": f"echo {i}"})])
+        for i in range(10)
+    ]
+    agent, registry, ui = make_agent(turns)
+    agent.max_rounds = 3
+    ok = asyncio.run(agent.run_turn("hi"))
+
+    assert_true(ok, "budgeted stop is a success, not an error")
+    assert_equal(len(registry.executed), 3, "exactly max_rounds streams ran")
+    assert_equal(len(agent.stream_messages), 3, "no further streams requested")
+
+
+def test_budget_stop_decision_matches_default_behavior() -> None:
+    # An explicit "stop" decision from on_round_budget_reached must behave
+    # exactly like today's silent cutoff — just with the driver asked once.
+    turns = [
+        AssistantTurn(tool_calls=[call("bash", {"command": f"echo {i}"})])
+        for i in range(5)
+    ]
+    agent, registry, ui = make_agent(turns)
+    agent.max_rounds = 3
+    asked = {"n": 0}
+
+    async def on_budget_reached() -> BudgetDecision:
+        asked["n"] += 1
+        return BudgetDecision(kind="stop")
+
+    agent.on_round_budget_reached = on_budget_reached
+    ok = asyncio.run(agent.run_turn("hi"))
+
+    assert_true(ok, "user-chosen stop is a success, not an error")
+    assert_equal(len(registry.executed), 3, "loop stopped at the original budget")
+    assert_equal(asked["n"], 1, "the driver was asked exactly once")
+
+
+def test_budget_grow_decision_raises_max_rounds_and_continues() -> None:
+    # "grow" raises max_rounds and the loop keeps running — a second budget
+    # hit at the grown ceiling asks the driver again.
+    turns = [
+        AssistantTurn(tool_calls=[call("bash", {"command": f"echo {i}"})])
+        for i in range(6)
+    ]
+    agent, registry, ui = make_agent(turns)
+    agent.max_rounds = 3
+    grown = {"done": False}
+
+    async def on_budget_reached() -> BudgetDecision:
+        if grown["done"]:
+            return BudgetDecision(kind="stop")
+        grown["done"] = True
+        return BudgetDecision(kind="grow", max_rounds=5)
+
+    agent.on_round_budget_reached = on_budget_reached
+    ok = asyncio.run(agent.run_turn("hi"))
+
+    assert_true(ok, "budgeted stop after growth is still a success")
+    assert_equal(agent.max_rounds, 5, "max_rounds was raised to the grown value")
+    assert_equal(len(registry.executed), 5, "loop ran to the grown budget, not the original")
+
+
+def test_budget_force_decision_forces_a_tool_and_asks_only_once() -> None:
+    # "force" keeps the loop going past the budget instead of stopping; once
+    # the forced tool actually satisfies stop_when, the loop ends cleanly and
+    # the driver was never asked a second time.
+    state = {"done": False}
+
+    class ResumeRegistry(FakeRegistry):
+        async def execute(self, name, arguments):
+            if name == "resume":
+                state["done"] = True
+            return await super().execute(name, arguments)
+
+    turns = [
+        AssistantTurn(tool_calls=[call("bash", {"command": f"echo {i}"})])
+        for i in range(3)
+    ] + [AssistantTurn(tool_calls=[call("resume", {"summary": "done"})])]
+    agent, registry, ui = make_agent(turns, registry=ResumeRegistry())
+    agent.max_rounds = 3
+    asked = {"n": 0}
+
+    async def on_budget_reached() -> BudgetDecision:
+        asked["n"] += 1
+        return BudgetDecision(kind="force", forced_tool="resume")
+
+    agent.on_round_budget_reached = on_budget_reached
+    agent.stop_when = lambda: state["done"]
+    ok = asyncio.run(agent.run_turn("hi"))
+
+    assert_true(ok, "forced resume ends the loop cleanly")
+    assert_equal(asked["n"], 1, "the driver is asked exactly once")
+    assert_equal(len(agent.stream_messages), 4, "one extra forced stream ran")
+    assert_equal(
+        [name for name, _ in registry.executed][-1], "resume", "the forced call executed"
+    )
+
+
+def test_pending_tool_choice_is_sent_once_and_cleared() -> None:
+    # The actual wire-level mechanism behind "force": a pending tool_choice
+    # reaches exactly the next stream_chat call and is cleared afterward —
+    # this is what makes qw35-server seed <tool_call><function=resume> via
+    # its existing forced_call_prefix machinery (no server changes needed).
+    class FakeStreamClient:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def stream_chat(self, **kwargs):
+            self.calls.append(kwargs)
+
+            async def _empty():
+                return
+                yield  # pragma: no cover - never reached, makes this a generator
+
+            return _empty()
+
+    class FakeConfig:
+        def gen_params(self) -> dict:
+            return {}
+
+    class FakeStreamRegistry:
+        def schemas(self) -> list:
+            return []
+
+    runner = TurnRunner.__new__(TurnRunner)
+    runner.client = FakeStreamClient()
+    runner.registry = FakeStreamRegistry()
+    runner.config = FakeConfig()
+    runner.ui = FakeUI()
+    runner.messages = []
+    runner.request_overrides = None
+    runner._pending_tool_choice = {"type": "function", "function": {"name": "resume"}}
+
+    asyncio.run(runner._stream_assistant())
+    asyncio.run(runner._stream_assistant())
+
+    calls = runner.client.calls
+    assert_equal(len(calls), 2, "two streams were issued")
+    assert_equal(
+        calls[0].get("tool_choice"),
+        {"type": "function", "function": {"name": "resume"}},
+        "the forced tool_choice reached the wire params on the first stream",
+    )
+    assert_true(
+        "tool_choice" not in calls[1],
+        "the forced tool_choice is one-shot — cleared after the first stream",
+    )
+
+
+def test_same_command_after_other_work_is_allowed() -> None:
+    # The shell guard is strictly consecutive: re-running the same command
+    # after ANY other call executed (edit -> re-run the tests) is
+    # legitimate; only an immediate identical repeat is denied.
+    turns = [
+        AssistantTurn(tool_calls=[call("bash", {"command": "pytest -q"})]),
+        AssistantTurn(
+            tool_calls=[
+                call("edit", {"filename": "a.py", "line_ranges": "1", "instructions": "fix"})
+            ]
+        ),
+        AssistantTurn(tool_calls=[call("bash", {"command": "pytest -q"})]),  # re-run: allowed
+        AssistantTurn(tool_calls=[call("bash", {"command": "pytest -q"})]),  # immediate: denied
+        AssistantTurn(content="done"),
+    ]
+    agent, registry, ui = make_agent(turns)
+    asyncio.run(agent.run_turn("hi"))
+
+    executed = [name for name, _ in registry.executed]
+    assert_equal(executed, ["bash", "edit", "bash"], "the re-run after the edit executed")
+    denied = [r for n, r, err in ui.chat.tool_results if n == "bash" and err]
+    assert_equal(len(denied), 1, "only the immediate repeat was denied")
+
+
+def test_stop_when_predicate_ends_loop_cleanly() -> None:
+    # The driver's state predicate ends the loop right after the turn that
+    # made it true; the rest of the script is never consumed.
+    state = {"done": False}
+
+    class FlagRegistry(FakeRegistry):
+        async def execute(self, name, arguments):
+            if arguments.get("command") == "make done":
+                state["done"] = True
+            return await super().execute(name, arguments)
+
+    turns = [
+        AssistantTurn(tool_calls=[call("bash", {"command": "prep"})]),
+        AssistantTurn(tool_calls=[call("bash", {"command": "make done"})]),
+        AssistantTurn(tool_calls=[call("bash", {"command": "never runs"})]),
+    ]
+    agent, registry, ui = make_agent(turns)
+    flag_registry = FlagRegistry()
+    agent.registry = flag_registry
+    agent.stop_when = lambda: state["done"]
+    ok = asyncio.run(agent.run_turn("hi"))
+
+    assert_true(ok, "predicate stop is a success")
+    assert_equal(
+        [args["command"] for _, args in flag_registry.executed],
+        ["prep", "make done"],
+        "loop ended at the turn that satisfied the predicate",
+    )
+    assert_equal(len(agent.stream_messages), 2, "no further streams requested")
+
+
+def test_stop_on_stall_ends_loop_after_denied_only_turn() -> None:
+    # After real work, a turn of nothing but repeat-denials is a stall: the
+    # loop transitions instead of spinning (and never consumes the rest of
+    # the script).
+    turns = [
+        AssistantTurn(tool_calls=[call("bash", {"command": "echo hi"})]),
+        AssistantTurn(tool_calls=[call("bash", {"command": "echo hi"})]),  # denied
+        AssistantTurn(tool_calls=[call("bash", {"command": "echo other"})]),  # never reached
+    ]
+    agent, registry, ui = make_agent(turns)
+    agent.stop_on_stall = True
+    ok = asyncio.run(agent.run_turn("hi"))
+
+    assert_true(ok, "stall exit is a success")
+    assert_equal(len(registry.executed), 1, "only the first call executed")
+    assert_equal(len(agent.stream_messages), 2, "loop ended at the denied turn")
+
+
+def test_stop_on_stall_skips_continuation_nudge_after_work() -> None:
+    # Once a tool has run, an unfinished-looking closing text ends the loop
+    # instead of drawing a continuation nudge; before any work, the nudge
+    # still applies (a planner's opening narration is legitimate).
+    turns = [
+        AssistantTurn(content="First I will analyze the task:"),  # nudged (no work yet)
+        AssistantTurn(tool_calls=[call("bash", {"command": "echo hi"})]),
+        AssistantTurn(content="Now let me implement the solution:"),  # would nudge; stalls instead
+        AssistantTurn(content="never reached"),
+    ]
+    agent, registry, ui = make_agent(turns)
+    agent.stop_on_stall = True
+    ok = asyncio.run(agent.run_turn("hi"))
+
+    assert_true(ok, "loop ended cleanly")
+    assert_equal(len(agent.stream_messages), 3, "one nudge before work, none after")
+    nudges = [
+        m for m in agent.messages
+        if m["role"] == "user" and "You ended your turn without calling a tool" in str(m["content"])
+    ]
+    assert_equal(len(nudges), 1, "only the pre-work narration was nudged")
+
+
+def test_out_of_stage_tool_call_is_denied_without_executing() -> None:
+    # Stage discipline (smart mode): a call outside allowed_tools is answered
+    # with an error tool-result and never reaches the registry. None (the
+    # freestyle default) is covered by every other test in this file.
+    turns = [
+        AssistantTurn(tool_calls=[call("bash", {"command": "ls"})]),
+        AssistantTurn(content="done"),
+    ]
+    agent, registry, ui = make_agent(turns)
+    agent.allowed_tools = frozenset({"edit", "insert"})
+    ok = asyncio.run(agent.run_turn("hi"))
+
+    assert_true(ok, "turn completes")
+    assert_equal(registry.executed, [], "out-of-stage call never executes")
+    name, result, is_err = ui.chat.tool_results[-1]
+    assert_true(is_err, "stage violation flagged as error")
+    assert_true("not available in this stage" in result, f"violation text: {result!r}")
+    assert_true("edit" in result and "insert" in result, "denial lists the stage's tools")
+    tool_msgs = [m for m in agent.messages if m.get("role") == "tool"]
+    assert_equal(len(tool_msgs), 1, "violation fed back as a tool result")
 
 
 def _replayer(turns: list[AssistantTurn]):
@@ -780,7 +1312,106 @@ def test_tool_progress_refreshes_continuation_budget() -> None:
     assert_equal(_continuations(agent), 2, "one nudge before the tool, one after")
 
 
+def test_appended_tool_message_is_compressed() -> None:
+    # End to end through a REAL registry: the {"role": "tool"} message the model
+    # sees is the compressed text, and the UI card shows exactly the same string.
+    from tools_registry import ToolRegistry
+
+    command = 'for i in $(seq 1 300); do echo "the same log line over and over"; done'
+    turns = [
+        AssistantTurn(tool_calls=[call("bash", {"command": command})]),
+        AssistantTurn(content="done"),
+    ]
+    agent, _, ui = make_agent(turns, registry=ToolRegistry())
+    asyncio.run(agent.run_turn("hi"))
+
+    tool_messages = [m for m in agent.messages if m.get("role") == "tool"]
+    assert_equal(len(tool_messages), 1, "one tool result appended")
+    content = tool_messages[0]["content"]
+    assert_true("[compressed:" in content, f"appended message compressed: {content[-200:]!r}")
+    assert_true("repeated × 300" in content, "repeat count in appended message")
+    shown = [r for name, r, _ in ui.chat.tool_results if name == "bash"]
+    assert_equal(len(shown), 1, "one tool card shown")
+    assert_equal(shown[0], content, "UI card and model message are the same string")
+
+
+def test_inspect_file_lsp_section_reaches_model_verbatim() -> None:
+    # The LSP diagnostics block appended by inspect_file is model-facing
+    # context, not TUI decoration: the exact registry result string must land
+    # in the next request's tool message (and the chat view shows the same).
+    section = (
+        "def f():\n    return 1\n\n"
+        "LSP diagnostics (python, lsp) — 1 error(s), 1 warning(s):\n"
+        "- line 2, col 12: [undefined-variable] Undefined variable 'x' (pylint)\n"
+        "Warnings (not blocking):\n"
+        "- line 1, col 1: [unused-import] Unused import os (pylint)"
+    )
+
+    class SectionRegistry(FakeRegistry):
+        async def execute(self, name: str, arguments: dict) -> str:
+            self.executed.append((name, arguments))
+            return section
+
+    turns = [
+        AssistantTurn(tool_calls=[call("inspect_file", {"file_path": "/w/f.py"})]),
+        AssistantTurn(content="done"),
+    ]
+    agent, registry, ui = make_agent(turns, registry=SectionRegistry())
+    asyncio.run(agent.run_turn("read it"))
+
+    # stream_messages[1] is the request payload for the model call AFTER the
+    # tool ran — exactly what the server (and so the model) receives.
+    sent = agent.stream_messages[1]
+    tool_msgs = [m for m in sent if m.get("role") == "tool"]
+    assert_equal(len(tool_msgs), 1, "one tool message in the model request")
+    assert_equal(
+        tool_msgs[0]["content"], section, "model receives the LSP section verbatim"
+    )
+    assert_equal(
+        ui.chat.tool_results,
+        [("inspect_file", section, False)],
+        "chat view shows the same string it sent to the model",
+    )
+
+
+def test_last_reasoning_tracks_issuing_turn_mid_dispatch() -> None:
+    # The orchestrator reads runner.last_reasoning while a tool call executes
+    # (the editor spawn's background block); it must be the reasoning of the
+    # SAME turn that issued the call, refreshed before each round's dispatch,
+    # and reset with the turn guards.
+    class SnappingRegistry(FakeRegistry):
+        def __init__(self) -> None:
+            super().__init__()
+            self.agent = None
+            self.seen: list[str] = []
+
+        async def execute(self, name: str, arguments: dict) -> str:
+            self.seen.append(self.agent.last_reasoning)
+            return await super().execute(name, arguments)
+
+    turns = [
+        AssistantTurn(reasoning="think-one", tool_calls=[call("bash", {"command": "ls"})]),
+        AssistantTurn(reasoning="think-two", tool_calls=[call("bash", {"command": "pwd"})]),
+        AssistantTurn(content="done"),
+    ]
+    snapping = SnappingRegistry()
+    agent, _registry, _ui = make_agent(turns, registry=snapping)
+    snapping.agent = agent
+    asyncio.run(agent.run_turn("hi"))
+
+    assert_equal(
+        snapping.seen, ["think-one", "think-two"],
+        "each dispatch sees its issuing turn's reasoning",
+    )
+    assert_equal(agent.last_reasoning, "", "reasoning-free closing turn clears it")
+    agent.last_reasoning = "stale"
+    agent.reset_turn_guards()
+    assert_equal(agent.last_reasoning, "", "reset_turn_guards clears the capture")
+
+
 def main() -> None:
+    test_inspect_file_lsp_section_reaches_model_verbatim()
+    test_last_reasoning_tracks_issuing_turn_mid_dispatch()
     test_identical_consecutive_call_is_denied()
     test_changed_arguments_clear_the_guard()
     test_third_identical_call_still_denied()
@@ -806,8 +1437,16 @@ def main() -> None:
     test_build_auto_read_block_shows_anchors_for_written_file()
     test_build_auto_read_block_caps_file_count()
     test_bash_write_appends_anchors_to_result()
+    test_build_auto_read_block_marks_attention_on_syntax_error()
+    test_build_auto_read_block_marks_attention_on_any_broken_target()
+    test_bash_write_syntax_error_flags_result_is_error()
     test_auto_read_suppressed_while_anchors_current_reshown_when_changed()
     test_auto_read_suppressed_after_model_read_unchanged_file()
+    test_build_post_write_report_clean_file_one_liner()
+    test_build_post_write_report_errors_use_plain_line_rows()
+    test_build_post_write_report_caps_file_count()
+    test_subedit_write_feedback_skips_hashline_and_flags_errors()
+    test_post_write_report_dedups_repeat_rows_per_conversation()
     test_model_sees_raw_tool_result_not_the_rendered_view()
     test_bash_syntax_warning_is_errors_only_never_ok()
     test_attention_marker_is_stripped_and_flags_error()
@@ -815,6 +1454,18 @@ def main() -> None:
     test_done_turn_no_continuation()
     test_continuation_is_capped()
     test_tool_progress_refreshes_continuation_budget()
+    test_interleaved_identical_calls_are_still_denied()
+    test_max_rounds_stops_the_loop_cleanly()
+    test_budget_stop_decision_matches_default_behavior()
+    test_budget_grow_decision_raises_max_rounds_and_continues()
+    test_budget_force_decision_forces_a_tool_and_asks_only_once()
+    test_pending_tool_choice_is_sent_once_and_cleared()
+    test_same_command_after_other_work_is_allowed()
+    test_stop_when_predicate_ends_loop_cleanly()
+    test_stop_on_stall_ends_loop_after_denied_only_turn()
+    test_stop_on_stall_skips_continuation_nudge_after_work()
+    test_out_of_stage_tool_call_is_denied_without_executing()
+    test_appended_tool_message_is_compressed()
     print("agent guard tests passed")
 
 

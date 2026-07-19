@@ -26,12 +26,12 @@ def test_prompt_uses_xml_tool_examples() -> None:
     assert_true('grep -E "a|b|c"' not in prompt, "double-quoted grep example absent")
     assert_true("For large or noisy files" not in prompt, "old large-file wording removed")
     xml_snippets = [
-        "<function=bash>",
+        "<function=run_shell_command>",
         "<parameter=command>touch file.py</parameter>",
-        "<function=beginTransaction>",
+        "<function=read_file>",
         "<parameter=file>path.py</parameter>",
         "<parameter=id>12af</parameter>",
-        "<function=edit>",
+        "<function=replace>",
         "<parameter=content>    return 2</parameter>",
         "<parameter=id>12af..189c</parameter>",
         "<function=insert>",
@@ -42,10 +42,10 @@ def test_prompt_uses_xml_tool_examples() -> None:
     for snippet in xml_snippets:
         assert_true(snippet in prompt, f"xml snippet present: {snippet}")
     assert_true("Hashline" not in prompt and "hashline" not in prompt, "internal term absent")
-    assert_true('{"name":"beginTransaction"' not in prompt, "flat JSON beginTransaction example absent")
+    assert_true('{"name":"read_file"' not in prompt, "flat JSON read_file example absent")
     assert_true('{"name":"edit_lines"' not in prompt, "flat JSON edit example absent")
     assert_true('<bash command=' not in prompt, "compact bash example absent")
-    assert_true('<beginTransaction file=' not in prompt, "compact beginTransaction example absent")
+    assert_true('<read_file file=' not in prompt, "compact read_file example absent")
     assert_true('<edit file=' not in prompt, "compact edit example absent")
     assert_true('<insert file=' not in prompt, "compact insert example absent")
     assert_true('<delete file=' not in prompt, "compact delete example absent")

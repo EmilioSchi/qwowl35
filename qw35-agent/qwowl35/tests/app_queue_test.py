@@ -7,6 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from rich.console import Console  # noqa: E402
+
 from app import QwowlApp, format_queued_user_batch  # noqa: E402
 
 
@@ -42,13 +44,23 @@ class FakePrompt:
 
 
 def _plain(content) -> str:
-    return content.plain if hasattr(content, "plain") else str(content)
+    if hasattr(content, "plain"):
+        return content.plain
+    if isinstance(content, str):
+        return content
+    # The queue card is a custom renderable; render it through a Console to
+    # get at its text.
+    console = Console(width=60)
+    with console.capture() as capture:
+        console.print(content)
+    return capture.get()
 
 
 def make_app(*, busy: bool):
     app = QwowlApp.__new__(QwowlApp)
     app._busy = busy
     app._queued_messages = []
+    app._queue_last_at = None
     app.queue_panel = FakePanel()
     app.started_turns = []
     app._run_turn = app.started_turns.append
@@ -76,9 +88,11 @@ def test_busy_submission_queues_and_updates_display() -> None:
     assert_equal(app.started_turns, [], "busy submission does not start a worker")
     assert_equal(app._queued_messages, ["queued message"], "busy submission queued")
     assert_true(app.queue_panel.display, "queue panel shown")
-    assert_true("Queue" in _plain(app.queue_panel.content), "queue label shown")
-    assert_true("queued message" in _plain(app.queue_panel.content), "preview shown")
-    assert_true("1. queued message" not in _plain(app.queue_panel.content), "preview is not numbered")
+    rendered = _plain(app.queue_panel.content)
+    assert_true("Incoming Message" in rendered, "card title shown")
+    assert_true("1. queued message" in rendered, "numbered preview shown")
+    assert_true(app._queue_last_at is not None, "enqueue stamped a time")
+    assert_true(app._queue_last_at in rendered, "timestamp shown on the card")
 
 
 def test_idle_submission_starts_turn_without_queueing() -> None:

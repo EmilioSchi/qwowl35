@@ -106,6 +106,9 @@ class PrefillProgress:
     percent: float
     processed: int
     total: int
+    # The serving session's live context ceiling (qw35 servers grow it on
+    # demand); None from servers that don't report it.
+    session_ctx: int | None = None
 
 
 @dataclass
@@ -594,13 +597,24 @@ class StreamAccumulator:
 # --------------------------------------------------------------------------- #
 class Qw35Client:
     def __init__(
-        self, base_url: str, timeout: float = 600.0, stream_tool_xml: bool = True
+        self,
+        base_url: str,
+        timeout: float = 600.0,
+        stream_tool_xml: bool = True,
+        raw_sink: Callable[[str], None] | None = None,
+        request_sink: Callable[[dict], None] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         # Ask the server to stream tool-call bodies incrementally (raw XML
         # fragments + qw35_tool_call side-channel) so the TUI can show a call
         # growing live. Off = the buffered OpenAI-shape stream.
         self.stream_tool_xml = stream_tool_xml
+        # Optional debug observers for every stream this client opens: the
+        # exact outgoing payload and each raw SSE chunk. Used by the headless
+        # harness to capture a full-fidelity trace; the interactive app leaves
+        # them unset. Observers only — they never touch the request.
+        self.raw_sink = raw_sink
+        self.request_sink = request_sink
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
 
     async def aclose(self) -> None:
@@ -628,14 +642,17 @@ class Qw35Client:
         messages: list[dict],
         tools: list[dict] | None = None,
         raw_sink: Callable[[str], None] | None = None,
+        request_sink: Callable[[dict], None] | None = None,
         **gen_params,
     ) -> AsyncIterator[StreamEvent]:
         """Open the chat-completions SSE stream and yield classified events.
 
-        ``raw_sink``, when set, receives each raw SSE ``data:`` payload before it
-        is classified — used by the headless debug runner to record the exact
-        text the model emitted (including malformed tool calls). It is never set
-        by the TUI, so default behavior is unchanged.
+        ``raw_sink`` receives each raw SSE ``data:`` payload before it is
+        classified (the exact text the model emitted, malformed tool calls
+        included); ``request_sink`` receives a copy of the full outgoing
+        payload. Per-call sinks override the client-wide defaults set in the
+        constructor. Sink failures are swallowed — observers can never break
+        a stream.
         """
         body: dict = {
             "messages": messages,
@@ -648,6 +665,22 @@ class Qw35Client:
         if tools:
             body["tools"] = tools
 
+        effective_raw_sink = raw_sink if raw_sink is not None else self.raw_sink
+        effective_request_sink = (
+            request_sink if request_sink is not None else self.request_sink
+        )
+        if effective_request_sink is not None:
+            try:
+                effective_request_sink(
+                    {
+                        "messages": json.loads(json.dumps(messages)),
+                        "tools": json.loads(json.dumps(tools or [])),
+                        "params": json.loads(json.dumps(gen_params, default=str)),
+                    }
+                )
+            except Exception:
+                pass
+
         try:
             async with self._client.stream("POST", "/v1/chat/completions", json=body) as resp:
                 if resp.status_code >= 400:
@@ -657,8 +690,11 @@ class Qw35Client:
                     if not line or not line.startswith("data:"):
                         continue
                     data = line[len("data:"):].strip()
-                    if raw_sink is not None:
-                        raw_sink(data)
+                    if effective_raw_sink is not None:
+                        try:
+                            effective_raw_sink(data)
+                        except Exception:
+                            pass
                     if data == "[DONE]":
                         break
                     try:
@@ -709,7 +745,13 @@ def _classify_chunk(chunk: dict):
             percent = prefill.get("percent")
             if percent is None:
                 percent = (processed / total * 100.0) if total else 0.0
-            yield PrefillProgress(percent=float(percent), processed=processed, total=total)
+            session_ctx = prefill.get("session_ctx")
+            yield PrefillProgress(
+                percent=float(percent),
+                processed=processed,
+                total=total,
+                session_ctx=int(session_ctx) if session_ctx else None,
+            )
         tool_side = chunk.get("qw35_tool_call")
         if isinstance(tool_side, dict):
             kind = tool_side.get("event")

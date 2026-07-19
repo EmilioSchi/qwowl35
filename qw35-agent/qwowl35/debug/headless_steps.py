@@ -86,7 +86,8 @@ def _tool_calls_in(messages: list[dict], start: int) -> list[dict]:
 
 
 EDIT_TOOLS = {
-    "edit",
+    "replace",
+    "edit",  # pre-rename transcripts
     "insert",
     "delete",
 }

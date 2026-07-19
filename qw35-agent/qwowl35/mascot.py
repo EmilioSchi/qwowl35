@@ -76,6 +76,15 @@ class State(str, Enum):
     BASH = "bash"
     PREFILL = "prefill"
     EDIT = "edit"
+    # Per-tool-family running states (see _TOOL_STATES). READ/SEARCH/WEB/PLAN/
+    # ASK/JUDGE are shown while a tool of that family executes, so the owl looks
+    # different reading a file, searching, hitting the network, or judging.
+    READ = "read"
+    SEARCH = "search"
+    WEB = "web"
+    PLAN = "planner"
+    ASK = "ask"
+    JUDGE = "judge"
     OK = "ok"
     COPIED = "copied"
     WARN = "warn"
@@ -189,6 +198,81 @@ EDIT = Animation(
     interval=0.2,
 )
 
+# Read: the owl scans a file top-to-bottom. Cyan braille rows descend (⠉ top
+# → ⠒ middle → ⠤ bottom) while the eyes glance down then up, so it reads as an
+# eye tracking down a page.
+READ = Animation(
+    State.READ.value,
+    (
+        Frame(f"o{YELLOW},{RESET}-", f"{CYAN}⠉{RESET}"),
+        Frame(f"-{YELLOW},{RESET}o", f"{CYAN}⠒{RESET}"),
+        Frame(f"o{YELLOW},{RESET}-", f"{CYAN}⠤{RESET}"),
+        Frame(f"-{YELLOW},{RESET}o", f"{CYAN}⠒{RESET}"),
+    ),
+    interval=0.3,
+)
+
+# Search: a lens focusing. Yellow ring pulses from empty to solid and back
+# (◌ ○ ◍ ●), wide darting eyes — distinct from Web's *rotating* ring.
+SEARCH = Animation(
+    State.SEARCH.value,
+    (
+        Frame(f"ò{YELLOW},{RESET}o", f"{YELLOW}◌{RESET}"),
+        Frame(f"o{YELLOW},{RESET}o", f"{YELLOW}○{RESET}"),
+        Frame(f"ù{YELLOW},{RESET}ù", f"{YELLOW}◍{RESET}"),
+        Frame(f"o{YELLOW},{RESET}o", f"{YELLOW}●{RESET}"),
+        Frame(f"ò{YELLOW},{RESET}o", f"{YELLOW}◍{RESET}"),
+        Frame(f"o{YELLOW},{RESET}-", f"{YELLOW}○{RESET}"),
+    ),
+    interval=0.2,
+)
+
+# Web: loading over the wire. Cyan ring rotates (◜◠◝◞◡◟), alert eyes.
+WEB = Animation(
+    State.WEB.value,
+    tuple(
+        Frame(f"v{YELLOW},{RESET}v", f"{CYAN}{glyph}{RESET}")
+        for glyph in ("◜", "◠", "◝", "◞", "◡", "◟")
+    ),
+    interval=0.15,
+)
+
+# Plan: ticking a checkbox. Green box fills [ ] → [.] → [x], focused eyes.
+PLAN = Animation(
+    State.PLAN.value,
+    (
+        Frame(f"v{YELLOW},{RESET}v", f"{GREEN} {RESET}"),
+        Frame(f"v{YELLOW},{RESET}-", f"{GREEN}.{RESET}"),
+        Frame(f"-{YELLOW},{RESET}v", f"{GREEN}!{RESET}"),
+    ),
+    interval=0.4,
+)
+
+# Ask: posing a question to the user. Cyan blinking "?" with wide eyes —
+# cyan + wide "O,O" set it apart from THINKING's yellow squint.
+ASK = Animation(
+    State.ASK.value,
+    (
+        Frame(f"ù{YELLOW},{RESET}ù", f"{CYAN}?{RESET}"),
+        Frame(f"ù{YELLOW},{RESET}ù", ""),
+    ),
+    interval=0.5,
+)
+
+# Judge: weighing a verdict. A purple scale beam tips left/center/right/center
+# (╱ ─ ╲ ─) while the eyes dart side to side.
+JUDGE = Animation(
+    State.JUDGE.value,
+    (
+        Frame(f"ò{YELLOW},{RESET}ó", f"{PURPLE}╱{RESET}"),
+        Frame(f"ó{YELLOW},{RESET}ò", f"{PURPLE}─{RESET}"),
+        Frame(f"ò{YELLOW},{RESET}ó", f"{PURPLE}╲{RESET}"),
+        Frame(f"ó{YELLOW},{RESET}ò", f"{PURPLE}─{RESET}"),
+    ),
+    interval=0.3,
+)
+
+
 # OK: a static success frame. A green checkmark accessory, eyes "ò,o".
 OK = Animation(
     State.OK.value,
@@ -255,6 +339,52 @@ ANIMATIONS: dict[str, Animation] = {
     BASH.name: BASH,
     PREFILL.name: PREFILL,
     EDIT.name: EDIT,
+    READ.name: READ,
+    SEARCH.name: SEARCH,
+    WEB.name: WEB,
+    PLAN.name: PLAN,
+    ASK.name: ASK,
+    JUDGE.name: JUDGE,
     OK.name: OK,
     COPIED.name: COPIED,
 }
+
+
+# Tool wire name -> running-animation State, grouped by conceptual family. The
+# owl shows this while the named tool executes (set at the call sites in
+# agent.py / orchestrator.py). Anything unlisted — or an unrecognized name —
+# falls back to EDIT, the safe generic "working" loop.
+_TOOL_STATES: dict[str, State] = {
+    # shell
+    "run_shell_command": State.BASH,
+    "bash": State.BASH,
+    # read / open a file ("beginTransaction" kept for pre-rename transcripts)
+    "inspect_file": State.READ,
+    "read_file": State.READ,
+    "beginTransaction": State.READ,
+    # search the tree
+    "grep_search": State.SEARCH,
+    "glob": State.SEARCH,
+    "list_directory": State.SEARCH,
+    # mutate a file ("edit" stays for pre-rename transcripts + the delegator)
+    "replace": State.EDIT,
+    "edit": State.EDIT,
+    "insert": State.EDIT,
+    "delete": State.EDIT,
+    # network
+    "web_fetch": State.WEB,
+    "search_engine": State.WEB,
+    # planning
+    "plan": State.PLAN,
+    # ask the user
+    "ask_user_question": State.ASK,
+    # the planner's explorer sub-agent: spawning is a search, the closing
+    # `resume` report reuses the judging owl (weighing what was found).
+    "explore": State.SEARCH,
+    "resume": State.JUDGE,
+}
+
+
+def state_for_tool(name: str) -> State:
+    """The owl's running animation for a tool call, by family (see _TOOL_STATES)."""
+    return _TOOL_STATES.get(name, State.EDIT)

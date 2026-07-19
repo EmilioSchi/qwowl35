@@ -61,6 +61,13 @@ class Palette:
     DIFF_ADD_BG: str
     DIFF_REMOVE_BG: str
     DIFF_CONTEXT_BG: str
+    # Markdown elements (chat prose); themes may pin them via markdown-* overrides
+    MD_HEADING: str    # headings (bold)
+    MD_LINK: str       # link text / URLs
+    MD_CODE: str       # inline code foreground
+    MD_QUOTE: str      # block quotes (italic)
+    MD_LIST: str       # list bullets / enumerations
+    MD_HR: str         # horizontal rules
 
 
 # The original soft-black / teal palette, kept as the built-in default so the
@@ -86,6 +93,12 @@ DEFAULT = Palette(
     DIFF_ADD_BG="#080f0a",
     DIFF_REMOVE_BG="#120707",
     DIFF_CONTEXT_BG="#15171c",
+    MD_HEADING="#8abeb7",   # = ACCENT
+    MD_LINK="#8abeb7",      # = ACCENT
+    MD_CODE="#a9d59a",      # = SUCCESS_SOFT
+    MD_QUOTE="#6b7280",     # = FG_FAINT
+    MD_LIST="#8abeb7",      # = ACCENT
+    MD_HR="#5c5f66",        # = FG_GHOST
 )
 
 _TOKENS = tuple(f.name for f in fields(Palette))

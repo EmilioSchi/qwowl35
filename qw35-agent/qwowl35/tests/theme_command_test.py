@@ -1,8 +1,9 @@
-"""Tests for local ``/``-commands: dispatch, ``/clear``, and the theme picker.
+"""Tests for local ``/``-commands: dispatch, ``/clear``, ``/mode``, the mode
+cycle, and the theme picker.
 
 Run directly: ``python qwowl35/tests/theme_command_test.py``. The dispatch/clear
-tests use fakes (no TUI); the picker test drives the real app headless via
-Textual's Pilot.
+tests use fakes (no TUI); the picker and mode-cycle tests drive the real app
+headless via Textual's Pilot.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent import Agent  # noqa: E402
 from app import QwowlApp  # noqa: E402
+from modes import Mode  # noqa: E402
 from widgets.theme_selector import ThemeSelector  # noqa: E402
 
 
@@ -89,11 +91,31 @@ class _FakePanel:
         self.content = content
 
 
+class _FakeStatus:
+    def __init__(self) -> None:
+        self.mode: Mode | None = None
+
+    def set_mode(self, mode: Mode) -> None:
+        self.mode = mode
+
+
+class _FakeSessionStore:
+    def __init__(self) -> None:
+        self.rotated = False
+
+    def rotate(self) -> str:
+        self.rotated = True
+        return "new-hash"
+
+
 def test_clear_conversation_resets_everything() -> None:
     app = QwowlApp.__new__(QwowlApp)
     app.agent = _FakeAgent()
     app.chat = _FakeChat()
     app.queue_panel = _FakePanel()
+    app.status = _FakeStatus()
+    app._session_store = _FakeSessionStore()
+    app.mode = Mode.CHAT
     app._queued_messages = ["queued"]
     infos: list[str] = []
     app.set_info = infos.append
@@ -102,9 +124,38 @@ def test_clear_conversation_resets_everything() -> None:
 
     assert_true(app.agent.cleared, "agent history cleared")
     assert_true(app.chat.cleared, "chat transcript cleared")
+    assert_true(app._session_store.rotated,
+                "cleared conversation becomes a restorable past session")
     assert_equal(app._queued_messages, [], "queue emptied")
     assert_true(not app.queue_panel.display, "queue panel hidden")
+    assert_equal(app.mode, Mode.NORMAL, "a cleared conversation restarts in NORMAL")
+    assert_equal(app.status.mode, Mode.NORMAL, "status bar box follows the reset")
     assert_equal(infos, ["cleared"], "mascot flashed 'cleared'")
+
+
+def test_dispatch_mode_command_cycles_selects_and_locks() -> None:
+    app = QwowlApp.__new__(QwowlApp)
+    app._busy = False
+    app.mode = Mode.NORMAL
+    app.status = _FakeStatus()
+    warnings: list[str] = []
+    app.set_warning = warnings.append
+
+    assert_true(app._dispatch_command("/mode"), "/mode handled")
+    assert_equal(app.mode, Mode.PLAN, "bare /mode cycles NORMAL -> PLAN")
+    assert_equal(app.status.mode, Mode.PLAN, "status bar box follows")
+
+    assert_true(app._dispatch_command("/mode chat"), "/mode chat handled")
+    assert_equal(app.mode, Mode.CHAT, "named mode selected directly")
+
+    assert_true(app._dispatch_command("/mode visual"), "/mode visual handled")
+    assert_equal(app.mode, Mode.CHAT, "display modes are not selectable")
+    assert_true(warnings and "unknown mode" in warnings[-1], "unknown mode warned")
+
+    app._busy = True
+    assert_true(app._dispatch_command("/mode"), "handled while busy")
+    assert_equal(app.mode, Mode.CHAT, "mode locked while a turn runs")
+    assert_true("locked" in warnings[-1], "lock warned")
 
 
 # --------------------------------------------------------------------------- #
@@ -118,7 +169,7 @@ def test_agent_clear_keeps_system_and_resets_guards() -> None:
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello"},
     ]
-    agent._last_tool_signature = "sig"
+    agent._last_signatures = {"bash": "sig"}
     agent._last_repeat_msg = "again"
     agent._bash_rewrite_counts = {"a.py": 3}
     agent._last_rewrite_advice = "nudge"
@@ -126,7 +177,7 @@ def test_agent_clear_keeps_system_and_resets_guards() -> None:
     agent.clear()
 
     assert_equal(agent.messages, [{"role": "system", "content": "SYS"}], "only system kept")
-    assert_equal(agent._last_tool_signature, None, "tool signature reset")
+    assert_equal(agent._last_signatures, {}, "tool signatures reset")
     assert_equal(agent._last_repeat_msg, None, "repeat msg reset")
     assert_equal(agent._bash_rewrite_counts, {}, "rewrite counts reset")
     assert_equal(agent._last_rewrite_advice, None, "rewrite advice reset")
@@ -168,11 +219,13 @@ def test_theme_picker_preview_commit_and_revert() -> None:
 
 
 def test_clear_command_empties_chat_keeps_system() -> None:
+    # /clear resets the orchestrator's session state.
     async def scenario() -> None:
         app = QwowlApp()
         async with app.run_test() as pilot:
             app.chat.add_user("hello there")
-            app.agent.messages.append({"role": "user", "content": "hello there"})
+            app.agent.turn_log.append(("hello there", "answered"))
+            app.agent.messages.append({"role": "system", "content": "=== stage: execute ==="})
             await pilot.pause()
             assert_true(len(app.chat.children) > 0, "chat has a message")
 
@@ -180,7 +233,77 @@ def test_clear_command_empties_chat_keeps_system() -> None:
             await pilot.pause()
 
             assert_equal(len(app.chat.children), 0, "transcript emptied")
-            assert_equal([m["role"] for m in app.agent.messages], ["system"], "only system kept")
+            assert_equal(app.agent.turn_log, [], "session log cleared")
+            assert_equal(app.agent.messages, [], "debug transcript cleared")
+
+    asyncio.run(scenario())
+
+
+def test_clear_command_resets_chat_lineage_state() -> None:
+    # /clear resets the chat lineage, session log, and the debug transcript.
+    async def scenario() -> None:
+        app = QwowlApp()
+        async with app.run_test() as pilot:
+            app.chat.add_user("hello there")
+            app.agent.chat_messages.append({"role": "user", "content": "hello there"})
+            app.agent.turn_log.append(("hello there", "answered"))
+            app.agent.messages.append({"role": "system", "content": "=== stage: chat ==="})
+            await pilot.pause()
+
+            app._dispatch_command("/clear")
+            await pilot.pause()
+
+            assert_equal(len(app.chat.children), 0, "transcript emptied")
+            assert_equal(
+                [m["role"] for m in app.agent.chat_messages], ["system"],
+                "chat lineage reset to its system prompt",
+            )
+            assert_equal(app.agent.turn_log, [], "session log cleared")
+            assert_equal(app.agent.messages, [], "debug transcript cleared")
+
+    asyncio.run(scenario())
+
+
+def test_app_binds_interactive_plan_callbacks_at_construction() -> None:
+    # Regression guard for "quiz never shown / plan approved without me":
+    # a constructed app must have the plan gate and question quiz bound to
+    # its modal methods — never the silent auto fallbacks.
+    app = QwowlApp()
+    assert_true(
+        app.agent.registry.plan._plan_callback == app._approve_plan,
+        "plan gate bound to the approval modal",
+    )
+    assert_true(
+        app.agent.registry.plan._question_callback == app._ask_user_questions,
+        "questions bound to the quiz modal",
+    )
+    assert_true(
+        app.agent.registry.plan.notify is not None,
+        "fallbacks would announce themselves",
+    )
+
+
+def test_shift_tab_cycles_user_modes_and_locks_while_busy() -> None:
+    async def scenario() -> None:
+        app = QwowlApp()
+        async with app.run_test() as pilot:
+            assert_equal(app.mode, Mode.NORMAL, "every conversation starts in NORMAL")
+            assert_equal(app.status.state.mode, Mode.NORMAL, "box shows NORMAL")
+
+            expected_cycle = [Mode.PLAN, Mode.WEB, Mode.CHAT, Mode.NORMAL]
+            for expected in expected_cycle:
+                await pilot.press("shift+tab")
+                await pilot.pause()
+                assert_equal(app.mode, expected, f"cycle reaches {expected.value}")
+                assert_equal(
+                    app.status.state.mode, expected, "status bar box tracks the cycle"
+                )
+
+            # The mode is locked once inference runs: cycling is refused.
+            app._busy = True
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert_equal(app.mode, Mode.NORMAL, "mode locked while a turn runs")
 
     asyncio.run(scenario())
 
