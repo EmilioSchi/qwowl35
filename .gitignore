@@ -47,3 +47,8 @@ messages.json
 # ── Stale local snapshots — should be deleted, ignored as a backstop ─
 qw35-server.backup/
 *.backup/
+
+# ── Scratch experiments & local-only notes (not part of the shipped tree) ─
+prototypes/
+qw35-agent/qwowl35/debug/dump_stage_context.py
+qw35-agent/qwowl35/tools/compress/RERANKER_PLAN.md
