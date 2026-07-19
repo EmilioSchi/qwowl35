@@ -40,6 +40,27 @@ BROKEN_PY = "a = 1\nb = 2\ndef f()\n    return 1\n"
 CLEAN_PY = "def f():\n    return 1\n"
 
 
+class _Bag:
+    """Attribute bag for building stub Magika result shapes."""
+
+    def __init__(self, **kw) -> None:
+        self.__dict__.update(kw)
+
+
+class _StubMagika:
+    """Stands in for a constructed Magika singleton, returning a fixed verdict.
+
+    Matches the ``output.ct_label`` / ``output.score`` shape that
+    detect._magika_identify probes for.
+    """
+
+    def __init__(self, label: str, score: float) -> None:
+        self._label, self._score = label, score
+
+    def identify_bytes(self, data: bytes) -> _Bag:
+        return _Bag(output=_Bag(ct_label=self._label, score=self._score))
+
+
 def test_supported_language_and_configure() -> None:
     assert_equal(diagnostics.supported_language("a.py"), "python", ".py → python")
     assert_equal(diagnostics.supported_language("a.tsx"), "typescript", ".tsx → typescript (not tsx)")
@@ -52,6 +73,51 @@ def test_supported_language_and_configure() -> None:
         assert_equal(diagnostics.supported_language("a.py"), None, "disabled → None")
     finally:
         diagnostics.configure(True)
+
+
+def test_supported_language_content_first() -> None:
+    """With source, a confident Magika verdict wins; extension is the fallback."""
+    import tools.compress.detect as detect_mod
+
+    def with_stub(label, score, fn) -> None:
+        saved = (detect_mod._MAGIKA, detect_mod._MAGIKA_FAILED)
+        detect_mod._MAGIKA, detect_mod._MAGIKA_FAILED = _StubMagika(label, score), False
+        try:
+            fn()
+        finally:
+            detect_mod._MAGIKA, detect_mod._MAGIKA_FAILED = saved
+
+    # Confident content label overrides even a known, conflicting extension.
+    with_stub("typescript", 0.99, lambda: assert_equal(
+        diagnostics.supported_language("a.js", "class X {}"),
+        "typescript", "content 'typescript' overrides .js extension"))
+    # Magika labels C# as "cs"; it must map to the csharp server, and here the
+    # extension (.txt) has no LSP backend at all — content alone routes it.
+    with_stub("cs", 0.99, lambda: assert_equal(
+        diagnostics.supported_language("a.txt", "class X {}"),
+        "csharp", "content 'cs' → csharp despite unsupported .txt extension"))
+    # Below MAGIKA_MIN_SCORE → ignore the label, use the extension.
+    with_stub("typescript", 0.10, lambda: assert_equal(
+        diagnostics.supported_language("a.py", "x = 1"),
+        "python", "low-confidence label falls back to .py extension"))
+    # Confident but no LSP backend for the label → use the extension.
+    with_stub("markdown", 0.99, lambda: assert_equal(
+        diagnostics.supported_language("a.py", "# hi"),
+        "python", "unmapped label falls back to .py extension"))
+    # No source → Magika never consulted, pure extension path.
+    with_stub("typescript", 0.99, lambda: assert_equal(
+        diagnostics.supported_language("a.js"),
+        "javascript", "no source → extension path, .js → javascript"))
+
+    # Magika unavailable (failed import cached) → extension fallback.
+    saved = (detect_mod._MAGIKA, detect_mod._MAGIKA_FAILED)
+    detect_mod._MAGIKA, detect_mod._MAGIKA_FAILED = None, True
+    try:
+        assert_equal(
+            diagnostics.supported_language("a.rs", "fn main() {}"),
+            "rust", "magika absent → .rs extension fallback")
+    finally:
+        detect_mod._MAGIKA, detect_mod._MAGIKA_FAILED = saved
 
 
 def test_router_prefers_lsp() -> None:
@@ -181,6 +247,50 @@ def test_convert_splits_severities_and_offsets() -> None:
     )
     assert_equal(warnings, [(1, 5, "line 1, col 5: unused variable")], "severity 2 → warning")
     assert_equal(diagnostics._convert({"diagnostics": []}), ([], []), "clean payload → empty lists")
+
+
+def test_drop_untyped_js_type_errors_scope() -> None:
+    D = diagnostics
+    JS = "class X { constructor(c){ this.c = c } }\n"
+    assert_true(D._drop_untyped_js_type_errors("a.js", JS), ".js (no pragma) → suppress")
+    assert_true(D._drop_untyped_js_type_errors("a.jsx", JS), ".jsx → suppress")
+    assert_true(D._drop_untyped_js_type_errors("a.mjs", JS), ".mjs → suppress")
+    # Opt-in via @ts-check keeps JS type checking on.
+    assert_true(not D._drop_untyped_js_type_errors("a.js", "// @ts-check\n" + JS),
+                ".js with @ts-check → keep type errors")
+    # Genuinely typed files are never suppressed.
+    assert_true(not D._drop_untyped_js_type_errors("a.ts", JS), ".ts → keep (typed)")
+    assert_true(not D._drop_untyped_js_type_errors("a.tsx", JS), ".tsx → keep (typed)")
+    assert_true(not D._drop_untyped_js_type_errors("a.py", JS), ".py → not JS-family")
+    # Code classifier: 1xxx syntax kept, >=2000 semantic dropped.
+    assert_true(not D._is_ts_semantic_code(1005), "TS 1005 (syntax) not semantic")
+    assert_true(D._is_ts_semantic_code(2339), "TS 2339 (property) is semantic")
+    assert_true(D._is_ts_semantic_code("18047"), "string code coerces")
+    assert_true(not D._is_ts_semantic_code(None), "missing code is not semantic")
+
+
+def test_convert_drops_untyped_js_type_errors() -> None:
+    def diag(message, code, source="typescript", severity=1, line=0):
+        return {
+            "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 3}},
+            "message": message, "severity": severity, "source": source, "code": code,
+        }
+
+    payload = {"uri": "file:///w/main.js", "diagnostics": [
+        diag("Property 'ctx' does not exist on type 'Environment'.", 2339, line=3),  # semantic → drop
+        diag("Type 'string' is not assignable to type 'number'.", 2322, line=4),     # semantic → drop
+        diag("',' expected.", 1005, line=5),                                         # syntax → keep
+        diag("undefined name 'foo'", "E0602", source="pyflakes", line=6),            # non-TS → keep
+    ]}
+    # Suppression ON (untyped JS): only the syntax error and the non-TS diag survive.
+    errors, _ = diagnostics._convert(payload, drop_ts_type_errors=True)
+    assert_equal(errors, [
+        (6, 1, "line 6, col 1: ',' expected. (typescript)"),
+        (7, 1, "line 7, col 1: undefined name 'foo' (pyflakes)"),
+    ], "JS: TS type errors dropped; syntax + non-TS kept")
+    # Suppression OFF (default, e.g. a .ts file): every diagnostic is reported.
+    all_errs, _ = diagnostics._convert(payload, drop_ts_type_errors=False)
+    assert_equal(len(all_errs), 4, "suppression off → all four reported")
 
 
 def test_convert_demotes_pylint_module_no_member_to_warning() -> None:
@@ -561,12 +671,15 @@ def test_attach_applies_pylsp_first_diag_timeout() -> None:
 
 def main() -> None:
     test_supported_language_and_configure()
+    test_supported_language_content_first()
     test_router_prefers_lsp()
     test_router_falls_back_on_none()
     test_router_falls_back_when_disabled_or_import_fails()
     test_outside_workspace_root_falls_back()
     test_disk_mismatch_returns_none_before_server_start()
     test_convert_splits_severities_and_offsets()
+    test_drop_untyped_js_type_errors_scope()
+    test_convert_drops_untyped_js_type_errors()
     test_convert_demotes_pylint_module_no_member_to_warning()
     test_uri_matches_normalises()
     test_run_check_takes_last_payload()

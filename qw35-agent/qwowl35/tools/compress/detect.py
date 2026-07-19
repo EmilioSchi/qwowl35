@@ -12,12 +12,14 @@ extension, and a confident-but-unmapped label (markdown, json, plain text…)
 deliberately returns None rather than second-guessing via the extension — a
 data file misnamed `.py` should not be parsed as Python.
 
-Detection runs only on the event-loop thread (inside compress_tool_result), so
-the lazy module-global Magika singleton needs no locking.
+Compression calls this on the event-loop thread (inside compress_tool_result),
+but the LSP diagnostics layer (tools/lsp) also calls :func:`magika_label` from
+worker threads, so the lazy module-global Magika singleton is guarded by a lock.
 """
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from tools.syntax.checker import language_for_path
@@ -49,6 +51,10 @@ _MAGIKA_TO_GRAMMAR: dict[str, str] = {
 # on every tool result.
 _MAGIKA: Any | None = None
 _MAGIKA_FAILED: bool = False
+# Serialises the lazy construction and each identify call. Compression runs on
+# the event-loop thread, but the LSP layer calls magika_label from worker
+# threads, so construction/inference must not race.
+_MAGIKA_LOCK = threading.Lock()
 
 
 def detect_language(text: str, file_path: str = "") -> str | None:
@@ -70,6 +76,25 @@ def detect_language(text: str, file_path: str = "") -> str | None:
         return None
 
 
+def magika_label(text: str) -> str | None:
+    """Confident Magika content-type label for ``text``, or None.
+
+    The raw label (e.g. "python", "javascript", "typescript", "cs") when Magika
+    is installed and scores at/above ``MAGIKA_MIN_SCORE``; None otherwise
+    (Magika absent, low confidence, or any error). Unlike :func:`detect_language`
+    this returns Magika's own label rather than a grammar name, leaving each
+    caller to apply its own label→target map — the LSP layer maps to multilspy
+    languages. Never raises.
+    """
+    try:
+        label, score = _magika_identify(text.encode("utf-8", errors="replace"))
+        if label is not None and score >= MAGIKA_MIN_SCORE:
+            return label
+        return None
+    except Exception:  # noqa: BLE001 - detection is best-effort, never raises
+        return None
+
+
 def _magika_identify(data: bytes) -> tuple[str | None, float]:
     """``(label, score)`` from Magika, or ``(None, 0.0)`` when unavailable.
 
@@ -81,17 +106,18 @@ def _magika_identify(data: bytes) -> tuple[str | None, float]:
     """
     global _MAGIKA, _MAGIKA_FAILED
     try:
-        if _MAGIKA_FAILED:
-            return None, 0.0
-        if _MAGIKA is None:
-            try:
-                from magika import Magika
-
-                _MAGIKA = Magika()
-            except Exception:  # noqa: BLE001 - optional dependency
-                _MAGIKA_FAILED = True
+        with _MAGIKA_LOCK:
+            if _MAGIKA_FAILED:
                 return None, 0.0
-        result = _MAGIKA.identify_bytes(data)
+            if _MAGIKA is None:
+                try:
+                    from magika import Magika
+
+                    _MAGIKA = Magika()
+                except Exception:  # noqa: BLE001 - optional dependency
+                    _MAGIKA_FAILED = True
+                    return None, 0.0
+            result = _MAGIKA.identify_bytes(data)
         label = _probe(
             result, ("prediction", "output", "label"), ("output", "ct_label"), ("output", "label")
         )

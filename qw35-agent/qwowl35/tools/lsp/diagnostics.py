@@ -61,6 +61,31 @@ _EXT_TO_LSP_LANG: dict[str, str] = {
     ".dart": "dart",
 }
 
+# Magika content-type label → multilspy Language value. Content detection
+# (tools/compress/detect) runs first in supported_language; a confident label
+# here wins even over a known extension — mirroring that module's Magika-first
+# policy — so a mis- or un-extensioned file still reaches the right server. Note
+# Magika labels C# as "cs" (not "csharp"), and "tsx"/"jsx" are not Magika labels
+# (it returns "typescript"/"javascript"). Labels with no LSP backend are absent,
+# so they fall through to the extension map rather than mapping to nothing.
+_MAGIKA_TO_LSP_LANG: dict[str, str] = {
+    "python": "python",
+    "javascript": "javascript",
+    "typescript": "typescript",
+    "rust": "rust",
+    "go": "go",
+    "java": "java",
+    "ruby": "ruby",
+    "cs": "csharp",
+    "kotlin": "kotlin",
+    "dart": "dart",
+}
+
+# JavaScript-family extensions: files the TypeScript server checks but which are
+# untyped, so its *semantic* (type) diagnostics are false positives on valid,
+# runtime-correct code — see _drop_untyped_js_type_errors.
+_JS_FAMILY_EXTS = frozenset({".js", ".jsx", ".mjs", ".cjs"})
+
 # How long to wait for the first publishDiagnostics after didOpen before giving
 # up on the LSP answer (tree-sitter takes over for that check). Bounds the
 # per-edit latency a slow or silent server can add.
@@ -134,11 +159,29 @@ def is_enabled() -> bool:
     return _ENABLED
 
 
-def supported_language(path: str | Path) -> str | None:
-    """multilspy language for ``path``'s extension, or ``None`` (incl. disabled)."""
+def supported_language(path: str | Path, source: str | None = None) -> str | None:
+    """multilspy language for ``path``, or ``None`` (incl. disabled).
+
+    Content-first: when ``source`` is given, a confident Magika verdict picks
+    the language and wins even over a known extension (mirroring
+    tools/compress/detect's Magika-first policy), so a mis- or un-extensioned
+    file still reaches the right server. The extension map is the fallback —
+    used when ``source`` is absent, Magika is uninstalled/unsure, or its label
+    has no LSP backend. Never raises.
+    """
     try:
         if not _ENABLED:
             return None
+        if source:
+            # Local import: keep the optional Magika/compress dependency off the
+            # module-load path and out of the lsp→compress import cycle.
+            from tools.compress.detect import magika_label
+
+            label = magika_label(source)
+            if label is not None:
+                lang = _MAGIKA_TO_LSP_LANG.get(label)
+                if lang is not None:
+                    return lang
         return _EXT_TO_LSP_LANG.get(Path(path).suffix.lower())
     except Exception:  # noqa: BLE001 - never raise to callers
         return None
@@ -158,10 +201,12 @@ def lsp_check_file(
     failed, or no diagnostics arriving within the timeout.
     """
     try:
-        language = supported_language(path)
-        if language is None or not source:
+        if not source:
             return None
         if len(source.encode("utf-8", errors="replace")) > _MAX_SOURCE_BYTES:
+            return None
+        language = supported_language(path, source)
+        if language is None:
             return None
         abs_path = os.path.realpath(str(path))
         root_real = os.path.realpath(root)
@@ -178,7 +223,7 @@ def lsp_check_file(
         handle = _get_or_start(language, root_real)
         if handle.status != "ready":
             return None  # booting (this round falls back) or failed (cached)
-        return _run_check(handle, abs_path, root_real)
+        return _run_check(handle, abs_path, root_real, _drop_untyped_js_type_errors(path, source))
     except Exception:  # noqa: BLE001 - diagnostics are best-effort
         return None
 
@@ -352,7 +397,7 @@ def _make_handler(handle: _ServerHandle):
 
 
 def _run_check(
-    handle: _ServerHandle, abs_path: str, root: str
+    handle: _ServerHandle, abs_path: str, root: str, drop_ts_type_errors: bool = False
 ) -> tuple[list[tuple[int, int, str]], list[tuple[int, int, str]]] | None:
     """One serialized open → wait → settle → convert cycle against ``handle``."""
     relpath = os.path.relpath(abs_path, root)
@@ -383,7 +428,7 @@ def _run_check(
             handle.payloads = []
     if not payloads:
         return None
-    return _convert(payloads[-1])
+    return _convert(payloads[-1], drop_ts_type_errors)
 
 
 def _uri_matches(uri: str, target_abs_path: str) -> bool:
@@ -424,8 +469,45 @@ def _is_module_no_member(diag: dict, text: str) -> bool:
     return body.startswith("Module '")
 
 
+def _drop_untyped_js_type_errors(path: str | Path, source: str | None) -> bool:
+    """Whether the TypeScript server's *type* diagnostics on ``path`` are noise.
+
+    Plain JavaScript is untyped, so tsserver's semantic checks (``Property 'x'
+    does not exist``, ``not assignable``, ``possibly null`` …) fire on valid,
+    runtime-correct code — the exact false positives editors suppress by
+    defaulting ``checkJs`` off. True for .js/.jsx/.mjs/.cjs files that have NOT
+    opted into checking via a ``@ts-check`` pragma; .ts/.tsx are genuinely
+    typed and never suppressed. Syntax errors (TS 1xxx) are kept regardless —
+    they are true in any dialect (see :func:`_is_ts_semantic_code`).
+    """
+    try:
+        if Path(path).suffix.lower() not in _JS_FAMILY_EXTS:
+            return False
+        # `@ts-check` (line/block comment) is the file-level opt-in to JS type
+        # checking; when present the type diagnostics are intended, so keep them.
+        return "@ts-check" not in (source or "")[:2000]
+    except Exception:  # noqa: BLE001 - never raise to callers
+        return False
+
+
+def _is_ts_semantic_code(code: Any) -> bool:
+    """Whether a TypeScript diagnostic ``code`` is semantic (type) vs syntactic.
+
+    TS numbers syntax/parser errors in 1000–1999 (``';' expected`` …) — true in
+    any dialect, always kept — and type/semantic errors from 2000 up (2339
+    property-does-not-exist, 2322/2345 not-assignable, 18047 possibly-null …),
+    which are the untyped-JS false positives. Non-numeric/unknown codes are not
+    treated as semantic, so nothing is over-suppressed.
+    """
+    try:
+        return int(code) >= 2000
+    except (TypeError, ValueError):
+        return False
+
+
 def _convert(
     params: dict,
+    drop_ts_type_errors: bool = False,
 ) -> tuple[list[tuple[int, int, str]], list[tuple[int, int, str]]]:
     """Split an LSP publishDiagnostics payload into (errors, warnings).
 
@@ -434,17 +516,27 @@ def _convert(
     identically. Severity 1 (or missing — servers may omit it) is an error,
     2 a warning; hints/infos (3-4) are dropped. One targeted demotion:
     pylint's module-attribute no-member (see :func:`_is_module_no_member`)
-    lands as a warning regardless of the server's severity.
+    lands as a warning regardless of the server's severity. When
+    ``drop_ts_type_errors`` is set (untyped JS, see
+    :func:`_drop_untyped_js_type_errors`), TypeScript *semantic* diagnostics are
+    discarded entirely — they are false on untyped code — while its syntax
+    errors still pass through.
     """
     errors: list[tuple[int, int, str]] = []
     warnings: list[tuple[int, int, str]] = []
     for diag in params.get("diagnostics", []) or []:
         try:
+            source = diag.get("source")
+            if (
+                drop_ts_type_errors
+                and str(source or "").lower() == "typescript"
+                and _is_ts_semantic_code(diag.get("code"))
+            ):
+                continue
             start = diag.get("range", {}).get("start", {})
             line = int(start.get("line", 0)) + 1
             col = int(start.get("character", 0)) + 1
             text = " ".join(str(diag.get("message", "")).split())
-            source = diag.get("source")
             message = f"line {line}, col {col}: {text}"
             if source:
                 message = f"{message} ({source})"

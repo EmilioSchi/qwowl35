@@ -150,7 +150,10 @@ def _lsp_result(path: str | Path, source: str):
     try:
         from ..lsp import lsp_check_file, supported_language
 
-        language = supported_language(path)
+        # Content-first (same source lsp_check_file re-detects on), so a file
+        # whose extension is unsupported but whose content is a supported
+        # language still routes to LSP.
+        language = supported_language(path, source)
         if language is None:
             return None
         result = lsp_check_file(path, source, _WORKSPACE_ROOT)
