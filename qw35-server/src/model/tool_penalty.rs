@@ -38,6 +38,16 @@ impl ToolCallPenaltyGuard {
         self.active
     }
 
+    /// Arm the guard as if the opening tag had been emitted — used when the
+    /// `<tool_call>` opening is a forced prompt prefix (prefilled, never
+    /// sampled), so the decode loop never observes its token id. The model's
+    /// own `</tool_call>` disarms it as usual.
+    pub(super) fn arm(&mut self) {
+        if self.open.is_some() {
+            self.active = true;
+        }
+    }
+
     /// Observe an emitted token (sampled or forced) and update the state.
     pub(super) fn observe(&mut self, token: u32) {
         if Some(token) == self.open {

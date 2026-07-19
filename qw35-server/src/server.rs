@@ -1,4 +1,7 @@
-use crate::model::{ChatTurn, Engine, FinishReason, GenerateError, GenerateRequest, TokenLimit};
+use crate::model::{
+    ChatTurn, Engine, FinishReason, GenerateError, GenerateRequest, SessionKind, TokenLimit,
+};
+use crate::reranker::RerankEngine;
 use crate::toolcall::{self, AssistantEvent, ParsedAssistantOutput};
 use axum::extract::{Path, State};
 use axum::http::header;
@@ -65,6 +68,13 @@ struct ChatRequest {
     /// chunks, instead of buffering each call to one delta at its end.
     #[serde(default)]
     stream_tool_call_xml: Option<bool>,
+    /// qw35 extension (sent by qwowl35): which GPU session to run on.
+    /// "main" (default) is the long-lived pipeline lineage with the
+    /// checkpoint stack; "scratch" and "plan" are small auxiliary runtimes
+    /// so short interludes (judge/editor) and the planner's persistent
+    /// context never clobber each other's KV rows or the main lineage.
+    #[serde(default)]
+    qw35_session: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -436,8 +446,12 @@ fn into_generate_request(
         None => Vec::new(),
     };
     let tool_choice = toolcall::parse_tool_choice(req.tool_choice.as_ref());
-    if let Some(block) = toolcall::render_tools_system_block(&tool_defs, &tool_choice) {
-        prepend_system_block(&mut messages, &block);
+    let mut tools_advertised = false;
+    if tool_choice != toolcall::ToolChoice::None {
+        if let Some(block) = toolcall::render_tools_system_block(&tool_defs) {
+            prepend_system_block(&mut messages, &block);
+            tools_advertised = true;
+        }
     }
     if let Some(format) = &req.response_format {
         match format
@@ -476,6 +490,19 @@ fn into_generate_request(
         })
         // No thinking signal at all → fall back to the server preset default.
         .unwrap_or(defaults.enable_thinking);
+    // A named tool_choice hard-forces the call: the `<tool_call>\n
+    // <function=X>\n` opening is injected right after the generation header,
+    // which requires the closed-think header — the forced turn fills
+    // parameters, it does not reason. Thinking is therefore off for it (this
+    // also keeps the stream parser out of its `Thinking` start state and
+    // zeroes the think budget).
+    let forced_tool_prefix = toolcall::forced_call_prefix(&tool_choice);
+    // Parse `<tool_call>` XML only when the request advertised tools; without
+    // them the XML passes through as content so plain-text clients see it.
+    // A named tool_choice without tools still forces a server-injected call
+    // opening into the text stream, so parsing must stay on to reassemble it.
+    let parse_tool_calls = tools_advertised || forced_tool_prefix.is_some();
+    let enable_thinking = enable_thinking && forced_tool_prefix.is_none();
     let preserve_thinking = req
         .preserve_thinking
         .or_else(|| template_kwargs.and_then(|kwargs| kwargs.preserve_thinking))
@@ -513,7 +540,22 @@ fn into_generate_request(
         // carry reasoning_content; tool-call markers pass through always.
         emit_reasoning: enable_thinking,
         stream_tool_call_xml: req.stream_tool_call_xml.unwrap_or(false),
+        parse_tool_calls,
+        tool_choice_enforcement: toolcall::enforcement_suffix(&tool_choice),
+        forced_tool_prefix,
+        session: parse_session_kind(req.qw35_session.as_deref())?,
     })
+}
+
+fn parse_session_kind(value: Option<&str>) -> Result<SessionKind, String> {
+    match value {
+        None | Some("main") => Ok(SessionKind::Main),
+        Some("scratch") => Ok(SessionKind::Scratch),
+        Some("plan") => Ok(SessionKind::Plan),
+        Some(other) => Err(format!(
+            "invalid qw35_session {other:?}: expected \"main\", \"scratch\", or \"plan\""
+        )),
+    }
 }
 
 /// Maps a `reasoning_effort` level to a thinking-token budget: the number of
@@ -613,7 +655,7 @@ fn into_responses_generate_request(
     }
 
     let model = req.model.as_deref().unwrap_or(default_model).to_string();
-    let messages = responses_input_to_chat_turns(req)?;
+    let (messages, tools_advertised) = responses_input_to_chat_turns(req)?;
     if messages.is_empty() {
         return Err("input must contain at least one message".to_string());
     }
@@ -623,6 +665,14 @@ fn into_responses_generate_request(
         None => defaults.max_tokens,
     };
     let enable_thinking = responses_enable_thinking(req, defaults);
+    // Same hard enforcement as the chat endpoint: a named tool_choice
+    // injects the call opening, which requires the closed-think header.
+    let forced_tool_prefix =
+        toolcall::forced_call_prefix(&toolcall::parse_tool_choice(req.tool_choice.as_ref()));
+    // Same gate as the chat endpoint: no tools advertised (and no forced call
+    // opening) means `<tool_call>` XML passes through as content.
+    let parse_tool_calls = tools_advertised || forced_tool_prefix.is_some();
+    let enable_thinking = enable_thinking && forced_tool_prefix.is_none();
     let thinking_budget = thinking_budget_for(
         req.reasoning
             .as_ref()
@@ -658,10 +708,20 @@ fn into_responses_generate_request(
         emit_reasoning: enable_thinking,
         // Raw tool-call streaming is a chat-completions extension only.
         stream_tool_call_xml: false,
+        parse_tool_calls,
+        tool_choice_enforcement: toolcall::enforcement_suffix(&toolcall::parse_tool_choice(
+            req.tool_choice.as_ref(),
+        )),
+        forced_tool_prefix,
+        // The responses endpoint has no qw35_session extension; it always
+        // runs on the main session.
+        session: SessionKind::Main,
     })
 }
 
-fn responses_input_to_chat_turns(req: &ResponsesRequest) -> Result<Vec<ChatTurn>, String> {
+/// Returns the chat turns plus whether a `# Tools` block was prepended (the
+/// request advertised tools), which gates tool-call parsing of the output.
+fn responses_input_to_chat_turns(req: &ResponsesRequest) -> Result<(Vec<ChatTurn>, bool), String> {
     let mut messages = Vec::new();
     if let Some(instructions) = req.instructions.as_deref() {
         if !instructions.trim().is_empty() {
@@ -691,11 +751,15 @@ fn responses_input_to_chat_turns(req: &ResponsesRequest) -> Result<Vec<ChatTurn>
         None => Vec::new(),
     };
     let tool_choice = toolcall::parse_tool_choice(req.tool_choice.as_ref());
-    if let Some(block) = toolcall::render_tools_system_block(&tool_defs, &tool_choice) {
-        prepend_system_block(&mut messages, &block);
+    let mut tools_advertised = false;
+    if tool_choice != toolcall::ToolChoice::None {
+        if let Some(block) = toolcall::render_tools_system_block(&tool_defs) {
+            prepend_system_block(&mut messages, &block);
+            tools_advertised = true;
+        }
     }
 
-    Ok(messages)
+    Ok((messages, tools_advertised))
 }
 
 fn append_response_item_as_chat_turn(
@@ -920,18 +984,20 @@ pub async fn serve(
     host: &str,
     port: u16,
     engine: Arc<Engine>,
+    reranker: Option<Arc<RerankEngine>>,
     defaults: GenerationDefaults,
 ) -> Result<(), String> {
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|err| format!("failed to listen on {addr}: {err}"))?;
-    serve_listener(listener, engine, defaults, None).await
+    serve_listener(listener, engine, reranker, defaults, None).await
 }
 
 pub async fn serve_listener(
     listener: tokio::net::TcpListener,
     engine: Arc<Engine>,
+    reranker: Option<Arc<RerankEngine>>,
     defaults: GenerationDefaults,
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<(), String> {
@@ -940,7 +1006,7 @@ pub async fn serve_listener(
         .map_err(|err| format!("failed to read listener address: {err}"))?;
     eprintln!("qw35: listening on http://{addr}");
 
-    let app = build_router(engine, defaults);
+    let app = build_router(engine, reranker, defaults);
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             match shutdown {
@@ -964,8 +1030,16 @@ pub async fn serve_listener(
         .map_err(|err| format!("server error: {err}"))
 }
 
-fn build_router(engine: Arc<Engine>, defaults: GenerationDefaults) -> Router {
-    let state = AppState { engine, defaults };
+fn build_router(
+    engine: Arc<Engine>,
+    reranker: Option<Arc<RerankEngine>>,
+    defaults: GenerationDefaults,
+) -> Router {
+    let state = AppState {
+        engine,
+        reranker,
+        defaults,
+    };
 
     Router::new()
         .route("/health", get(health))
@@ -973,6 +1047,7 @@ fn build_router(engine: Arc<Engine>, defaults: GenerationDefaults) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/models/{model}", get(model))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/rerank", post(rerank))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/input_tokens", post(responses_input_tokens))
         .layer(
@@ -987,6 +1062,10 @@ fn build_router(engine: Arc<Engine>, defaults: GenerationDefaults) -> Router {
 #[derive(Clone)]
 struct AppState {
     engine: Arc<Engine>,
+    /// The optional second model: loaded only with --reranker-model; absent →
+    /// /v1/rerank answers 501 inference_unavailable and everything else is
+    /// untouched.
+    reranker: Option<Arc<RerankEngine>>,
     defaults: GenerationDefaults,
 }
 
@@ -1014,6 +1093,16 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         serde_json::json!({"enabled": false})
     };
 
+    let reranker = match &state.reranker {
+        Some(reranker) => serde_json::json!({
+            "loaded": true,
+            "model": reranker.model_name(),
+            "ctx_size": reranker.ctx_size(),
+            "ffn": reranker.ffn_label(),
+        }),
+        None => serde_json::json!({"loaded": false}),
+    };
+
     Json(serde_json::json!({
         "status": "ok",
         "model": engine.model_id(),
@@ -1033,6 +1122,7 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
             "execution_blockers": plan.execution_blockers,
         },
         "warmup": warmup,
+        "reranker": reranker,
     }))
 }
 
@@ -1123,6 +1213,96 @@ async fn chat_completions(
     }
 }
 
+// ── Rerank endpoint ────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct RerankRequest {
+    /// Accepted for OpenAI-style client compatibility; the single loaded
+    /// reranker always serves the request.
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>,
+    query: String,
+    documents: Vec<String>,
+    /// Task instruction for the Qwen3-Reranker template; omitted → the
+    /// model's default web-search instruction.
+    #[serde(default)]
+    instruction: Option<String>,
+    /// Truncates only the sorted `results` list; `scores` always covers every
+    /// input document.
+    #[serde(default)]
+    top_n: Option<usize>,
+}
+
+async fn rerank(
+    State(state): State<AppState>,
+    Json(req): Json<RerankRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let Some(reranker) = state.reranker.clone() else {
+        return Err(AppError::inference_unavailable(
+            "no reranker model is loaded; start the server with --reranker-model FILE",
+        ));
+    };
+
+    let top_n = req.top_n;
+    let (scores, timings) = tokio::task::spawn_blocking(move || {
+        reranker.score(&req.query, &req.documents, req.instruction.as_deref())
+    })
+    .await
+    .map_err(|err| AppError::inference_unavailable(&format!("rerank task failed: {err}")))??;
+
+    let order = rank_order(&scores, top_n);
+    let results: Vec<serde_json::Value> = order
+        .iter()
+        .map(|&index| {
+            serde_json::json!({"index": index, "relevance_score": scores[index]})
+        })
+        .collect();
+
+    let prompt_eval_ms = timings.prompt_eval_duration.as_secs_f64() * 1000.0;
+    let reranker_name = state
+        .reranker
+        .as_ref()
+        .map(|r| r.model_name().to_string())
+        .unwrap_or_default();
+    Ok(Json(serde_json::json!({
+        "object": "rerank",
+        "model": reranker_name,
+        "scores": scores,
+        "results": results,
+        "qw35_timings": {
+            "total_ms": timings.total_duration.as_secs_f64() * 1000.0,
+            "render_ms": timings.render_duration.as_secs_f64() * 1000.0,
+            "tokenize_ms": timings.tokenize_duration.as_secs_f64() * 1000.0,
+            "prompt_eval_ms": prompt_eval_ms,
+            "prompt_eval_count": timings.prompt_eval_count,
+            "prompt_eval_tps": rate(timings.prompt_eval_count, timings.prompt_eval_duration),
+            "docs": timings.docs,
+            "prefix_reused_tokens": timings.prefix_reused_tokens,
+            "per_doc_ms": timings
+                .per_doc_duration
+                .iter()
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .collect::<Vec<f64>>(),
+        },
+    })))
+}
+
+/// Document indices sorted by descending score (ties keep input order),
+/// truncated to `top_n` when given.
+fn rank_order(scores: &[f32], top_n: Option<usize>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by(|a, b| {
+        scores[*b]
+            .partial_cmp(&scores[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if let Some(top_n) = top_n {
+        order.truncate(top_n);
+    }
+    order
+}
+
 async fn responses(
     State(state): State<AppState>,
     Json(req): Json<ResponsesRequest>,
@@ -1163,6 +1343,7 @@ async fn plain_response(engine: &Engine, request: &GenerateRequest) -> Result<Re
     let parsed = toolcall::parse_assistant_text(
         &generation.text,
         request.emit_reasoning && request.enable_thinking,
+        request.parse_tool_calls,
     );
     let finish_reason = chat_finish_reason(generation.finish_reason, !parsed.tool_calls.is_empty());
     let id = response_id("chatcmpl");
@@ -1272,6 +1453,7 @@ async fn stream_response(
         let mut parser = toolcall::AssistantStreamParser::with_options(
             request2.emit_reasoning && request2.enable_thinking,
             request2.stream_tool_call_xml,
+            request2.parse_tool_calls,
         );
         let mut emitter = ChatStreamEmitter {
             tx: &tx2,
@@ -1284,10 +1466,12 @@ async fn stream_response(
         let result = engine_arc.generate_stream_with_progress(
             &request2,
             |chunk| emitter.send_events(parser.feed(chunk)),
-            |processed, total| {
+            |processed, total, session_ctx| {
                 // Prompt-processing progress as a choice-less chunk. OpenAI
                 // clients ignore the empty choices and the qw35_prefill field;
-                // our TUI maps it to the mascot's prefill percentage.
+                // our TUI maps it to the mascot's prefill percentage and
+                // sizes its context display against session_ctx (the serving
+                // session's live, possibly just-grown ceiling).
                 let percent = if total > 0 {
                     processed as f64 / total as f64 * 100.0
                 } else {
@@ -1303,6 +1487,7 @@ async fn stream_response(
                         "processed": processed,
                         "total": total,
                         "percent": percent,
+                        "session_ctx": session_ctx,
                     },
                 }))));
             },
@@ -1485,6 +1670,7 @@ async fn responses_plain_response(
     let parsed = toolcall::parse_assistant_text(
         &generation.text,
         request.emit_reasoning && request.enable_thinking,
+        request.parse_tool_calls,
     );
     let id = response_id("resp");
     let created = now();
@@ -1559,8 +1745,11 @@ async fn responses_stream_response(
             }),
         );
 
-        let mut parser =
-            toolcall::AssistantStreamParser::new(request.emit_reasoning && request.enable_thinking);
+        let mut parser = toolcall::AssistantStreamParser::with_options(
+            request.emit_reasoning && request.enable_thinking,
+            false,
+            request.parse_tool_calls,
+        );
         let result = engine.generate_stream(&request, |chunk| {
             for event in parser.feed(chunk) {
                 state.handle(event)?;
@@ -2083,6 +2272,9 @@ fn timings_json(timings: &crate::model::GenerationTimings) -> serde_json::Value 
         "prompt_eval_tps": rate(timings.prompt_eval_count, timings.prompt_eval_duration),
         "cached_prompt_tokens": timings.cached_prompt_tokens,
         "session_path": timings.session_path.as_str(),
+        "session": timings.session.as_str(),
+        "session_ctx": timings.session_ctx,
+        "checkpoint_depth": timings.checkpoint_depth,
         "prefill_chunk": timings.prefill_chunk,
         "prefill_path": timings.prefill_path.as_str(),
         "eval_ms": duration_ms(timings.eval_duration),
@@ -2208,5 +2400,13 @@ mod thinking_budget_tests;
 mod mode_tests;
 
 #[cfg(test)]
+#[path = "tests/server_rerank.rs"]
+mod rerank_tests;
+
+#[cfg(test)]
 #[path = "tests/server_enable_thinking.rs"]
 mod enable_thinking_precedence_tests;
+
+#[cfg(test)]
+#[path = "tests/server_tool_gate.rs"]
+mod tool_call_gate_tests;

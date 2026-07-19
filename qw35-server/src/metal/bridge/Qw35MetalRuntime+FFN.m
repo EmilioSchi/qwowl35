@@ -37,10 +37,24 @@
 #pragma mark - Per-operation encoders
 // ---------------------------------------------------------------------------
 
+/// Kernel names for the token-embedding row gather, selected by the
+/// embedding tensor's quantization (q4_k on the 9B, q8_0 on the reranker).
+static NSString *qw35_get_row_kernel(uint32_t type_id, BOOL batch, NSError **error) {
+    switch (type_id) {
+        case 8:  return batch ? @"qw35_get_rows_q8_0_f32" : @"qw35_get_row_q8_0_f32";
+        case 12: return batch ? @"qw35_get_rows_q4_k_f32" : @"qw35_get_row_q4_k_f32";
+        default:
+            if (error) *error = qw35_error(@"unsupported token_embd.weight type %u", type_id);
+            return nil;
+    }
+}
+
 - (BOOL)encodeEmbedding:(id<MTLComputeCommandEncoder>)enc
                   token:(uint32_t)token
                   error:(NSError **)error {
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_get_row_q4_k_f32" error:error];
+    NSString *kernel = qw35_get_row_kernel(_tokenEmbd.type_id, NO, error);
+    if (!kernel) return NO;
+    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:kernel error:error];
     if (!pipe) return NO;
     int64_t k = (int64_t)_h.embedding_length;
     [enc setComputePipelineState:pipe];
@@ -57,7 +71,9 @@
                        error:(NSError **)error {
     Qw35Tensor *embd = [self tensorNamed:@"token_embd.weight" error:error];
     if (!embd) return NO;
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_get_rows_q4_k_f32" error:error];
+    NSString *kernel = qw35_get_row_kernel(embd.type_id, YES, error);
+    if (!kernel) return NO;
+    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:kernel error:error];
     if (!pipe) return NO;
     int64_t k = (int64_t)_h.embedding_length;
     [enc setComputePipelineState:pipe];
@@ -173,7 +189,8 @@
     BOOL q8_geometry = NO;
     switch (w.type_id) {
         case 8:
-            kernel = @"qw35_decode_matmul_q8_0_f32";
+            kernel = residual ? @"qw35_decode_matmul_q8_0_residual_f32"
+                              : @"qw35_decode_matmul_q8_0_f32";
             block_elems = 32;
             q8_geometry = YES;
             break;
@@ -204,7 +221,7 @@
             if (error) *error = qw35_error(@"unsupported tensor type %u for %@", w.type_id, w.name);
             return NO;
     }
-    if (residual && w.type_id != 12 && w.type_id != 14 && w.type_id != 100 && w.type_id != 101) {
+    if (residual && w.type_id != 8 && w.type_id != 12 && w.type_id != 14 && w.type_id != 100 && w.type_id != 101) {
         if (error) *error = qw35_error(@"no residual matvec kernel for tensor type %u (%@)", w.type_id, w.name);
         return NO;
     }

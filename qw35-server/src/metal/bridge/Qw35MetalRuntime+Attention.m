@@ -14,6 +14,7 @@
                                      kvHeads:(int)_h.attention_kv_heads
                                      headDim:(int)_h.attention_key_length
                                      ropeDim:(int)_h.rope_dimension_count
+                                     hasGate:_h.attn_gate != 0
                                        error:error];
 }
 

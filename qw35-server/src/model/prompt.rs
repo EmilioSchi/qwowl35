@@ -6,8 +6,17 @@ pub(super) fn render_qwen35_chat_prompt(
     messages: &[ChatTurn],
     enable_thinking: bool,
     preserve_thinking: bool,
+    enforcement: Option<&str>,
+    forced_prefix: Option<&str>,
 ) -> String {
-    render_qwen35_chat_prompt_with_boundary(messages, enable_thinking, preserve_thinking).0
+    render_qwen35_chat_prompt_with_boundary(
+        messages,
+        enable_thinking,
+        preserve_thinking,
+        enforcement,
+        forced_prefix,
+    )
+    .0
 }
 
 /// Renders the chat prompt and returns two byte boundaries:
@@ -22,13 +31,30 @@ pub(super) fn render_qwen35_chat_prompt(
 /// Future renders of an extended conversation reproduce the stable prefix
 /// verbatim, while the header (`<|im_start|>assistant\n<think>...`) is not
 /// reproduced for historical assistant turns.
+///
+/// `enforcement` (the tool_choice must-call instruction) renders as a user
+/// turn AFTER `stable_len`, in the same volatile region as the generation
+/// header: it applies to this generation only and is never reproduced by
+/// future prompts, so it cannot perturb the session-cache checkpoint prefix.
+///
+/// `forced_prefix` (the named-tool_choice `<tool_call>\n<function=X>\n`
+/// opening) renders after the generation header, in the same volatile
+/// region. A forced turn always gets the closed-think header regardless of
+/// `enable_thinking` — an open `<think>` would swallow the injected call.
 pub(super) fn render_qwen35_chat_prompt_with_boundary(
     messages: &[ChatTurn],
     enable_thinking: bool,
     preserve_thinking: bool,
+    enforcement: Option<&str>,
+    forced_prefix: Option<&str>,
 ) -> (String, usize) {
-    let (prompt, stable_len, _preamble_len) =
-        render_qwen35_chat_prompt_with_boundaries(messages, enable_thinking, preserve_thinking);
+    let (prompt, stable_len, _preamble_len) = render_qwen35_chat_prompt_with_boundaries(
+        messages,
+        enable_thinking,
+        preserve_thinking,
+        enforcement,
+        forced_prefix,
+    );
     (prompt, stable_len)
 }
 
@@ -36,6 +62,8 @@ pub(super) fn render_qwen35_chat_prompt_with_boundaries(
     messages: &[ChatTurn],
     enable_thinking: bool,
     preserve_thinking: bool,
+    enforcement: Option<&str>,
+    forced_prefix: Option<&str>,
 ) -> (String, usize, usize) {
     let mut out = String::new();
     let mut num_sys = 0usize;
@@ -102,11 +130,19 @@ pub(super) fn render_qwen35_chat_prompt_with_boundaries(
     }
 
     let stable_len = out.len();
+    if let Some(instruction) = enforcement {
+        out.push_str("<|im_start|>user\n");
+        out.push_str(instruction.trim());
+        out.push_str("<|im_end|>\n");
+    }
     out.push_str("<|im_start|>assistant\n");
-    if enable_thinking {
+    if enable_thinking && forced_prefix.is_none() {
         out.push_str("<think>\n");
     } else {
         out.push_str("<think>\n\n</think>\n\n");
+    }
+    if let Some(prefix) = forced_prefix {
+        out.push_str(prefix);
     }
     (out, stable_len, preamble_len)
 }

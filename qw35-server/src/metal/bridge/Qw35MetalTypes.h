@@ -48,6 +48,14 @@ typedef struct {
     // window <= 0 means full attention; sink = leading tokens always attended.
     int32_t  attn_window;
     int32_t  attn_sink;
+    // 1 when attention Q projections carry the fused sigmoid output gate
+    // (Qwen3.5 hybrid: attn_q rows = heads*head_dim*2); 0 = plain ungated
+    // attention (dense Qwen3, e.g. the reranker).
+    uint32_t attn_gate;
+    // Classification-head outputs when the model carries cls.output.weight
+    // instead of a vocab-sized output.weight (rank-converted rerankers).
+    // 0 = normal LM output head. Must stay the LAST fields (ABI append-only).
+    uint32_t n_cls_out;
 } qw35_metal_hparams;
 
 /// Output-head mode for an eval call.

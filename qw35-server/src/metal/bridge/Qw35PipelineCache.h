@@ -21,12 +21,15 @@
                                             error:(NSError **)error;
 
 /// Get (or compile) an attention pipeline specialized on the model shape
-/// via function constants (indices 750-753).
+/// via function constants (indices 750-754). hasGate selects the fused
+/// sigmoid output gate (Qwen3.5 hybrid attention, Q stride head_dim*2)
+/// vs plain ungated attention (dense Qwen3).
 - (id<MTLComputePipelineState>)attnPipelineNamed:(NSString *)name
                                            heads:(int)heads
                                          kvHeads:(int)kvHeads
                                          headDim:(int)headDim
                                          ropeDim:(int)ropeDim
+                                         hasGate:(BOOL)hasGate
                                            error:(NSError **)error;
 
 @end

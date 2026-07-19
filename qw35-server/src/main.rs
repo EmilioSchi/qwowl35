@@ -1,8 +1,9 @@
 use qw35_server::metal::KvCacheType;
 use qw35_server::model::{
-    validate_prefill_chunk, Engine, EngineConfig, TokenLimit, DEFAULT_MODEL_ID,
-    DEFAULT_PREFILL_CHUNK,
+    validate_prefill_chunk, Engine, EngineConfig, TokenLimit, DEFAULT_CHECKPOINT_CAP,
+    DEFAULT_MODEL_ID, DEFAULT_PREFILL_CHUNK, DEFAULT_SCRATCH_CTX,
 };
+use qw35_server::reranker::{RerankEngine, RerankerConfig, DEFAULT_RERANKER_CTX};
 use qw35_server::server::{self, GenerationDefaults};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -13,6 +14,11 @@ use std::sync::Arc;
 // one place so the `Config` default and the missing-model helper can't drift.
 const DEFAULT_MODEL_PATH: &str = ".gguf/Qwowl3.5-9B.gguf";
 const DOWNLOAD_SCRIPT: &str = "download_model.sh";
+// Auto-loaded reranker (POST /v1/rerank) when present on disk: the RAW q8_0
+// rank conversion, deliberately not the GF4 cook (rerank is prefill-bound —
+// GF4 gains no speed there and costs ranking fidelity on a 0.6B; see
+// MODEL_CARD). --reranker-model overrides; --no-reranker disables.
+const DEFAULT_RERANKER_PATH: &str = ".gguf/qwen3-reranker-0.6b-q8_0.gguf";
 
 // 128K is the throughput sweet spot: decode holds full speed (~19.3 tok/s) and
 // time-to-first-token stays under ~0.5 s, whereas the full 262144 window collapses
@@ -47,6 +53,8 @@ fn run(config: Config) -> ExitCode {
         prefill_chunk: config.prefill_chunk,
         kv_cache_type: config.kv_cache_type,
         session_cache: config.session_cache,
+        checkpoint_cap: config.checkpoint_cap,
+        scratch_ctx: config.scratch_ctx,
         // Decode-time sliding-window attention, passed straight to the Metal
         // runtime over the FFI (no env vars). Off by default (full attention).
         attn_window: config.attn_window,
@@ -67,6 +75,34 @@ fn run(config: Config) -> ExitCode {
             eprintln!("qw35: failed to open engine: {err}");
             return ExitCode::FAILURE;
         }
+    };
+
+    // Optional second model: the reranker, its own engine over its own mmap.
+    // An explicit --reranker-model must load or startup fails; otherwise the
+    // default reranker GGUF is picked up automatically when it exists on disk
+    // (skip with --no-reranker). Without a reranker /v1/rerank answers 501.
+    let reranker_path = match &config.reranker_model {
+        Some(path) => Some(path.clone()),
+        None if !config.no_reranker && Path::new(DEFAULT_RERANKER_PATH).exists() => {
+            Some(PathBuf::from(DEFAULT_RERANKER_PATH))
+        }
+        None => None,
+    };
+    let reranker = match &reranker_path {
+        Some(path) => match RerankEngine::open(RerankerConfig {
+            model_path: path.clone(),
+            ctx_size: config.reranker_ctx,
+            prefill_chunk: config.prefill_chunk,
+            kv_cache_type: config.kv_cache_type,
+            verbose: config.verbose,
+        }) {
+            Ok(reranker) => Some(Arc::new(reranker)),
+            Err(err) => {
+                eprintln!("qw35: failed to open reranker: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
     };
 
     let summary = engine.metadata_summary();
@@ -92,10 +128,28 @@ fn run(config: Config) -> ExitCode {
             config.attn_window, config.attn_sink
         );
     }
+    match &reranker {
+        Some(reranker) => eprintln!(
+            "  reranker={} (ctx={}, ffn={})",
+            reranker.model_name(),
+            reranker.ctx_size(),
+            reranker.ffn_label()
+        ),
+        None => eprintln!("  reranker=off"),
+    }
     eprintln!(
         "  session_cache={}",
         if engine.session_cache() { "on" } else { "off" }
     );
+    if engine.session_cache() {
+        let snapshot = engine.state_snapshot_size();
+        eprintln!(
+            "  checkpoints={} (snapshot {:.1} MiB each, {:.1} MiB max)",
+            engine.checkpoint_cap(),
+            snapshot as f64 / 1024.0 / 1024.0,
+            (engine.checkpoint_cap() * snapshot) as f64 / 1024.0 / 1024.0
+        );
+    }
     eprintln!("  temperature={}", gen.temperature);
     eprintln!("  top_p={}", gen.top_p);
     eprintln!("  top_k={}", gen.top_k);
@@ -159,6 +213,7 @@ fn run(config: Config) -> ExitCode {
         &config.host,
         config.port,
         engine,
+        reranker,
         config.generation_defaults,
     )) {
         Ok(()) => ExitCode::SUCCESS,
@@ -177,12 +232,17 @@ enum Command {
 struct Config {
     model_path: PathBuf,
     model_id: String,
+    reranker_model: Option<PathBuf>,
+    no_reranker: bool,
+    reranker_ctx: u32,
     host: String,
     port: u16,
     ctx_size: u32,
     prefill_chunk: u32,
     kv_cache_type: KvCacheType,
     session_cache: bool,
+    checkpoint_cap: usize,
+    scratch_ctx: u32,
     attn_window: i32,
     attn_sink: i32,
     generation_defaults: GenerationDefaults,
@@ -258,12 +318,17 @@ impl Config {
         let mut config = Config {
             model_path: PathBuf::from(DEFAULT_MODEL_PATH),
             model_id: DEFAULT_MODEL_ID.to_string(),
+            reranker_model: None,
+            no_reranker: false,
+            reranker_ctx: DEFAULT_RERANKER_CTX,
             host: "127.0.0.1".to_string(),
             port: 8080,
             ctx_size: DEFAULT_CTX_SIZE,
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
             kv_cache_type: KvCacheType::Q8_0,
             session_cache: true,
+            checkpoint_cap: DEFAULT_CHECKPOINT_CAP,
+            scratch_ctx: DEFAULT_SCRATCH_CTX,
             attn_window: 0,
             attn_sink: 0,
             generation_defaults: GenerationDefaults::default(),
@@ -284,6 +349,13 @@ impl Config {
                 "-h" | "--help" => return Ok(Command::Help),
                 "-m" | "--model" => config.model_path = PathBuf::from(need_arg(&arg, &mut args)?),
                 "--model-id" => config.model_id = need_arg(&arg, &mut args)?,
+                "--reranker-model" => {
+                    config.reranker_model = Some(PathBuf::from(need_arg(&arg, &mut args)?));
+                }
+                "--no-reranker" => config.no_reranker = true,
+                "--reranker-ctx" => {
+                    config.reranker_ctx = parse_u32(&arg, &need_arg(&arg, &mut args)?)?;
+                }
                 "--host" => config.host = need_arg(&arg, &mut args)?,
                 "--port" => {
                     config.port = parse_u16(&arg, &need_arg(&arg, &mut args)?)?;
@@ -301,6 +373,12 @@ impl Config {
                     })?;
                 }
                 "--no-session-cache" => config.session_cache = false,
+                "--checkpoints" => {
+                    config.checkpoint_cap = parse_u32(&arg, &need_arg(&arg, &mut args)?)? as usize;
+                }
+                "--scratch-ctx" => {
+                    config.scratch_ctx = parse_u32(&arg, &need_arg(&arg, &mut args)?)?;
+                }
                 "--attn-window" => {
                     config.attn_window = parse_u32(&arg, &need_arg(&arg, &mut args)?)? as i32;
                 }
@@ -415,6 +493,8 @@ fn arg_hint(flag: &str) -> &'static str {
     match flag {
         "-m" | "--model" => "a GGUF model file path",
         "--model-id" => "the served OpenAI model id (e.g. qwen35-9b)",
+        "--reranker-model" => "a reranker GGUF file path (e.g. .gguf/Qwowl3-Reranker-0.6B.gguf)",
+        "--reranker-ctx" => "the reranker context size in tokens (e.g. 2048)",
         "--host" => "a bind address (e.g. 127.0.0.1)",
         "--port" => "a port number (e.g. 8080)",
         "-c" | "--ctx" | "--num-ctx" => "a context size in tokens (e.g. 120000)",
@@ -480,12 +560,22 @@ Model and runtime:\n\
       GGUF model path. Default: .gguf/Qwowl3.5-9B.gguf\n\
   --model-id ID\n\
       Served OpenAI model id. Default: qwen35-9b\n\
+  --reranker-model FILE\n\
+      Qwen3-Reranker GGUF (rank conversion with a yes/no classification head) served alongside the main model on POST /v1/rerank. When omitted, .gguf/qwen3-reranker-0.6b-q8_0.gguf is auto-loaded if it exists (fetch it with ./download_model.sh reranker); with no reranker at all /v1/rerank answers 501 inference_unavailable.\n\
+  --no-reranker\n\
+      Skip the reranker entirely, including the auto-load of the default reranker GGUF.\n\
+  --reranker-ctx N\n\
+      Context size allocated for the reranker session (one (query, document) prompt must fit; longer documents are truncated). Default: 2048\n\
   -c, --ctx N, --num-ctx N\n\
       Context size allocated by the inference backend. Default: 131072 (128K — the throughput sweet spot: full decode speed and sub-0.5s TTFT; ~2.1 GiB of q8_0 KV cache). Pass --ctx 262144 for the full trained window (collapses prefill to ~2.5 tok/s and TTFT to ~3s). With --kv-cache-type f16 the cache is ~1.9x larger — pass a smaller --ctx on memory-constrained machines.\n\
   --kv-cache-type TYPE\n\
       Attention KV cache storage: q8_0 (8.5 bits/element blocks, default) or f16. q8_0 is byte-identical to f16 output in testing at fp16-parity decode speed and ~1.9x less memory; f16 is the lossless reference, kept for KV-cache comparisons.\n\
   --no-session-cache\n\
       Disable the session prefix cache. By default the server keeps the KV cache and SSM state alive between requests and re-evaluates only the new suffix when a prompt extends the previous conversation.\n\
+  --checkpoints N\n\
+      Max recurrent-state snapshots kept at prompt history boundaries for prefix rewinds (the session checkpoint stack). Each costs ~state-size bytes of host RAM (tens of MB, printed at startup). 1 = legacy single-checkpoint behavior; 0 = extend-or-reset only. Default: 8\n\
+  --scratch-ctx N\n\
+      Initial context size of the lazily-created scratch/plan GPU sessions (qw35_session=\"scratch\"/\"plan\" requests: standalone contexts like qwowl35's editor and planner that must not clobber the main session's KV rows and checkpoints). A session whose prompt outgrows it is grown on demand in 8192-token steps up to --ctx (the KV cache extends lazily, so unused ceiling costs nothing). 0 disables the aux sessions. Default: 16384\n\
   --attn-window N\n\
       Decode-time sliding-window attention for the 8 full-attention layers: attend only to the last N positions (plus --attn-sink leading tokens), bounding the per-token attention cost so decode tok/s stays FLAT across a long session instead of degrading with context (e.g. ~13 tok/s at any ctx vs ~10 at 8K / falling further). Default 0 = off (full attention). TRADE-OFF: the model loses exact recall of content older than the window in those layers (the DeltaNet layers carry only compressed long-range), so enable it only when sustained speed matters more than long-range recall. Suggested: 2048-4096.\n\
   --attn-sink N\n\
@@ -545,6 +635,7 @@ Supported endpoints:\n\
   GET  /v1/models\n\
   GET  /v1/models/{{model}}\n\
   POST /v1/chat/completions\n\
+  POST /v1/rerank            (needs the reranker model, auto-loaded when present; body: query, documents[], optional instruction/top_n)\n\
   POST /v1/responses\n\
   POST /v1/responses/input_tokens\n\
 \n\

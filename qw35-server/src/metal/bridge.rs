@@ -107,17 +107,28 @@ extern "C" {
     ) -> *mut c_void;
     fn qw35_metal_runtime_destroy(runtime: *mut c_void);
     fn qw35_metal_runtime_reset(runtime: *mut c_void, err: *mut i8, err_len: usize) -> i32;
-    fn qw35_metal_runtime_state_checkpoint_save(
+    fn qw35_metal_runtime_state_size(runtime: *mut c_void) -> u64;
+    fn qw35_metal_runtime_state_export(
         runtime: *mut c_void,
+        buf: *mut u8,
+        len: u64,
         err: *mut i8,
         err_len: usize,
     ) -> i32;
-    fn qw35_metal_runtime_state_checkpoint_restore(
+    fn qw35_metal_runtime_state_import(
         runtime: *mut c_void,
+        buf: *const u8,
+        len: u64,
         err: *mut i8,
         err_len: usize,
     ) -> i32;
     fn qw35_metal_runtime_sync(runtime: *mut c_void, err: *mut i8, err_len: usize) -> i32;
+    fn qw35_metal_runtime_set_ctx(
+        runtime: *mut c_void,
+        new_ctx: u32,
+        err: *mut i8,
+        err_len: usize,
+    ) -> i32;
     fn qw35_metal_runtime_set_attn_sink(runtime: *mut c_void, sink: i32);
     fn qw35_metal_runtime_eval_token(
         runtime: *mut c_void,
@@ -238,7 +249,9 @@ pub fn verify_native_qwen_kernels() -> Result<(), String> {
 pub struct MetalRuntime {
     #[cfg(target_os = "macos")]
     raw: NonNull<c_void>,
-    vocab_size: usize,
+    /// Length of the logits vector `copy_logits` returns: `n_cls_out` for a
+    /// classification-head model (reranker), else the full vocab size.
+    logits_len: usize,
 }
 
 unsafe impl Send for MetalRuntime {}
@@ -303,52 +316,54 @@ impl MetalRuntime {
             let raw = NonNull::new(raw).ok_or_else(|| c_string_from_i8(&err))?;
             Ok(Self {
                 raw,
-                vocab_size: vocab_size as usize,
+                logits_len: if hparams.n_cls_out > 0 {
+                    hparams.n_cls_out as usize
+                } else {
+                    vocab_size as usize
+                },
             })
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (gguf, hparams, ctx_size, prefill_chunk, kv_cache_type);
+            let _ = (gguf, ctx_size, prefill_chunk, kv_cache_type);
             Ok(Self {
-                vocab_size: vocab_size as usize,
+                logits_len: if hparams.n_cls_out > 0 {
+                    hparams.n_cls_out as usize
+                } else {
+                    vocab_size as usize
+                },
             })
         }
     }
 
-    /// Snapshot the SSM/conv recurrent state into the runtime's internal
-    /// checkpoint slot. KV cache rows are positional and need no snapshot.
-    pub fn state_checkpoint_save(&mut self) -> Result<(), String> {
+    /// Byte size of the SSM/conv recurrent state snapshot payload. The KV
+    /// cache is positional and needs no snapshot, so this is the complete
+    /// per-checkpoint cost.
+    pub fn state_size(&self) -> usize {
         #[cfg(target_os = "macos")]
         {
-            let mut err = vec![0i8; 1024];
-            let ok = unsafe {
-                qw35_metal_runtime_state_checkpoint_save(
-                    self.raw.as_ptr(),
-                    err.as_mut_ptr(),
-                    err.len(),
-                )
-            };
-            if ok == 0 {
-                return Err(c_string_from_i8(&err));
-            }
-            Ok(())
+            unsafe { qw35_metal_runtime_state_size(self.raw.as_ptr()) as usize }
         }
 
         #[cfg(not(target_os = "macos"))]
         {
-            Err("Qw35 native state checkpoint requires macOS Metal".to_string())
+            0
         }
     }
 
-    /// Restore the SSM/conv recurrent state from the internal checkpoint slot.
-    pub fn state_checkpoint_restore(&mut self) -> Result<(), String> {
+    /// Snapshot the SSM/conv recurrent state into a caller-owned buffer of
+    /// exactly `state_size()` bytes. The caller may hold any number of
+    /// snapshots (the session checkpoint stack does).
+    pub fn state_export(&mut self, buf: &mut [u8]) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
             let mut err = vec![0i8; 1024];
             let ok = unsafe {
-                qw35_metal_runtime_state_checkpoint_restore(
+                qw35_metal_runtime_state_export(
                     self.raw.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len() as u64,
                     err.as_mut_ptr(),
                     err.len(),
                 )
@@ -361,7 +376,37 @@ impl MetalRuntime {
 
         #[cfg(not(target_os = "macos"))]
         {
-            Err("Qw35 native state checkpoint requires macOS Metal".to_string())
+            let _ = buf;
+            Err("Qw35 native state export requires macOS Metal".to_string())
+        }
+    }
+
+    /// Restore the SSM/conv recurrent state from a buffer previously filled
+    /// by `state_export`. KV cache rows are untouched: they are positional
+    /// and remain valid for every position evaluated before the snapshot.
+    pub fn state_import(&mut self, buf: &[u8]) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut err = vec![0i8; 1024];
+            let ok = unsafe {
+                qw35_metal_runtime_state_import(
+                    self.raw.as_ptr(),
+                    buf.as_ptr(),
+                    buf.len() as u64,
+                    err.as_mut_ptr(),
+                    err.len(),
+                )
+            };
+            if ok == 0 {
+                return Err(c_string_from_i8(&err));
+            }
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = buf;
+            Err("Qw35 native state import requires macOS Metal".to_string())
         }
     }
 
@@ -380,6 +425,31 @@ impl MetalRuntime {
         #[cfg(not(target_os = "macos"))]
         {
             Err("Qw35 native runtime reset requires macOS Metal".to_string())
+        }
+    }
+
+    /// Raise the context ceiling to `new_ctx` positions. The segmented KV
+    /// cache grows lazily toward the ceiling as positions are reached, so this
+    /// only moves the scalar bound — live KV rows, recurrent state, and
+    /// snapshots stay valid. Values at or under the current ceiling are a
+    /// no-op success.
+    pub fn set_ctx_size(&mut self, new_ctx: u32) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut err = vec![0i8; 1024];
+            let ok = unsafe {
+                qw35_metal_runtime_set_ctx(self.raw.as_ptr(), new_ctx, err.as_mut_ptr(), err.len())
+            };
+            if ok == 0 {
+                return Err(c_string_from_i8(&err));
+            }
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = new_ctx;
+            Err("Qw35 native context growth requires macOS Metal".to_string())
         }
     }
 
@@ -507,7 +577,7 @@ impl MetalRuntime {
     }
 
     pub fn copy_logits(&mut self) -> Result<Vec<f32>, String> {
-        let mut logits = vec![0.0f32; self.vocab_size];
+        let mut logits = vec![0.0f32; self.logits_len];
         #[cfg(target_os = "macos")]
         {
             let mut err = vec![0i8; 1024];
@@ -546,12 +616,15 @@ const REQUIRED_NATIVE_KERNELS: &[&str] = &[
     "qw35_touch_u8_stride",
     "qw35_get_row_q4_k_f32",
     "qw35_get_rows_q4_k_f32",
+    "qw35_get_row_q8_0_f32",
+    "qw35_get_rows_q8_0_f32",
     "qw35_rms_norm_weight_f32",
     "qw35_rms_norm_weight_batch_f32",
     "qw35_residual_rms_norm_weight_f32",
     "qw35_residual_rms_norm_weight_batch_f32",
     "qw35_swiglu_f32",
     "qw35_decode_matmul_q8_0_f32",
+    "qw35_decode_matmul_q8_0_residual_f32",
     "qw35_decode_matmul_q4_k_2row_f32",
     "qw35_decode_matmul_q4_k_2row_residual_f32",
     "qw35_decode_matmul_q5_k_2row_f32",
@@ -618,6 +691,8 @@ struct MetalHparams {
     full_attention_interval: u32,
     attn_window: i32,
     attn_sink: i32,
+    attn_gate: u32,
+    n_cls_out: u32,
 }
 
 #[cfg(target_os = "macos")]
@@ -648,6 +723,8 @@ impl From<&QwenHparams> for MetalHparams {
             // Filled in by MetalRuntime::new from EngineConfig (not a model hparam).
             attn_window: 0,
             attn_sink: 0,
+            attn_gate: value.attn_gate,
+            n_cls_out: value.n_cls_out,
         }
     }
 }

@@ -16,6 +16,14 @@
         return [self encodeDecodeMatvecTensor:enc weight:_outputWeight input:_norm inputOffset:normRowOffset dst:_logits residual:NO error:error];
     }
 
+    // A classification head (cls.output.weight, n_cls_out rows) only ever
+    // serves full-logits scoring; the fused vocab argmax below assumes the
+    // LM head layout and is meaningless for it.
+    if (_h.n_cls_out > 0) {
+        if (error) *error = qw35_error(@"classification-head model supports only full logits readback");
+        return NO;
+    }
+
     // Greedy: fused matvec + per-threadgroup argmax over 16 vocab rows, then
     // a single reduction over the partials. Prefers GF4 output weights.
     const int64_t rows = (int64_t)_outputWeight.dims[1];
@@ -70,12 +78,13 @@
 }
 
 - (BOOL)copyLogits:(float *)dst len:(uintptr_t)len error:(NSError **)error {
-    if (!dst || len < _vocabSize) {
+    const uintptr_t n = _h.n_cls_out > 0 ? _h.n_cls_out : _vocabSize;
+    if (!dst || len < n) {
         if (error) *error = qw35_error(@"invalid logits readback buffer");
         return NO;
     }
     if (![self waitForLastCommand:error]) return NO;
-    memcpy(dst, [_logits contents], (size_t)_vocabSize * sizeof(float));
+    memcpy(dst, [_logits contents], (size_t)n * sizeof(float));
     return YES;
 }
 

@@ -40,9 +40,13 @@
 - (NSArray<id<MTLBuffer>> *)allBuffers;
 
 /// Validate that the essential tensors (embedding, output norm, output head)
-/// exist and have the expected types and dimensions.
+/// exist and have the expected types and dimensions. clsOutputs == 0 keeps the
+/// LM layout (vocab-sized output.weight, q4_k embeddings); clsOutputs > 0
+/// expects a classification head (cls.output.weight [emb, clsOutputs], q4_k or
+/// q8_0 embeddings) as in llama.cpp rank-converted rerankers.
 - (BOOL)validateRequiredForEmbeddingLength:(uint32_t)embeddingLength
                                  vocabSize:(uint32_t)vocabSize
+                                clsOutputs:(uint32_t)clsOutputs
                                      error:(NSError **)error;
 
 @end

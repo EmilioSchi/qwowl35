@@ -41,6 +41,8 @@ fn start_test_server() -> TestServer {
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
             kv_cache_type: qw35_server::metal::KvCacheType::Q8_0,
             session_cache: true,
+            checkpoint_cap: qw35_server::model::DEFAULT_CHECKPOINT_CAP,
+            scratch_ctx: 0,
             attn_window: 0,
             attn_sink: 0,
             warm_weights: true,
@@ -65,6 +67,7 @@ fn start_test_server() -> TestServer {
             server::serve_listener(
                 tokio_listener,
                 engine,
+                None,
                 GenerationDefaults {
                     max_tokens: TokenLimit::Fixed(128),
                     ..GenerationDefaults::default()
@@ -516,6 +519,70 @@ fn chat_completions_tool_calling_works_over_http() {
 }
 
 #[test]
+fn chat_completions_without_tools_passes_tool_call_xml_as_text() {
+    let server = start_test_server();
+    let addr = server.addr;
+
+    // Without a tools array the server must not hijack `<tool_call>` XML
+    // into structured tool_calls: plain-text clients (qw35-client) read only
+    // content and would silently lose the output.
+    let body = serde_json::json!({
+        "model": "qwen3.5-9b",
+        "messages": [
+            {"role": "user", "content": format!("Say exactly: {CALL_TEXT}")}
+        ],
+        "max_tokens": 64,
+        "stream": false
+    });
+    let response = post_json(addr, "/v1/chat/completions", &body);
+    assert!(response.contains("HTTP/1.1 200 OK"), "{response}");
+    let json = response_body_json(&response);
+    let choice = &json["choices"][0];
+    assert_eq!(choice["finish_reason"], "stop", "{json}");
+    let message = &choice["message"];
+    assert!(message.get("tool_calls").is_none(), "{json}");
+    let content = message["content"].as_str().unwrap();
+    assert!(content.contains(CALL_TEXT), "{json}");
+
+    // Streaming: the XML flows through content deltas; no tool_calls deltas,
+    // no qw35_tool_call side-channel chunks, finish_reason stays "stop".
+    let stream_body = serde_json::json!({
+        "model": "qwen3.5-9b",
+        "messages": [
+            {"role": "user", "content": format!("Say exactly: {CALL_TEXT}")}
+        ],
+        "max_tokens": 64,
+        "stream": true
+    });
+    let stream_response = post_json(addr, "/v1/chat/completions", &stream_body);
+    let chunks = sse_data_chunks(&stream_response);
+    let mut streamed_content = String::new();
+    let mut finish_reasons = Vec::new();
+    for chunk in &chunks {
+        assert!(
+            chunk.get("qw35_tool_call").is_none(),
+            "side-channel leaked without tools: {chunk}"
+        );
+        let choice = &chunk["choices"][0];
+        assert!(
+            choice["delta"].get("tool_calls").is_none(),
+            "tool_calls delta leaked without tools: {chunk}"
+        );
+        if let Some(reason) = choice["finish_reason"].as_str() {
+            finish_reasons.push(reason.to_string());
+        }
+        if let Some(content) = choice["delta"]["content"].as_str() {
+            streamed_content.push_str(content);
+        }
+    }
+    assert!(
+        streamed_content.contains(CALL_TEXT),
+        "{stream_response}"
+    );
+    assert_eq!(finish_reasons, vec!["stop".to_string()]);
+}
+
+#[test]
 fn responses_tool_calling_works_over_http() {
     let server = start_test_server();
     let addr = server.addr;
@@ -639,6 +706,40 @@ fn responses_tool_calling_works_over_http() {
         truncated_json["incomplete_details"]["reason"], "max_output_tokens",
         "{truncated_json}"
     );
+}
+
+#[test]
+fn rerank_returns_501_without_a_reranker_model() {
+    let server = start_test_server();
+    let addr = server.addr;
+
+    let body = serde_json::json!({
+        "query": "what is rust",
+        "documents": ["Rust is a language.", "Bananas are yellow."],
+    });
+    let response = post_json(addr, "/v1/rerank", &body);
+    assert!(
+        response.contains("HTTP/1.1 501 Not Implemented"),
+        "{response}"
+    );
+    let json = response_body_json(&response);
+    assert_eq!(json["error"]["code"], "inference_unavailable", "{json}");
+    assert_eq!(json["error"]["type"], "qw35_error", "{json}");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--reranker-model"),
+        "{json}"
+    );
+
+    // /health reports the reranker as absent, additively.
+    let health = http_request(
+        addr,
+        "GET /health HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n",
+    );
+    let health_json = response_body_json(&health);
+    assert_eq!(health_json["reranker"]["loaded"], false, "{health_json}");
 }
 
 fn http_request(addr: std::net::SocketAddr, request: &str) -> String {

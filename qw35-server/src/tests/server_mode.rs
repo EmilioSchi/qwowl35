@@ -1,6 +1,17 @@
     use super::*;
 
     #[test]
+    fn session_kind_parses_all_three_sessions() {
+        use crate::model::SessionKind;
+
+        assert_eq!(parse_session_kind(None).unwrap(), SessionKind::Main);
+        assert_eq!(parse_session_kind(Some("main")).unwrap(), SessionKind::Main);
+        assert_eq!(parse_session_kind(Some("scratch")).unwrap(), SessionKind::Scratch);
+        assert_eq!(parse_session_kind(Some("plan")).unwrap(), SessionKind::Plan);
+        assert!(parse_session_kind(Some("aux")).is_err());
+    }
+
+    #[test]
     fn presets_match_official_qwen35_values() {
         // (temp, top_p, top_k, min_p, presence, rep, enable_thinking)
         let g = Mode::ThinkingGeneral.defaults();

@@ -258,7 +258,16 @@ int qw35_metal_runtime_reset(void *runtime, char *err, uintptr_t err_len) {
     }
 }
 
-int qw35_metal_runtime_state_checkpoint_save(void *runtime, char *err, uintptr_t err_len) {
+uint64_t qw35_metal_runtime_state_size(void *runtime) {
+    @autoreleasepool {
+        if (!runtime) return 0;
+        Qw35MetalRuntime *rt = (__bridge Qw35MetalRuntime *)runtime;
+        return [rt stateSize];
+    }
+}
+
+int qw35_metal_runtime_state_export(
+        void *runtime, uint8_t *buf, uint64_t len, char *err, uintptr_t err_len) {
     @autoreleasepool {
         if (!runtime) {
             qw35_set_error(err, err_len, "invalid Qw35 Metal runtime");
@@ -266,7 +275,7 @@ int qw35_metal_runtime_state_checkpoint_save(void *runtime, char *err, uintptr_t
         }
         NSError *error = nil;
         Qw35MetalRuntime *rt = (__bridge Qw35MetalRuntime *)runtime;
-        if (![rt stateCheckpointSave:&error]) {
+        if (![rt stateExport:buf length:len error:&error]) {
             qw35_set_ns_error(err, err_len, error);
             return 0;
         }
@@ -274,7 +283,8 @@ int qw35_metal_runtime_state_checkpoint_save(void *runtime, char *err, uintptr_t
     }
 }
 
-int qw35_metal_runtime_state_checkpoint_restore(void *runtime, char *err, uintptr_t err_len) {
+int qw35_metal_runtime_state_import(
+        void *runtime, const uint8_t *buf, uint64_t len, char *err, uintptr_t err_len) {
     @autoreleasepool {
         if (!runtime) {
             qw35_set_error(err, err_len, "invalid Qw35 Metal runtime");
@@ -282,7 +292,7 @@ int qw35_metal_runtime_state_checkpoint_restore(void *runtime, char *err, uintpt
         }
         NSError *error = nil;
         Qw35MetalRuntime *rt = (__bridge Qw35MetalRuntime *)runtime;
-        if (![rt stateCheckpointRestore:&error]) {
+        if (![rt stateImport:buf length:len error:&error]) {
             qw35_set_ns_error(err, err_len, error);
             return 0;
         }
@@ -299,6 +309,23 @@ int qw35_metal_runtime_sync(void *runtime, char *err, uintptr_t err_len) {
         NSError *error = nil;
         Qw35MetalRuntime *rt = (__bridge Qw35MetalRuntime *)runtime;
         if (![rt sync:&error]) {
+            qw35_set_ns_error(err, err_len, error);
+            return 0;
+        }
+        return 1;
+    }
+}
+
+int qw35_metal_runtime_set_ctx(
+        void *runtime, uint32_t new_ctx, char *err, uintptr_t err_len) {
+    @autoreleasepool {
+        if (!runtime) {
+            qw35_set_error(err, err_len, "invalid Qw35 Metal runtime");
+            return 0;
+        }
+        NSError *error = nil;
+        Qw35MetalRuntime *rt = (__bridge Qw35MetalRuntime *)runtime;
+        if (![rt setCtxSize:new_ctx error:&error]) {
             qw35_set_ns_error(err, err_len, error);
             return 0;
         }

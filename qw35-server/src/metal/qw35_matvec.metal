@@ -130,6 +130,44 @@ kernel void qw35_get_rows_q4_k_f32(
     dst[gid] = qw35_dequant_q4_k_at(weight[block_idx], local_idx);
 }
 
+// q8_0 token-embedding row gather (the reranker ships token_embd.weight as
+// q8_0; the 9B uses the q4_k kernels above). 32-element blocks, symmetric
+// int8 + one fp16 scale.
+kernel void qw35_get_row_q8_0_f32(
+    device const qw35_block_q8_0 * weight [[buffer(0)]],
+    device float * dst [[buffer(1)]],
+    constant uint &row [[buffer(2)]],
+    constant int64_t &k [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (int64_t(gid) >= k) return;
+    const int64_t n_blocks = (k + 31) / 32;
+    const int64_t block_idx = int64_t(row) * n_blocks + int64_t(gid) / 32;
+    const int local_idx = int(int64_t(gid) & 31);
+    device const qw35_block_q8_0 &blk = weight[block_idx];
+    dst[gid] = float(blk.d) * float(blk.qs[local_idx]);
+}
+
+kernel void qw35_get_rows_q8_0_f32(
+    device const qw35_block_q8_0 * weight [[buffer(0)]],
+    device const uint * rows [[buffer(1)]],
+    device float * dst [[buffer(2)]],
+    constant int64_t &k [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const int64_t total = k;
+    if (total <= 0) return;
+    const int64_t token_idx = int64_t(gid) / total;
+    const int64_t col = int64_t(gid) - token_idx * total;
+    if (col >= total) return;
+    const uint row = rows[token_idx];
+    const int64_t n_blocks = (k + 31) / 32;
+    const int64_t block_idx = int64_t(row) * n_blocks + col / 32;
+    const int local_idx = int(col & 31);
+    device const qw35_block_q8_0 &blk = weight[block_idx];
+    dst[gid] = float(blk.d) * float(blk.qs[local_idx]);
+}
+
 kernel void qw35_decode_matmul_q4_k_2row_f32(
     device const qw35_block_q4_k * x [[buffer(0)]],
     device const float * y [[buffer(1)]],
@@ -613,4 +651,33 @@ kernel void qw35_decode_matmul_q8_0_f32(
     }
     sum = simd_sum(sum);
     if (lane == 0) dst[row] = sum;
+}
+
+// Residual twin of the q8_0 decode matvec: accumulates into dst instead of
+// overwriting (the reranker's q8_0 FFN down projection folds the residual add
+// in, matching the q4_k/q6_k/GF4 residual kernels).
+kernel void qw35_decode_matmul_q8_0_residual_f32(
+    device const qw35_block_q8_0 * x [[buffer(0)]],
+    device const float * y [[buffer(1)]],
+    device float * dst [[buffer(2)]],
+    constant int64_t &n_blocks [[buffer(3)]],
+    constant int64_t &k [[buffer(4)]],
+    constant int64_t &rows_per_token [[buffer(5)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 ti [[thread_position_in_threadgroup]]
+) {
+    const int64_t row = int64_t(tg.x) * QW35_DECODE_ROWS_PER_GROUP + int64_t(ti.y);
+    if (row >= rows_per_token) return;
+
+    const int lane = int(ti.x);
+    float sum = 0.0f;
+    device const qw35_block_q8_0 *x_row = x + row * n_blocks;
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        const int64_t col = b * 32 + lane;
+        if (col < k) {
+            sum += y[col] * float(x_row[b].d) * float(x_row[b].qs[lane]);
+        }
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) dst[row] += sum;
 }

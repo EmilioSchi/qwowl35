@@ -82,6 +82,10 @@ static inline uint64_t qw35_div_up_u64(uint64_t value, uint64_t divisor) {
     return (value + divisor - 1) / divisor;
 }
 
+static inline uint64_t qw35_max_u64(uint64_t a, uint64_t b) {
+    return a > b ? a : b;
+}
+
 // Accumulate per-channel |x| into a double accumulator (calibration capture).
 static inline void qw35_accum_absmean(double *acc, const float *x, uint64_t n) {
     for (uint64_t i = 0; i < n; i++) {
@@ -137,10 +141,6 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
     uint32_t _kvSlabCount;
     id<MTLBuffer> _conv_state;
     id<MTLBuffer> _ssm_state;
-    // Session checkpoint copies of the recurrent state (CPU-side, small).
-    NSMutableData *_conv_state_ckpt;
-    NSMutableData *_ssm_state_ckpt;
-    BOOL _has_state_ckpt;
     id<MTLBuffer> _argmax_token;
     id<MTLBuffer> _argmax_logit;
     id<MTLBuffer> _argmax_partial_token;
@@ -152,8 +152,13 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
     NSArray<Qw35LayerTensors *> *_layers;
     Qw35Tensor *_tokenEmbd;
     Qw35Tensor *_outputNorm;
-    Qw35Tensor *_outputWeight; // GF4-preferred
+    Qw35Tensor *_outputWeight; // GF4-preferred; cls.output.weight when n_cls_out > 0
     BOOL _outputWeightIsGf4;
+    // Pre-FFN norm tensor suffix: the Qwen3.5 hybrid names it
+    // post_attention_norm.weight; a stock dense Qwen3 (classification-head
+    // reranker, n_cls_out > 0) names it ffn_norm.weight. Resolved once at init
+    // so the name-based prefill path and the resolved decode path agree.
+    NSString *_preFfnNormSuffix;
 
     // Last committed command buffer of the most recent eval.
     id<MTLCommandBuffer> _lastCB;
@@ -226,8 +231,9 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
 - (BOOL)sync:(NSError **)error;
 - (void)setAttnSink:(int)sink;
 - (BOOL)reset:(NSError **)error;
-- (BOOL)stateCheckpointSave:(NSError **)error;
-- (BOOL)stateCheckpointRestore:(NSError **)error;
+- (uint64_t)stateSize;
+- (BOOL)stateExport:(void *)buf length:(uint64_t)len error:(NSError **)error;
+- (BOOL)stateImport:(const void *)buf length:(uint64_t)len error:(NSError **)error;
 - (BOOL)initializeRopeFrequencies:(NSError **)error;
 - (Qw35Tensor *)tensorNamed:(NSString *)name error:(NSError **)error;
 - (BOOL)evalToken:(uint32_t)token

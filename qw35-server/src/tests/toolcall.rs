@@ -55,6 +55,29 @@
     }
 
     #[test]
+    fn forced_prefix_then_model_completion_assembles_one_call() {
+        // The generate loop seeds the text stream with the forced opening
+        // (`<tool_call>\n<function=X>\n`) before the model's sampled
+        // parameter body arrives: the parser must reconstruct exactly one
+        // well-formed call named X. The forced turn never starts in thinking
+        // (the closed-think header is rendered), hence start_in_thinking =
+        // false.
+        let completion =
+            "<parameter=verdict>\nyes\n</parameter>\n<parameter=meaning>\nholds the bug\n</parameter>\n</function>\n</tool_call>";
+        let out = assemble_events(&run(
+            &["<tool_call>\n<function=useful>\n", completion],
+            false,
+        ));
+        assert_eq!(out.content, "", "content leaked: {:?}", out.content);
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].name, "useful");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out.tool_calls[0].arguments).unwrap(),
+            serde_json::json!({"verdict": "yes", "meaning": "holds the bug"})
+        );
+    }
+
+    #[test]
     fn text_then_tool_call_then_text() {
         let text = format!("Let me check.\n{CALL_BLOCK}\nDone.");
         for out in run_split_everywhere(&text, false) {
@@ -524,7 +547,7 @@
         // model's embedded `tokenizer.chat_template` tools section for
         // ToolChoice::Auto. `verify_tool_template.py` derives this expected text
         // from the GGUF, so a wording/separator drift here fails the build.
-        let block = render_tools_system_block(&defs, &ToolChoice::Auto).unwrap();
+        let block = render_tools_system_block(&defs).unwrap();
         let expected = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n\
 {\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"units\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature units\"}}, \"required\": [\"city\"]}}}\n\
 </tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n\
@@ -538,11 +561,32 @@
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n\
 </IMPORTANT>";
         assert_eq!(block, expected);
-        assert!(render_tools_system_block(&defs, &ToolChoice::None).is_none());
-        assert!(render_tools_system_block(&[], &ToolChoice::Auto).is_none());
-        let required = render_tools_system_block(&defs, &ToolChoice::Required).unwrap();
-        assert!(required.starts_with(expected));
-        assert!(required.ends_with("\n\nYou must call at least one function before answering."));
+        assert!(render_tools_system_block(&[]).is_none());
+
+        // The must-call instruction is no longer part of the system block: it
+        // renders past the stable prompt boundary so `tool_choice` never
+        // perturbs the session-cache checkpoint prefix.
+        assert_eq!(enforcement_suffix(&ToolChoice::Auto), None);
+        assert_eq!(enforcement_suffix(&ToolChoice::None), None);
+        assert_eq!(
+            enforcement_suffix(&ToolChoice::Required).as_deref(),
+            Some("You must call at least one function before answering.")
+        );
+        assert_eq!(
+            enforcement_suffix(&ToolChoice::Named("verdict".to_string())).as_deref(),
+            Some("You must call the function \"verdict\".")
+        );
+
+        // The named choice additionally hard-forces the call by injecting its
+        // opening into the prompt; `required` stays instruction-only (the
+        // model must still pick which function to call).
+        assert_eq!(forced_call_prefix(&ToolChoice::Auto), None);
+        assert_eq!(forced_call_prefix(&ToolChoice::None), None);
+        assert_eq!(forced_call_prefix(&ToolChoice::Required), None);
+        assert_eq!(
+            forced_call_prefix(&ToolChoice::Named("useful".to_string())).as_deref(),
+            Some("<tool_call>\n<function=useful>\n")
+        );
 
         let call = render_tool_call_block("get_weather", "{\"city\": \"Paris\"}");
         assert_eq!(
@@ -596,7 +640,7 @@
     // ── Raw-streaming mode (stream_tool_call_xml) ──────────────────────────
 
     fn run_streaming(feeds: &[&str], start_in_thinking: bool) -> Vec<AssistantEvent> {
-        let mut parser = AssistantStreamParser::with_options(start_in_thinking, true);
+        let mut parser = AssistantStreamParser::with_options(start_in_thinking, true, true);
         let mut events = Vec::new();
         for feed in feeds {
             events.extend(parser.feed(feed));
@@ -626,7 +670,7 @@
             "<tool_call>\nnope\n</tool_call>".to_string(),
         ];
         for text in &fixtures {
-            let whole = parse_assistant_text(text, false);
+            let whole = parse_assistant_text(text, false, true);
             for split in text.char_indices().map(|(idx, _)| idx).skip(1) {
                 let events = run_streaming(&[&text[..split], &text[split..]], false);
                 assert_same_output(&assemble_events(&events), &whole);
@@ -643,7 +687,7 @@
         let block = bash_block("echo hi");
         // Feed only up to the end of the `<function=bash>` header line.
         let header_end = block.find(">\n<parameter").unwrap() + 1;
-        let mut parser = AssistantStreamParser::with_options(false, true);
+        let mut parser = AssistantStreamParser::with_options(false, true, true);
         let events = parser.feed(&block[..header_end]);
         let begin_pos = events
             .iter()
@@ -724,7 +768,7 @@
 
     #[test]
     fn stream_raw_bash_attribute_header_names_bash_early() {
-        let mut parser = AssistantStreamParser::with_options(false, true);
+        let mut parser = AssistantStreamParser::with_options(false, true, true);
         let events = parser.feed("<tool_call>\n<bash command=\"ls -");
         assert!(events
             .iter()
@@ -749,4 +793,59 @@
             .collect();
         assert_eq!(args.len(), 1);
         serde_json::from_str::<serde_json::Value>(args[0]).expect("legacy Args is full JSON");
+    }
+
+    // ── Tool-call parsing disabled (request advertised no tools) ───────────
+
+    fn run_no_tools(feeds: &[&str], start_in_thinking: bool) -> Vec<AssistantEvent> {
+        let mut parser = AssistantStreamParser::with_options(start_in_thinking, false, false);
+        let mut events = Vec::new();
+        for feed in feeds {
+            events.extend(parser.feed(feed));
+        }
+        events.extend(parser.finish());
+        events
+    }
+
+    #[test]
+    fn disabled_mode_passes_tool_call_xml_as_content_at_every_split_point() {
+        let boundaries: Vec<usize> = CALL_BLOCK
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .skip(1)
+            .collect();
+        for &split in &boundaries {
+            let out = assemble_events(&run_no_tools(
+                &[&CALL_BLOCK[..split], &CALL_BLOCK[split..]],
+                false,
+            ));
+            assert_eq!(out.content, CALL_BLOCK, "split at {split}");
+            assert!(out.tool_calls.is_empty());
+            assert!(out.reasoning.is_empty());
+        }
+    }
+
+    #[test]
+    fn disabled_mode_keeps_think_extraction() {
+        let text = format!("<think>\nplan it\n</think>\n\n{CALL_BLOCK}");
+        let out = assemble_events(&run_no_tools(&[&text], false));
+        assert_eq!(out.reasoning, "plan it\n");
+        assert_eq!(out.content, CALL_BLOCK);
+        assert!(out.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn disabled_mode_passes_rootless_function_xml_as_content() {
+        let text = "<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>";
+        let out = assemble_events(&run_no_tools(&[text], false));
+        assert_eq!(out.content, text);
+        assert!(out.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn disabled_mode_flushes_partial_tool_call_at_eof() {
+        let text = "text <tool_call>\n<function=x>";
+        let out = assemble_events(&run_no_tools(&[text], false));
+        assert_eq!(out.content, text);
+        assert!(out.tool_calls.is_empty());
     }

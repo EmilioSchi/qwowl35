@@ -97,6 +97,7 @@
     }
 
     _h = *hparams;
+    _preFfnNormSuffix = _h.n_cls_out > 0 ? @"ffn_norm.weight" : @"post_attention_norm.weight";
     const uint32_t slab = QW35_KV_INITIAL_SLAB;
     // The segmented KV cache addresses at most QW35_MAX_SLABS slabs. Reject a
     // larger --ctx outright rather than clamping silently: the Rust layer admits
@@ -133,13 +134,16 @@
     if (!_tensorStore) return nil;
     if (![_tensorStore validateRequiredForEmbeddingLength:_h.embedding_length
                                                 vocabSize:_vocabSize
+                                               clsOutputs:_h.n_cls_out
                                                     error:error]) {
         return nil;
     }
-    Qw35Tensor *outputWeight = [_tensorStore tensorNamed:@"output.weight"];
-    if (outputWeight.type_id != 14) {
-        if (error) *error = qw35_error(@"output.weight must be q6_k for the fused argmax head");
-        return nil;
+    if (_h.n_cls_out == 0) {
+        Qw35Tensor *outputWeight = [_tensorStore tensorNamed:@"output.weight"];
+        if (outputWeight.type_id != 14) {
+            if (error) *error = qw35_error(@"output.weight must be q6_k for the fused argmax head");
+            return nil;
+        }
     }
 
     _pipelineCache = [[Qw35PipelineCache alloc] initWithLibrary:_library device:_device];
@@ -222,8 +226,16 @@
     _tokenEmbd = [self tensorNamed:@"token_embd.weight" error:error];
     _outputNorm = [self tensorNamed:@"output_norm.weight" error:error];
     if (!_tokenEmbd || !_outputNorm) return NO;
-    _outputWeight = [self decodeWeightNamed:@"output.weight" error:error];
+    NSString *headName = _h.n_cls_out > 0 ? @"cls.output.weight" : @"output.weight";
+    _outputWeight = [self decodeWeightNamed:headName error:error];
     if (!_outputWeight) return NO;
+    if (_h.n_cls_out > 0 &&
+        (_outputWeight.dims[0] != _h.embedding_length || _outputWeight.dims[1] != _h.n_cls_out)) {
+        if (error) *error = qw35_error(@"cls.output.weight has unexpected dimensions %llu x %llu (expected %u x %u)",
+                                       _outputWeight.dims[0], _outputWeight.dims[1],
+                                       _h.embedding_length, _h.n_cls_out);
+        return NO;
+    }
     _outputWeightIsGf4 = _outputWeight.type_id == 100;
 
     const uint32_t interval = _h.full_attention_interval ? _h.full_attention_interval : 4;
@@ -240,7 +252,7 @@
 
         Qw35LayerTensors *layer = [Qw35LayerTensors new];
         layer.attnNorm = plain(@"attn_norm.weight");
-        layer.postAttentionNorm = plain(@"post_attention_norm.weight");
+        layer.postAttentionNorm = plain(_preFfnNormSuffix);
         // The unified .gguf bakes the AWQ-folded norm directly into
         // post_attention_norm, so prefill and decode share it (both run the
         // GF4+AWQ FFN) — no decode-only override.
@@ -262,6 +274,17 @@
             layer.attnOutput = weight(@"attn_output.weight");
             if (!layer.attnQ || !layer.attnK || !layer.attnV || !layer.attnQNorm ||
                 !layer.attnKNorm || !layer.attnOutput) {
+                return NO;
+            }
+            // The gated-attention kernels read Q at stride head_dim*2; the
+            // ungated ones at head_dim. A projection whose row count doesn't
+            // match the configured gating would silently misindex, so check
+            // it here where the tensor is first resolved.
+            const uint64_t expect_q_rows =
+                (uint64_t)_h.attention_heads * _h.attention_key_length * (_h.attn_gate ? 2u : 1u);
+            if (layer.attnQ.dims[1] != expect_q_rows) {
+                if (error) *error = qw35_error(@"blk.%u.attn_q.weight has %llu rows, expected %llu (attn_gate=%u)",
+                                               il, layer.attnQ.dims[1], expect_q_rows, _h.attn_gate);
                 return NO;
             }
         } else {
@@ -341,8 +364,12 @@
                                       options:MTLResourceStorageModeShared];
     _vSlabPtrs.label = @"v_slab_ptrs";
     if (_kSlabs[0] && _vSlabs[0] && _kSlabPtrs && _vSlabPtrs) [self updateSlabPtrs];
-    _conv_state = [self newFloatBuffer:(uint64_t)_deltaLayerCount * ssm_conv_channels * (_h.ssm_conv_kernel - 1) label:@"conv_state"];
-    _ssm_state = [self newFloatBuffer:(uint64_t)_deltaLayerCount * _h.ssm_time_step_rank * _h.ssm_state_size * _h.ssm_state_size label:@"ssm_state"];
+    // qw35_max_u64(1, ...): an all-attention model (deltaLayerCount == 0, e.g.
+    // the reranker) would otherwise size these to 0 and newFloatBuffer returns
+    // nil for a zero count, failing init. The 1-float stubs are never encoded
+    // (no delta layers) and make state export/import trivially small no-ops.
+    _conv_state = [self newFloatBuffer:qw35_max_u64(1, (uint64_t)_deltaLayerCount * ssm_conv_channels * (_h.ssm_conv_kernel - 1)) label:@"conv_state"];
+    _ssm_state = [self newFloatBuffer:qw35_max_u64(1, (uint64_t)_deltaLayerCount * _h.ssm_time_step_rank * _h.ssm_state_size * _h.ssm_state_size) label:@"ssm_state"];
     _argmax_token = [_device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
     _argmax_logit = [_device newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared];
     const uint64_t argmax_groups = qw35_div_up_u64(_vocabSize, 16);
@@ -529,6 +556,12 @@
     if (baseHead != nil && baseHead.type_id == 100) {
         if (![_pipelineCache pipelineNamed:@"qw35_output_gf4_argmax_partials_16row_f32" error:error]) return NO;
     }
+    // q8_0 token embeddings (the reranker ships them q8_0; the 9B is q4_k and
+    // skips this, keeping its prewarm set byte-identical).
+    if (_tokenEmbd.type_id == 8) {
+        if (![_pipelineCache pipelineNamed:@"qw35_get_row_q8_0_f32" error:error]) return NO;
+        if (![_pipelineCache pipelineNamed:@"qw35_get_rows_q8_0_f32" error:error]) return NO;
+    }
     return YES;
 }
 
@@ -552,6 +585,25 @@
     _attnSink = sink < 0 ? 0 : sink;
 }
 
+- (BOOL)setCtxSize:(uint32_t)newCtx error:(NSError **)error {
+    if (newCtx <= _ctxSize) return YES;
+    // Same physical bound as init: the slab pointer table addresses at most
+    // QW35_MAX_SLABS slabs, so a ceiling past it would admit positions the
+    // cache cannot hold.
+    const uint64_t maxCtx = (uint64_t)QW35_MAX_SLABS * (uint64_t)_kvSlab;
+    if ((uint64_t)newCtx > maxCtx) {
+        if (error) *error = qw35_error(@"ctx %u exceeds the maximum %llu tokens the KV cache can address (%u slabs x %u)",
+                                       newCtx, maxCtx, (unsigned)QW35_MAX_SLABS, _kvSlab);
+        return NO;
+    }
+    // Scalar bump only: slabs are appended on demand by
+    // ensureKvCapacityForPositions: (which drains in-flight work itself), and
+    // requests on this runtime are serialized by the Rust session lock, so no
+    // encode can be reading the old ceiling concurrently.
+    _ctxSize = newCtx;
+    return YES;
+}
+
 - (BOOL)reset:(NSError **)error {
     if (![self waitForLastCommand:error]) return NO;
     NSArray<id<MTLBuffer>> *zeroed = @[_conv_state, _ssm_state];
@@ -562,32 +614,38 @@
     return YES;
 }
 
-- (BOOL)stateCheckpointSave:(NSError **)error {
+- (uint64_t)stateSize {
+    if (!_conv_state || !_ssm_state) return 0;
+    return (uint64_t)[_conv_state length] + (uint64_t)[_ssm_state length];
+}
+
+- (BOOL)stateExport:(void *)buf length:(uint64_t)len error:(NSError **)error {
     if (![self waitForLastCommand:error]) return NO;
     if (!_conv_state || !_ssm_state) {
         if (error) *error = qw35_error(@"recurrent state buffers are not allocated");
         return NO;
     }
-    if (!_conv_state_ckpt) _conv_state_ckpt = [NSMutableData dataWithLength:[_conv_state length]];
-    if (!_ssm_state_ckpt) _ssm_state_ckpt = [NSMutableData dataWithLength:[_ssm_state length]];
-    if (!_conv_state_ckpt || !_ssm_state_ckpt) {
-        if (error) *error = qw35_error(@"failed to allocate state checkpoint storage");
+    if (!buf || len != [self stateSize]) {
+        if (error) *error = qw35_error(@"state export buffer size mismatch");
         return NO;
     }
-    memcpy([_conv_state_ckpt mutableBytes], [_conv_state contents], [_conv_state length]);
-    memcpy([_ssm_state_ckpt mutableBytes], [_ssm_state contents], [_ssm_state length]);
-    _has_state_ckpt = YES;
+    memcpy(buf, [_conv_state contents], [_conv_state length]);
+    memcpy((uint8_t *)buf + [_conv_state length], [_ssm_state contents], [_ssm_state length]);
     return YES;
 }
 
-- (BOOL)stateCheckpointRestore:(NSError **)error {
+- (BOOL)stateImport:(const void *)buf length:(uint64_t)len error:(NSError **)error {
     if (![self waitForLastCommand:error]) return NO;
-    if (!_has_state_ckpt) {
-        if (error) *error = qw35_error(@"no recurrent state checkpoint has been saved");
+    if (!_conv_state || !_ssm_state) {
+        if (error) *error = qw35_error(@"recurrent state buffers are not allocated");
         return NO;
     }
-    memcpy([_conv_state contents], [_conv_state_ckpt bytes], [_conv_state length]);
-    memcpy([_ssm_state contents], [_ssm_state_ckpt bytes], [_ssm_state length]);
+    if (!buf || len != [self stateSize]) {
+        if (error) *error = qw35_error(@"state import buffer size mismatch");
+        return NO;
+    }
+    memcpy([_conv_state contents], buf, [_conv_state length]);
+    memcpy([_ssm_state contents], (const uint8_t *)buf + [_conv_state length], [_ssm_state length]);
     return YES;
 }
 
@@ -1112,7 +1170,7 @@
                 delta_slot++;
             }
 
-            if (![self encodeResidualRmsBatch:enc weight:[prefix stringByAppendingString:@"post_attention_norm.weight"] tokens:n error:error]) { failed = YES; break; }
+            if (![self encodeResidualRmsBatch:enc weight:[prefix stringByAppendingString:_preFfnNormSuffix] tokens:n error:error]) { failed = YES; break; }
 
             if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"ffn_gate.weight"] input:_norm inputOffset:0 dst:_ffn_gate dstOffset:0 tokens:n error:error]) { failed = YES; break; }
             if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"ffn_up.weight"] input:_norm inputOffset:0 dst:_ffn_up dstOffset:0 tokens:n error:error]) { failed = YES; break; }

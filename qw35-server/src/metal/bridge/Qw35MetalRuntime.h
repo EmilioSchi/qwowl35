@@ -41,16 +41,29 @@
 /// Waits for any in-flight GPU work first.
 - (BOOL)reset:(NSError **)error;
 
-/// Copy the conv/SSM recurrent state into the internal checkpoint slot.
-/// Waits for in-flight GPU work first. Used by the session prefix cache to
-/// mark a rewind point (the hybrid SSM state cannot be rolled back otherwise).
-- (BOOL)stateCheckpointSave:(NSError **)error;
+/// Raise the context ceiling to `newCtx` positions. The segmented KV cache
+/// grows lazily toward the ceiling as positions are actually reached, so this
+/// only moves the scalar bound — no reallocation, no replay; live KV rows,
+/// recurrent state, and snapshots all stay valid. Lowering is refused (KV rows
+/// past a lowered ceiling would still be addressed by live sessions); a value
+/// at or under the current ceiling is a no-op success.
+- (BOOL)setCtxSize:(uint32_t)newCtx error:(NSError **)error;
 
-/// Restore the conv/SSM recurrent state from the internal checkpoint slot.
-/// Fails if no checkpoint has been saved. KV cache rows are untouched: they
+/// Total byte size of the conv/SSM recurrent state (the export/import
+/// payload). 0 if the state buffers are not allocated.
+- (uint64_t)stateSize;
+
+/// Copy the conv/SSM recurrent state into a caller-owned buffer of exactly
+/// -stateSize bytes. Waits for in-flight GPU work first. Used by the session
+/// prefix cache to mark rewind points (the hybrid SSM state cannot be rolled
+/// back otherwise); the caller may hold any number of snapshots.
+- (BOOL)stateExport:(void *)buf length:(uint64_t)len error:(NSError **)error;
+
+/// Restore the conv/SSM recurrent state from a caller-owned buffer previously
+/// filled by -stateExport:length:error:. KV cache rows are untouched: they
 /// are positional and remain valid for every position evaluated before the
-/// checkpoint was taken.
-- (BOOL)stateCheckpointRestore:(NSError **)error;
+/// snapshot was taken.
+- (BOOL)stateImport:(const void *)buf length:(uint64_t)len error:(NSError **)error;
 
 /// Evaluate a single token through the entire model graph.
 ///

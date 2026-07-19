@@ -158,8 +158,10 @@ static inline uint64_t round_up_u64(uint64_t value, uint64_t alignment) {
 
 - (BOOL)validateRequiredForEmbeddingLength:(uint32_t)embeddingLength
                                  vocabSize:(uint32_t)vocabSize
+                                clsOutputs:(uint32_t)clsOutputs
                                      error:(NSError **)error {
-    NSArray<NSString *> *required = @[@"token_embd.weight", @"output_norm.weight", @"output.weight"];
+    NSString *headName = clsOutputs > 0 ? @"cls.output.weight" : @"output.weight";
+    NSArray<NSString *> *required = @[@"token_embd.weight", @"output_norm.weight", headName];
     for (NSString *reqName in required) {
         if (!_tensors[reqName]) {
             if (error) *error = [NSError errorWithDomain:@"Qw35TensorStore"
@@ -170,7 +172,14 @@ static inline uint64_t round_up_u64(uint64_t value, uint64_t alignment) {
     }
 
     Qw35Tensor *embd = _tensors[@"token_embd.weight"];
-    if (embd.type_id != 12) { // must be q4_k
+    if (clsOutputs > 0) {
+        if (embd.type_id != 12 && embd.type_id != 8) { // q4_k or q8_0
+            if (error) *error = [NSError errorWithDomain:@"Qw35TensorStore"
+                                                    code:-11
+                                                userInfo:@{NSLocalizedDescriptionKey: @"token_embd.weight must be q4_k or q8_0"}];
+            return NO;
+        }
+    } else if (embd.type_id != 12) { // must be q4_k
         if (error) *error = [NSError errorWithDomain:@"Qw35TensorStore"
                                                 code:-11
                                             userInfo:@{NSLocalizedDescriptionKey: @"token_embd.weight must be q4_k"}];
@@ -181,6 +190,15 @@ static inline uint64_t round_up_u64(uint64_t value, uint64_t alignment) {
                                                 code:-12
                                             userInfo:@{NSLocalizedDescriptionKey: @"token_embd.weight has unexpected dimensions"}];
         return NO;
+    }
+    if (clsOutputs > 0) {
+        Qw35Tensor *cls = _tensors[headName];
+        if (cls.dims[0] != embeddingLength || cls.dims[1] != clsOutputs) {
+            if (error) *error = [NSError errorWithDomain:@"Qw35TensorStore"
+                                                    code:-13
+                                                userInfo:@{NSLocalizedDescriptionKey: @"cls.output.weight has unexpected dimensions"}];
+            return NO;
+        }
     }
     return YES;
 }

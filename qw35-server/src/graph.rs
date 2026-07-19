@@ -33,6 +33,14 @@ pub struct QwenHparams {
     pub ssm_time_step_rank: u32,
     pub ssm_inner_size: u32,
     pub full_attention_interval: u32,
+    /// 1 when attention Q projections carry the fused sigmoid output gate
+    /// (Qwen3.5 hybrid layout: attn_q rows = heads*head_dim*2); 0 for plain
+    /// ungated attention (dense Qwen3, e.g. the reranker).
+    pub attn_gate: u32,
+    /// Number of classification-head outputs when the model carries a
+    /// `cls.output.weight` head instead of a vocab-sized `output.weight`
+    /// (llama.cpp rank-converted rerankers). 0 = normal LM output head.
+    pub n_cls_out: u32,
 }
 
 impl GraphPlan {
@@ -156,6 +164,9 @@ fn read_hparams(gguf: &MappedGguf) -> QwenHparams {
         full_attention_interval: gguf
             .metadata_u32("qwen35.full_attention_interval")
             .unwrap_or(4),
+        // The 9B hybrid always carries gated attention and an LM output head.
+        attn_gate: 1,
+        n_cls_out: 0,
     }
 }
 

@@ -19,6 +19,8 @@
             ],
             false,
             false,
+            None,
+            None,
         );
 
         assert_eq!(
@@ -49,7 +51,7 @@
             },
         ];
         let (prompt, stable_len, preamble_len) =
-            super::render_qwen35_chat_prompt_with_boundaries(&messages, false, false);
+            super::render_qwen35_chat_prompt_with_boundaries(&messages, false, false, None, None);
         // Preamble ends right after the first user turn, before the assistant turn.
         let expected = "<|im_start|>system\nTool format: <parameter=...><|im_end|>\n<|im_start|>user\nfirst task<|im_end|>\n";
         assert_eq!(&prompt[..preamble_len], expected);
@@ -62,6 +64,84 @@
     }
 
     #[test]
+    fn enforcement_renders_past_stable_boundary() {
+        // The tool_choice must-call instruction lives in the volatile region
+        // with the generation header: the stable prefix is byte-identical
+        // with and without it, so forcing a call never perturbs the
+        // session-cache checkpoint prefix.
+        let messages = [
+            ChatTurn {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+            },
+            ChatTurn {
+                role: "user".to_string(),
+                content: "task".to_string(),
+            },
+        ];
+        let (plain, plain_stable, _) =
+            super::render_qwen35_chat_prompt_with_boundaries(&messages, false, false, None, None);
+        let (forced, forced_stable, _) = super::render_qwen35_chat_prompt_with_boundaries(
+            &messages,
+            false,
+            false,
+            Some("You must call the function \"verdict\"."),
+            None,
+        );
+        assert_eq!(plain_stable, forced_stable);
+        assert_eq!(plain[..plain_stable], forced[..forced_stable]);
+        assert_eq!(
+            &forced[forced_stable..],
+            "<|im_start|>user\nYou must call the function \"verdict\".<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn forced_tool_prefix_renders_past_stable_boundary_with_closed_think() {
+        // The named-tool_choice hard enforcement: the call opening renders
+        // after the generation header, in the volatile region (the stable
+        // prefix is byte-identical with and without it), and always on the
+        // closed-think header — an open <think> would swallow the call.
+        let messages = [
+            ChatTurn {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+            },
+            ChatTurn {
+                role: "user".to_string(),
+                content: "task".to_string(),
+            },
+        ];
+        let (plain, plain_stable, _) =
+            super::render_qwen35_chat_prompt_with_boundaries(&messages, false, false, None, None);
+        let (forced, forced_stable, _) = super::render_qwen35_chat_prompt_with_boundaries(
+            &messages,
+            false,
+            false,
+            Some("You must call the function \"useful\"."),
+            Some("<tool_call>\n<function=useful>\n"),
+        );
+        assert_eq!(plain_stable, forced_stable);
+        assert_eq!(plain[..plain_stable], forced[..forced_stable]);
+        assert_eq!(
+            &forced[forced_stable..],
+            "<|im_start|>user\nYou must call the function \"useful\".<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=useful>\n"
+        );
+
+        // Thinking requested + forced prefix -> the closed header still wins.
+        let (forced_thinking, _, _) = super::render_qwen35_chat_prompt_with_boundaries(
+            &messages,
+            true,
+            false,
+            None,
+            Some("<tool_call>\n<function=useful>\n"),
+        );
+        assert!(forced_thinking.ends_with(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=useful>\n"
+        ));
+    }
+
+    #[test]
     fn preamble_boundary_is_zero_without_user_turn() {
         // No user/tool turn -> no preamble floor (engine falls back to config sink).
         let messages = [ChatTurn {
@@ -69,7 +149,7 @@
             content: "only system".to_string(),
         }];
         let (_prompt, _stable, preamble_len) =
-            super::render_qwen35_chat_prompt_with_boundaries(&messages, false, false);
+            super::render_qwen35_chat_prompt_with_boundaries(&messages, false, false, None, None);
         assert_eq!(preamble_len, 0);
     }
 
@@ -80,11 +160,11 @@
             content: "<think>\nprivate\n</think>\n\nvisible".to_string(),
         }];
 
-        let stripped = super::render_qwen35_chat_prompt(&messages, true, false);
+        let stripped = super::render_qwen35_chat_prompt(&messages, true, false, None, None);
         assert!(stripped.contains("\nvisible<|im_end|>"));
         assert!(!stripped.contains("private"));
 
-        let preserved = super::render_qwen35_chat_prompt(&messages, true, true);
+        let preserved = super::render_qwen35_chat_prompt(&messages, true, true, None, None);
         assert!(preserved.contains("private"));
         assert!(preserved.contains("visible"));
 
@@ -92,7 +172,7 @@
             role: "assistant".to_string(),
             content: "<think>\nstill private".to_string(),
         }];
-        let stripped_unclosed = super::render_qwen35_chat_prompt(&unclosed, true, false);
+        let stripped_unclosed = super::render_qwen35_chat_prompt(&unclosed, true, false, None, None);
         assert!(!stripped_unclosed.contains("still private"));
     }
 
@@ -103,8 +183,8 @@
             content: "Say hi.".to_string(),
         }];
 
-        let thinking = super::render_qwen35_chat_prompt(&messages, true, false);
-        let non_thinking = super::render_qwen35_chat_prompt(&messages, false, false);
+        let thinking = super::render_qwen35_chat_prompt(&messages, true, false, None, None);
+        let non_thinking = super::render_qwen35_chat_prompt(&messages, false, false, None, None);
 
         assert!(thinking.ends_with("<|im_start|>assistant\n<think>\n"));
         assert!(non_thinking.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));

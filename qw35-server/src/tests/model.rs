@@ -1,8 +1,16 @@
     use super::{
-        plan_session_reuse, render_qwen35_chat_prompt, ChatTurn, Engine,
+        plan_session_reuse, render_qwen35_chat_prompt, ChatTurn, CheckpointStack, Engine,
         EngineConfig, GenerateRequest, SessionReuse, TokenLimit, DEFAULT_MODEL_ID,
     };
     use std::path::PathBuf;
+
+    fn stack_with(prefixes: &[&[u32]]) -> CheckpointStack {
+        let mut stack = CheckpointStack::new(8);
+        for prefix in prefixes {
+            stack.save(prefix.to_vec(), Box::new([]));
+        }
+        stack
+    }
 
     #[test]
     fn session_reuse_extends_live_state() {
@@ -10,7 +18,7 @@
         let evaluated = vec![1, 2, 3, 4];
         let prompt = vec![1, 2, 3, 4, 5, 6];
         assert_eq!(
-            plan_session_reuse(&evaluated, None, &prompt),
+            plan_session_reuse(&evaluated, &stack_with(&[]), &prompt),
             SessionReuse::Extend(4)
         );
     }
@@ -19,22 +27,20 @@
     fn session_reuse_always_leaves_one_token_to_evaluate() {
         // Identical prompt: the live state cannot be reused as-is because no
         // token would be left to produce logits, and the SSM state cannot
-        // rewind. Falls back to the checkpoint only if it is short enough.
+        // rewind. Falls back to a checkpoint only if it is short enough.
         let evaluated = vec![1, 2, 3, 4];
         let prompt = vec![1, 2, 3, 4];
         assert_eq!(
-            plan_session_reuse(&evaluated, None, &prompt),
+            plan_session_reuse(&evaluated, &stack_with(&[]), &prompt),
             SessionReuse::Reset
         );
-        let checkpoint = vec![1, 2, 3];
         assert_eq!(
-            plan_session_reuse(&evaluated, Some(&checkpoint), &prompt),
-            SessionReuse::Checkpoint(3)
+            plan_session_reuse(&evaluated, &stack_with(&[&[1, 2, 3]]), &prompt),
+            SessionReuse::Checkpoint { index: 0, len: 3 }
         );
         // A checkpoint covering the whole prompt is unusable too.
-        let full = vec![1, 2, 3, 4];
         assert_eq!(
-            plan_session_reuse(&evaluated, Some(&full), &prompt),
+            plan_session_reuse(&evaluated, &stack_with(&[&[1, 2, 3, 4]]), &prompt),
             SessionReuse::Reset
         );
     }
@@ -45,24 +51,25 @@
         // inside the generated region but still matches the prompt-boundary
         // checkpoint.
         let evaluated = vec![1, 2, 3, 9, 9];
-        let checkpoint = vec![1, 2, 3];
         let prompt = vec![1, 2, 3, 7, 8, 9];
         assert_eq!(
-            plan_session_reuse(&evaluated, Some(&checkpoint), &prompt),
-            SessionReuse::Checkpoint(3)
+            plan_session_reuse(&evaluated, &stack_with(&[&[1, 2, 3]]), &prompt),
+            SessionReuse::Checkpoint { index: 0, len: 3 }
         );
     }
 
     #[test]
     fn session_reuse_resets_for_unrelated_prompts() {
         let evaluated = vec![1, 2, 3, 4];
-        let checkpoint = vec![1, 2, 3];
         let prompt = vec![5, 6, 7, 8];
         assert_eq!(
-            plan_session_reuse(&evaluated, Some(&checkpoint), &prompt),
+            plan_session_reuse(&evaluated, &stack_with(&[&[1, 2, 3]]), &prompt),
             SessionReuse::Reset
         );
-        assert_eq!(plan_session_reuse(&[], None, &prompt), SessionReuse::Reset);
+        assert_eq!(
+            plan_session_reuse(&[], &stack_with(&[]), &prompt),
+            SessionReuse::Reset
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -174,7 +181,11 @@
                     ignore_eos: false,
                     stop_sequences: Vec::new(),
                     emit_reasoning: false,
-            stream_tool_call_xml: false,
+                    stream_tool_call_xml: false,
+                    parse_tool_calls: false,
+                    tool_choice_enforcement: None,
+                    forced_tool_prefix: None,
+                    session: crate::model::SessionKind::Main,
                 })
                 .unwrap_or_else(|err| panic!("turn {} failed: {err:?}", idx + 1));
             eprintln!("turn {} assistant: {:?}", idx + 1, generation.text);
@@ -188,6 +199,98 @@
                 content: generation.text,
             });
         }
+    }
+
+    /// A scratch-session interlude (qwowl35's judge/editor agents) must not
+    /// clobber the main session's KV rows: the main conversation's next turn
+    /// still extends/rewinds instead of resetting.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "loads the real Qwen3.5 GGUF; interleaves scratch requests between main turns"]
+    fn real_model_scratch_session_keeps_main_lineage_reusable() {
+        use super::{SessionKind, SessionPath};
+
+        let _gpu = real_model_gpu_lock();
+        let engine = Engine::open(EngineConfig {
+            model_path: PathBuf::from(real_model_path()),
+            model_id: DEFAULT_MODEL_ID.to_string(),
+            ctx_size: 4096,
+            prefill_chunk: 32,
+            kv_cache_type: crate::metal::KvCacheType::Q8_0,
+            session_cache: true,
+            checkpoint_cap: 8,
+            scratch_ctx: 2048,
+            attn_window: 0,
+            attn_sink: 0,
+            warm_weights: false,
+            test_responder: false,
+            verbose: false,
+        })
+        .unwrap_or_else(|err| panic!("failed to open real native engine: {err}"));
+
+        let request = |messages: Vec<ChatTurn>, session: SessionKind| GenerateRequest {
+            model: DEFAULT_MODEL_ID.to_string(),
+            messages,
+            max_tokens: TokenLimit::Fixed(16),
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repetition_penalty: 1.0,
+            repeat_last_n: -1,
+            enable_thinking: false,
+            preserve_thinking: false,
+            thinking_budget: None,
+            reasoning_budget_message: None,
+            ignore_eos: false,
+            stop_sequences: Vec::new(),
+            emit_reasoning: false,
+            stream_tool_call_xml: false,
+            parse_tool_calls: false,
+            tool_choice_enforcement: None,
+            forced_tool_prefix: None,
+            session,
+        };
+        let user = |content: &str| ChatTurn {
+            role: "user".to_string(),
+            content: content.to_string(),
+        };
+        let assistant = |content: String| ChatTurn {
+            role: "assistant".to_string(),
+            content,
+        };
+
+        // Main turn 1 (cold): builds the lineage and its boundary checkpoint.
+        let mut main_messages = vec![user("Reply with one short greeting.")];
+        let first = engine
+            .generate(&request(main_messages.clone(), SessionKind::Main))
+            .expect("main turn 1");
+        main_messages.push(assistant(first.text.clone()));
+
+        // Scratch interlude with an unrelated prompt: would reset the main
+        // lineage if it ran on the main session.
+        let scratch = engine
+            .generate(&request(
+                vec![user("Name one prime number.")],
+                SessionKind::Scratch,
+            ))
+            .expect("scratch interlude");
+        assert_eq!(scratch.timings.session, SessionKind::Scratch);
+
+        // Main turn 2: must reuse the lineage (extend or checkpoint), not reset.
+        main_messages.push(user("Now name one color."));
+        let second = engine
+            .generate(&request(main_messages, SessionKind::Main))
+            .expect("main turn 2");
+        assert_eq!(second.timings.session, SessionKind::Main);
+        assert_ne!(
+            second.timings.session_path,
+            SessionPath::Reset,
+            "scratch interlude clobbered the main session"
+        );
+        assert!(second.timings.cached_prompt_tokens > 0);
     }
 
     /// The real-model tests each open one or more engines that stream the
@@ -318,7 +421,7 @@
         }
 
         let engine = open_real_engine_with(32, 2048);
-        let mut text = render_qwen35_chat_prompt(&messages, false, false);
+        let mut text = render_qwen35_chat_prompt(&messages, false, false, None, None);
         text.push_str(&completion);
         let tokens = engine
             .tokenizer
@@ -449,7 +552,7 @@
                 role: "user".to_string(),
                 content: user.to_string(),
             }];
-            let mut text = render_qwen35_chat_prompt(&messages, false, false);
+            let mut text = render_qwen35_chat_prompt(&messages, false, false, None, None);
             text.push_str(assistant);
             let tokens = engine.tokenizer.encode(&text, true).expect("tokenize");
             let last = tokens.len() - 1;
@@ -515,6 +618,8 @@
             prefill_chunk,
             kv_cache_type: crate::metal::KvCacheType::Q8_0,
             session_cache: false,
+            checkpoint_cap: 0,
+            scratch_ctx: 0,
             attn_window: 0,
             attn_sink: 0,
             warm_weights: false,
@@ -556,7 +661,7 @@
                     role: "user".to_string(),
                     content: (*user).to_string(),
                 }];
-                let mut text = render_qwen35_chat_prompt(&messages, false, false);
+                let mut text = render_qwen35_chat_prompt(&messages, false, false, None, None);
                 text.push_str(assistant);
                 let tokens = base.tokenizer.encode(&text, true).expect("tokenize");
                 let begin = (tokens.len() / 4).max(15);
@@ -653,6 +758,8 @@
             prefill_chunk,
             kv_cache_type: crate::metal::KvCacheType::Q8_0,
             session_cache: false,
+            checkpoint_cap: 0,
+            scratch_ctx: 0,
             attn_window: 0,
             attn_sink: 0,
             warm_weights: false,
@@ -746,13 +853,19 @@
             stop_sequences: Vec::new(),
             emit_reasoning: false,
             stream_tool_call_xml: false,
+            parse_tool_calls: false,
+            tool_choice_enforcement: None,
+            forced_tool_prefix: None,
+            session: crate::model::SessionKind::Main,
         };
         let prompt = render_qwen35_chat_prompt(
             &request.messages,
             request.enable_thinking,
             request.preserve_thinking,
+            None,
+            None,
         );
-        
+
         engine
             .tokenizer
             .encode(&prompt, true)

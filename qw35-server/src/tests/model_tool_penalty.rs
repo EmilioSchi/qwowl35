@@ -37,6 +37,25 @@
     }
 
     #[test]
+    fn arm_activates_without_observing_the_open_token() {
+        // A forced tool-call prefix is prefilled prompt bytes: the decode
+        // loop never observes the open token, so the guard is armed
+        // explicitly; the model's own close still releases it.
+        let mut guard = ToolCallPenaltyGuard::new(Some(OPEN), Some(CLOSE));
+        guard.arm();
+        assert!(guard.active());
+        guard.observe(42);
+        assert!(guard.active());
+        guard.observe(CLOSE);
+        assert!(!guard.active());
+
+        // A disabled guard (missing ids) refuses to arm.
+        let mut disabled = ToolCallPenaltyGuard::new(Some(OPEN), None);
+        disabled.arm();
+        assert!(!disabled.active());
+    }
+
+    #[test]
     fn missing_either_token_id_disables_the_guard() {
         // Without a close id an open could latch active() forever; the guard
         // must refuse to arm at all.

@@ -24,6 +24,10 @@
             stop_sequences: Vec::new(),
             emit_reasoning: false,
             stream_tool_call_xml: false,
+            parse_tool_calls: false,
+            tool_choice_enforcement: None,
+            forced_tool_prefix: None,
+            session: crate::model::SessionKind::Main,
         }
     }
 

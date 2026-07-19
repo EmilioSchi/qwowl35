@@ -54,14 +54,29 @@ void qw35_metal_runtime_destroy(void *runtime);
 /// Wait for in-flight GPU work, then zero the conv/SSM recurrent state.
 int qw35_metal_runtime_reset(void *runtime, char *err, uintptr_t err_len);
 
-/// Copy the conv/SSM recurrent state into an internal checkpoint slot.
-int qw35_metal_runtime_state_checkpoint_save(void *runtime, char *err, uintptr_t err_len);
+/// Byte size of the conv/SSM recurrent state (the export/import payload).
+/// 0 on an invalid runtime.
+uint64_t qw35_metal_runtime_state_size(void *runtime);
 
-/// Restore the conv/SSM recurrent state from the internal checkpoint slot.
-int qw35_metal_runtime_state_checkpoint_restore(void *runtime, char *err, uintptr_t err_len);
+/// Copy the conv/SSM recurrent state into a caller-owned buffer of exactly
+/// qw35_metal_runtime_state_size bytes. Waits for in-flight GPU work first.
+int qw35_metal_runtime_state_export(
+        void *runtime, uint8_t *buf, uint64_t len, char *err, uintptr_t err_len);
+
+/// Restore the conv/SSM recurrent state from a buffer previously filled by
+/// qw35_metal_runtime_state_export. KV cache rows are untouched.
+int qw35_metal_runtime_state_import(
+        void *runtime, const uint8_t *buf, uint64_t len, char *err, uintptr_t err_len);
 
 /// Wait for all in-flight GPU work to complete.
 int qw35_metal_runtime_sync(void *runtime, char *err, uintptr_t err_len);
+
+/// Raise the runtime's context ceiling to `new_ctx` positions. The KV cache
+/// grows lazily toward the ceiling as positions are reached; nothing is
+/// reallocated or replayed. Values at or under the current ceiling are a
+/// no-op success; values past the slab-addressing cap fail.
+int qw35_metal_runtime_set_ctx(
+        void *runtime, uint32_t new_ctx, char *err, uintptr_t err_len);
 
 /// Set the decode-time sliding-window attention sink (first N positions always
 /// attended). The engine sets this per request to max(--attn-sink, preamble),

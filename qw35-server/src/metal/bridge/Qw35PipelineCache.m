@@ -54,8 +54,9 @@
                                          kvHeads:(int)kvHeads
                                          headDim:(int)headDim
                                          ropeDim:(int)ropeDim
+                                         hasGate:(BOOL)hasGate
                                            error:(NSError **)error {
-    NSString *key = [NSString stringWithFormat:@"%@#attn=%d/%d/%d/%d", name, heads, kvHeads, headDim, ropeDim];
+    NSString *key = [NSString stringWithFormat:@"%@#attn=%d/%d/%d/%d/%d", name, heads, kvHeads, headDim, ropeDim, hasGate ? 1 : 0];
 
     __block id<MTLComputePipelineState> result = nil;
     dispatch_sync(_syncQueue, ^{
@@ -67,10 +68,12 @@
         int kvHeadsVal = kvHeads;
         int headDimVal = headDim;
         int ropeDimVal = ropeDim;
+        BOOL hasGateVal = hasGate;
         [constants setConstantValue:&headsVal type:MTLDataTypeInt atIndex:750];
         [constants setConstantValue:&kvHeadsVal type:MTLDataTypeInt atIndex:751];
         [constants setConstantValue:&headDimVal type:MTLDataTypeInt atIndex:752];
         [constants setConstantValue:&ropeDimVal type:MTLDataTypeInt atIndex:753];
+        [constants setConstantValue:&hasGateVal type:MTLDataTypeBool atIndex:754];
 
         NSError *nsError = nil;
         id<MTLFunction> function = [self.library newFunctionWithName:name

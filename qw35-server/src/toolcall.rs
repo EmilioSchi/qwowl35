@@ -110,10 +110,12 @@ pub fn parse_tool_choice(value: Option<&serde_json::Value>) -> ToolChoice {
 /// the model emit well-formed `<tool_call>` blocks; an `examples`-style XML
 /// signature list (what this used to render) is off-distribution.
 ///
-/// The `ToolChoice::Required`/`Named` lines are our own enforcement suffix and
-/// are not part of the template; `Auto` reproduces the template exactly.
-pub fn render_tools_system_block(defs: &[ToolDef], choice: &ToolChoice) -> Option<String> {
-    if defs.is_empty() || *choice == ToolChoice::None {
+/// Callers gate on `ToolChoice::None` themselves (no advertisement at all);
+/// the `Required`/`Named` must-call instruction is NOT part of this block —
+/// it renders past the stable prompt boundary via [`enforcement_suffix`], so
+/// `tool_choice` never perturbs the session-cache checkpoint prefix.
+pub fn render_tools_system_block(defs: &[ToolDef]) -> Option<String> {
+    if defs.is_empty() {
         return None;
     }
     let mut out = String::from("# Tools\n\nYou have access to the following functions:\n\n<tools>");
@@ -148,16 +150,33 @@ Reminder:
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 </IMPORTANT>",
     );
+    Some(out)
+}
+
+/// The `tool_choice: required`/named must-call instruction. Rendered as a
+/// volatile user turn after the stable prompt boundary (see
+/// `render_qwen35_chat_prompt_with_boundaries`), not inside the `<tools>`
+/// system block, so forcing a call never changes the cached prefix.
+pub fn enforcement_suffix(choice: &ToolChoice) -> Option<String> {
     match choice {
         ToolChoice::Required => {
-            out.push_str("\n\nYou must call at least one function before answering.");
+            Some("You must call at least one function before answering.".to_string())
         }
-        ToolChoice::Named(name) => {
-            out.push_str(&format!("\n\nYou must call the function {name:?}."));
-        }
-        _ => {}
+        ToolChoice::Named(name) => Some(format!("You must call the function {name:?}.")),
+        ToolChoice::Auto | ToolChoice::None => None,
     }
-    Some(out)
+}
+
+/// The forced tool-call opening for a named `tool_choice`: injected into the
+/// prompt right after the generation header (past the stable boundary), so
+/// the model can only complete the call's parameters — prose is impossible,
+/// unlike the instruction-only [`enforcement_suffix`]. `required` stays
+/// instruction-only: the model must still pick which function to call.
+pub fn forced_call_prefix(choice: &ToolChoice) -> Option<String> {
+    match choice {
+        ToolChoice::Named(name) => Some(format!("<tool_call>\n<function={name}>\n")),
+        ToolChoice::Required | ToolChoice::Auto | ToolChoice::None => None,
+    }
 }
 
 /// Serializes a tool definition the way Jinja2's `tojson` filter does, so the
@@ -350,6 +369,10 @@ pub struct AssistantStreamParser {
     /// `ToolCallDemoted` before its text. Off = the legacy buffered behavior
     /// (Begin + one Args + End at block end).
     stream_raw: bool,
+    /// Detect `<tool_call>` / rootless `<function=` blocks at all. Off when
+    /// the request advertised no tools: the XML flows through as ordinary
+    /// content text while `<think>` handling keeps working.
+    parse_tool_calls: bool,
 }
 
 #[derive(Debug)]
@@ -388,12 +411,14 @@ impl AssistantStreamParser {
     /// `start_in_thinking` is set when the generation header already opened a
     /// `<think>` block in the prompt, so the model output begins inside it.
     pub fn new(start_in_thinking: bool) -> Self {
-        Self::with_options(start_in_thinking, false)
+        Self::with_options(start_in_thinking, false, true)
     }
 
     /// `stream_raw` turns on incremental tool-call streaming (see the field
     /// doc); only the flagged chat-completions stream uses it.
-    pub fn with_options(start_in_thinking: bool, stream_raw: bool) -> Self {
+    /// `parse_tool_calls` off disables tool-call detection entirely (see the
+    /// field doc); think handling is unaffected.
+    pub fn with_options(start_in_thinking: bool, stream_raw: bool, parse_tool_calls: bool) -> Self {
         Self {
             state: if start_in_thinking {
                 ParserState::Thinking
@@ -405,6 +430,7 @@ impl AssistantStreamParser {
             emitted_calls: 0,
             current_index: 0,
             stream_raw,
+            parse_tool_calls,
         }
     }
 
@@ -468,7 +494,7 @@ impl AssistantStreamParser {
         }
 
         let in_thinking = matches!(self.state, ParserState::Thinking);
-        if starts_with_function_call(&self.pending) {
+        if self.parse_tool_calls && starts_with_function_call(&self.pending) {
             match rootless_function_call_end(&self.pending) {
                 RootlessFunctionStatus::Ready(end) => {
                     let raw: String = self.pending.drain(..end).collect();
@@ -480,10 +506,11 @@ impl AssistantStreamParser {
                 RootlessFunctionStatus::NotToolCall => {}
             }
         }
-        let candidates: &[&str] = if in_thinking {
-            &["<tool_call>", "</think>"]
-        } else {
-            &["<tool_call>", "<think>", "</think>"]
+        let candidates: &[&str] = match (self.parse_tool_calls, in_thinking) {
+            (true, true) => &["<tool_call>", "</think>"],
+            (true, false) => &["<tool_call>", "<think>", "</think>"],
+            (false, true) => &["</think>"],
+            (false, false) => &["<think>", "</think>"],
         };
         for tag in candidates {
             if self.pending.starts_with(tag) {
@@ -528,16 +555,17 @@ impl AssistantStreamParser {
                 return true;
             }
         }
-        let possible_starts: &[&str] = if in_thinking {
-            &["<tool_call>", "<function=", "<function ", "</think>"]
-        } else {
-            &[
+        let possible_starts: &[&str] = match (self.parse_tool_calls, in_thinking) {
+            (true, true) => &["<tool_call>", "<function=", "<function ", "</think>"],
+            (true, false) => &[
                 "<tool_call>",
                 "<function=",
                 "<function ",
                 "<think>",
                 "</think>",
-            ]
+            ],
+            (false, true) => &["</think>"],
+            (false, false) => &["<think>", "</think>"],
         };
         if possible_starts
             .iter()
@@ -1429,8 +1457,12 @@ pub struct ParsedAssistantOutput {
 }
 
 /// Runs the parser over a complete generation (the non-streaming path).
-pub fn parse_assistant_text(text: &str, start_in_thinking: bool) -> ParsedAssistantOutput {
-    let mut parser = AssistantStreamParser::new(start_in_thinking);
+pub fn parse_assistant_text(
+    text: &str,
+    start_in_thinking: bool,
+    parse_tool_calls: bool,
+) -> ParsedAssistantOutput {
+    let mut parser = AssistantStreamParser::with_options(start_in_thinking, false, parse_tool_calls);
     let mut events = parser.feed(text);
     events.extend(parser.finish());
     assemble_events(&events)

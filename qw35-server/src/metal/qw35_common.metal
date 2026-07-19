@@ -9,6 +9,7 @@ using namespace metal;
 #define FC_ATTN_KV_HEADS 751
 #define FC_ATTN_HEAD_DIM 752
 #define FC_ATTN_ROPE_DIM 753
+#define FC_ATTN_HAS_GATE 754
 #define FC_COMPRESSED_VOCAB_SIZE 760
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 

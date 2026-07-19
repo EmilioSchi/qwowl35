@@ -1032,6 +1032,8 @@ fn open_engine(config: &DirectConfig) -> Result<(Engine, f64), String> {
         // Benchmarks measure full prefill cost; cross-run prefix reuse would
         // skew repeated identical prompts.
         session_cache: false,
+        checkpoint_cap: 0,
+        scratch_ctx: 0,
         // The bench reports its own timing; the engine's per-request log
         // would be redundant noise.
         verbose: false,
@@ -1073,6 +1075,10 @@ fn generate_request(prompt: &PromptConfig) -> GenerateRequest {
         stop_sequences: Vec::new(),
         emit_reasoning: false,
         stream_tool_call_xml: false,
+        parse_tool_calls: false,
+        tool_choice_enforcement: None,
+        forced_tool_prefix: None,
+        session: qw35_server::model::SessionKind::Main,
     }
 }
 

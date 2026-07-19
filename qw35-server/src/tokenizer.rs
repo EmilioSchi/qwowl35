@@ -54,6 +54,14 @@ pub struct DecodeState {
 
 impl QwenTokenizer {
     pub fn load(gguf: &MappedGguf) -> Result<Self, String> {
+        Self::load_with_pre(gguf, &["qwen35"])
+    }
+
+    /// Load with an explicit set of accepted `tokenizer.ggml.pre` values. The
+    /// hand-rolled pretokenizer below implements the qwen2-family regex
+    /// (single-digit numbers, contractions, punctuation runs), which `qwen35`
+    /// shares; the reranker's stock GGUF is tagged `qwen2`.
+    pub fn load_with_pre(gguf: &MappedGguf, allowed_pre: &[&str]) -> Result<Self, String> {
         let model = gguf
             .metadata_string("tokenizer.ggml.model")
             .ok_or("missing tokenizer.ggml.model")?
@@ -62,9 +70,9 @@ impl QwenTokenizer {
             .metadata_string("tokenizer.ggml.pre")
             .ok_or("missing tokenizer.ggml.pre")?
             .to_string();
-        if model != "gpt2" || pre != "qwen35" {
+        if model != "gpt2" || !allowed_pre.contains(&pre.as_str()) {
             return Err(format!(
-                "unsupported tokenizer model={model:?} pre={pre:?}; Qw35 expects gpt2/qwen35"
+                "unsupported tokenizer model={model:?} pre={pre:?}; expected gpt2 with pre in {allowed_pre:?}"
             ));
         }
 

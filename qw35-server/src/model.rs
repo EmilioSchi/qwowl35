@@ -24,6 +24,20 @@ use tool_penalty::ToolCallPenaltyGuard;
 pub const DEFAULT_MODEL_ID: &str = "qwen3.5-9b";
 pub const DEFAULT_PREFILL_CHUNK: u32 = 32;
 pub const MAX_PREFILL_CHUNK: u32 = 256;
+/// Default depth of the session checkpoint stack (recurrent-state snapshots
+/// at prompt history boundaries). Each snapshot costs `state_size()` bytes of
+/// host RAM (~tens of MB); see --checkpoints.
+pub const DEFAULT_CHECKPOINT_CAP: usize = 8;
+/// Default context size of the lazily-created scratch session (judge/editor
+/// standalone contexts are short); see --scratch-ctx.
+pub const DEFAULT_SCRATCH_CTX: u32 = 16384;
+/// KV slab granularity of the Metal cache (mirrors QW35_KV_INITIAL_SLAB in
+/// Qw35MetalRuntime.m); on-demand context growth rounds new ceilings up to it.
+const CTX_GROW_SLAB: u32 = 8192;
+/// Decode headroom guaranteed when growing a session's context for an
+/// until-EOS request (TokenLimit::Context), so a grown session never resumes
+/// with a sliver of output budget.
+const CTX_GROW_HEADROOM: u32 = 8192;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -33,6 +47,13 @@ pub struct EngineConfig {
     pub prefill_chunk: u32,
     pub kv_cache_type: metal::KvCacheType,
     pub session_cache: bool,
+    /// Max recurrent-state snapshots kept for prefix rewinds (--checkpoints).
+    /// 1 reproduces the legacy single-checkpoint behavior; 0 disables rewinds
+    /// (extend-or-reset only).
+    pub checkpoint_cap: usize,
+    /// Context size of the lazily-created scratch session (--scratch-ctx).
+    /// 0 disables the scratch session (qw35_session=scratch requests fail).
+    pub scratch_ctx: u32,
     /// Decode-time sliding-window attention (0 = full attention) and leading
     /// sink tokens, from --attn-window/--attn-sink. Passed to the Metal runtime.
     pub attn_window: i32,
@@ -87,6 +108,27 @@ pub struct GenerateRequest {
     /// the OpenAI-compatible buffered behavior. Only the chat-completions
     /// streaming path honors it.
     pub stream_tool_call_xml: bool,
+    /// Parse model-emitted `<tool_call>` XML into structured tool_calls.
+    /// True only when the request advertised tools (or a named tool_choice
+    /// forced a call opening); otherwise the XML passes through verbatim as
+    /// content so plain-text clients see it instead of losing it.
+    pub parse_tool_calls: bool,
+    /// `tool_choice: required`/named must-call instruction, rendered as a
+    /// user turn past the stable prompt boundary so it applies to this
+    /// generation only and never enters the session-cache checkpoint prefix.
+    pub tool_choice_enforcement: Option<String>,
+    /// Named-tool_choice hard enforcement: the `<tool_call>\n<function=X>\n`
+    /// opening injected into the prompt right after the generation header
+    /// (same volatile region), so the model can only complete the call's
+    /// parameters. Prompt bytes never reach the emitted text, so generation
+    /// seeds the text stream and the penalty guard with the prefix. The
+    /// caller must disable thinking when setting this (the render falls back
+    /// to the closed-think header regardless).
+    pub forced_tool_prefix: Option<String>,
+    /// Which GPU session to run on (`qw35_session` request field). Scratch
+    /// keeps short standalone contexts off the main lineage so they never
+    /// invalidate its KV rows or checkpoints.
+    pub session: SessionKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +175,13 @@ pub struct GenerationTimings {
     pub eval_count: u32,
     pub cached_prompt_tokens: u32,
     pub session_path: SessionPath,
+    /// Which GPU session served the request (main lineage or scratch).
+    pub session: SessionKind,
+    /// The serving session's live context ceiling after any on-demand growth.
+    /// Clients size their context-usage display against this.
+    pub session_ctx: u32,
+    /// Entries in the session's checkpoint stack after this request.
+    pub checkpoint_depth: u32,
     pub prefill_chunk: u32,
     pub prefill_path: PrefillPath,
 }
@@ -156,6 +205,31 @@ impl SessionPath {
             SessionPath::Reset => "reset",
             SessionPath::Extend => "extend",
             SessionPath::Checkpoint => "checkpoint",
+        }
+    }
+}
+
+/// Which GPU session a request runs on. `Main` is the long-lived pipeline
+/// lineage with the checkpoint stack. `Scratch` and `Plan` are smaller
+/// auxiliary runtimes for contexts that must not clobber each other or the
+/// main lineage (KV rows are positional; a divergent prompt resets from
+/// position 0): qwowl35 runs judge/editor interludes on `Scratch` and keeps
+/// the planner's persistent context on `Plan`, so the plan↔execute
+/// alternation never re-prefills the planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionKind {
+    #[default]
+    Main,
+    Scratch,
+    Plan,
+}
+
+impl SessionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionKind::Main => "main",
+            SessionKind::Scratch => "scratch",
+            SessionKind::Plan => "plan",
         }
     }
 }
@@ -189,6 +263,14 @@ pub enum GenerateError {
 
 pub struct Engine {
     metal_runtime: Option<Mutex<RuntimeSession>>,
+    /// Smaller auxiliary runtimes, created lazily on first use (weights are
+    /// no-copy views over the shared mmap; the real cost per slot is one KV
+    /// slab + activation buffers + pipeline warmup). `None` inside the mutex
+    /// until then. `scratch` hosts short interludes (qwowl35's judge and
+    /// editor); `plan` hosts the planner's persistent context so the
+    /// plan↔execute alternation never re-prefills it.
+    scratch_runtime: Mutex<Option<RuntimeSession>>,
+    plan_runtime: Mutex<Option<RuntimeSession>>,
     // The GPU reads the GF4 FFN weights directly from this mapping; it must
     // outlive metal_runtime (fields drop in declaration order).
     gguf: MappedGguf,
@@ -198,6 +280,8 @@ pub struct Engine {
     prefill_chunk: u32,
     kv_cache_type: metal::KvCacheType,
     session_cache: bool,
+    checkpoint_cap: usize,
+    scratch_ctx: u32,
     attn_window: i32,
     attn_sink: i32,
     test_responder: bool,
@@ -211,13 +295,137 @@ pub struct Engine {
 /// The Metal runtime plus the token bookkeeping that makes its GPU state
 /// reusable across requests. `evaluated` mirrors exactly the tokens whose
 /// evaluation has been submitted (KV rows 0..len written, SSM state advanced).
-/// `checkpoint` holds the token prefix that the runtime's saved recurrent
-/// state corresponds to (taken at the end of the latest prompt prefill); the
-/// hybrid SSM state cannot rewind, so this is the only rollback point.
+/// `checkpoints` holds recurrent-state snapshots taken at successive prompt
+/// history boundaries; the hybrid SSM state cannot rewind, so these are the
+/// only rollback points.
 struct RuntimeSession {
     runtime: metal::MetalRuntime,
     evaluated: Vec<u32>,
-    checkpoint: Option<Vec<u32>>,
+    checkpoints: CheckpointStack,
+    /// The session's live context ceiling. Starts at the configured size
+    /// (--ctx for main, --scratch-ctx for aux) and grows on demand toward
+    /// --ctx when a prompt outgrows it; the Metal KV cache extends lazily
+    /// underneath, so growth is a scalar bump, not a reallocation.
+    ctx_limit: u32,
+}
+
+/// One recurrent-state snapshot: the token prefix it corresponds to plus the
+/// exported SSM/conv state bytes. KV rows for positions below `tokens.len()`
+/// stay valid in the shared cache as long as nothing shallower is re-evaluated,
+/// so restoring is an import + suffix prefill.
+struct Checkpoint {
+    tokens: Vec<u32>,
+    state: Box<[u8]>,
+    last_used: u64,
+}
+
+/// A small set of checkpoints along the session's evaluated lineage. All
+/// entries are prefixes of one token history (deeper entries extend shallower
+/// ones); `plan_session_reuse` picks the deepest entry matching a new prompt,
+/// so short rewinds (dropping one tool exchange, starting the next pipeline
+/// stage or todo task) never re-prefill the kept context.
+struct CheckpointStack {
+    entries: Vec<Checkpoint>,
+    cap: usize,
+    clock: u64,
+}
+
+impl CheckpointStack {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            cap,
+            clock: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Deepest entry whose tokens are a strict prefix of `prompt` (at least
+    /// one prompt token must remain to evaluate).
+    fn deepest_match(&self, prompt: &[u32]) -> Option<(usize, usize)> {
+        let cap = prompt.len().saturating_sub(1);
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                let len = entry.tokens.len();
+                len > 0 && len <= cap && prompt[..len] == entry.tokens[..]
+            })
+            .max_by_key(|(_, entry)| entry.tokens.len())
+            .map(|(index, entry)| (index, entry.tokens.len()))
+    }
+
+    fn state_of(&self, index: usize) -> &[u8] {
+        &self.entries[index].state
+    }
+
+    /// After restoring `index`, prefill overwrites the KV rows above its
+    /// boundary: every deeper entry's rows are about to become garbage, so
+    /// drop them. Shallower entries keep only rows below their own (smaller)
+    /// boundary and stay valid. Also refreshes the restored entry's LRU stamp.
+    fn mark_restored(&mut self, index: usize) {
+        self.clock += 1;
+        self.entries[index].last_used = self.clock;
+        let len = self.entries[index].tokens.len();
+        self.entries.retain(|entry| entry.tokens.len() <= len);
+    }
+
+    /// Record a snapshot at a new boundary. An entry with identical tokens is
+    /// refreshed instead of duplicated. On overflow the least-recently-used
+    /// entry is evicted, but never the deepest (the equivalent of the old
+    /// single checkpoint — the most likely rewind target for the next
+    /// request) and never the entry just saved.
+    fn save(&mut self, tokens: Vec<u32>, state: Box<[u8]>) {
+        if self.cap == 0 {
+            return;
+        }
+        self.clock += 1;
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.tokens == tokens) {
+            entry.state = state;
+            entry.last_used = self.clock;
+            return;
+        }
+        self.entries.push(Checkpoint {
+            tokens,
+            state,
+            last_used: self.clock,
+        });
+        if self.entries.len() > self.cap {
+            let saved = self.entries.len() - 1;
+            let deepest = self
+                .entries
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, entry)| entry.tokens.len())
+                .map(|(index, _)| index)
+                .unwrap_or(saved);
+            let victim = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != saved && *index != deepest)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+                // Everything but the just-saved entry is protected only when
+                // cap forces a choice between it and the deepest; keep the
+                // fresh save (legacy single-slot semantics) and let the old
+                // deepest go.
+                .or_else(|| {
+                    self.entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| *index != saved)
+                        .min_by_key(|(_, entry)| entry.last_used)
+                        .map(|(index, _)| index)
+                });
+            if let Some(victim) = victim {
+                self.entries.remove(victim);
+            }
+        }
+    }
 }
 
 /// How much of the live session state a new prompt can reuse.
@@ -225,9 +433,9 @@ struct RuntimeSession {
 enum SessionReuse {
     /// Prompt strictly extends the evaluated tokens: prefill from this offset.
     Extend(usize),
-    /// Prompt matches the checkpoint prefix: restore the recurrent state and
-    /// prefill from this offset.
-    Checkpoint(usize),
+    /// Prompt matches a checkpointed prefix: restore that entry's recurrent
+    /// state and prefill from its boundary.
+    Checkpoint { index: usize, len: usize },
     Reset,
 }
 
@@ -235,17 +443,15 @@ enum SessionReuse {
 /// must always be (re-)evaluated so the output head runs on the last token.
 fn plan_session_reuse(
     evaluated: &[u32],
-    checkpoint: Option<&[u32]>,
+    checkpoints: &CheckpointStack,
     prompt: &[u32],
 ) -> SessionReuse {
     let cap = prompt.len().saturating_sub(1);
     if !evaluated.is_empty() && evaluated.len() <= cap && prompt[..evaluated.len()] == *evaluated {
         return SessionReuse::Extend(evaluated.len());
     }
-    if let Some(ckpt) = checkpoint {
-        if !ckpt.is_empty() && ckpt.len() <= cap && prompt[..ckpt.len()] == *ckpt {
-            return SessionReuse::Checkpoint(ckpt.len());
-        }
+    if let Some((index, len)) = checkpoints.deepest_match(prompt) {
+        return SessionReuse::Checkpoint { index, len };
     }
     SessionReuse::Reset
 }
@@ -301,12 +507,15 @@ impl Engine {
                     config.attn_sink,
                 )?,
                 evaluated: Vec::new(),
-                checkpoint: None,
+                checkpoints: CheckpointStack::new(config.checkpoint_cap),
+                ctx_limit: config.ctx_size,
             }))
         };
 
         Ok(Self {
             metal_runtime,
+            scratch_runtime: Mutex::new(None),
+            plan_runtime: Mutex::new(None),
             gguf,
             model_path: config.model_path,
             model_id: config.model_id,
@@ -314,6 +523,8 @@ impl Engine {
             prefill_chunk: config.prefill_chunk,
             kv_cache_type: config.kv_cache_type,
             session_cache: config.session_cache,
+            checkpoint_cap: config.checkpoint_cap,
+            scratch_ctx: config.scratch_ctx,
             attn_window: config.attn_window,
             attn_sink: config.attn_sink,
             test_responder: config.test_responder,
@@ -351,6 +562,112 @@ impl Engine {
 
     pub fn session_cache(&self) -> bool {
         self.session_cache
+    }
+
+    pub fn checkpoint_cap(&self) -> usize {
+        self.checkpoint_cap
+    }
+
+    /// Build an auxiliary RuntimeSession (scratch or plan): same model and
+    /// knobs as the main session but a smaller context and a minimal
+    /// checkpoint stack. Two snapshot slots (not the main cap): a multi-turn
+    /// aux context (the editor agent, the planner's review pings) re-renders
+    /// its history each turn, so without a boundary snapshot every
+    /// continuation would reset and re-prefill the whole context; the
+    /// snapshot size is ctx-independent, so this costs ~two state copies of
+    /// host RAM per slot.
+    fn open_aux_session(&self, kind: SessionKind) -> Result<RuntimeSession, String> {
+        if self.scratch_ctx == 0 {
+            return Err(format!(
+                "the {} session is disabled (--scratch-ctx 0); run this request on the main session",
+                kind.as_str()
+            ));
+        }
+        let vocab_size = self
+            .tokenizer
+            .spec
+            .vocab_size
+            .try_into()
+            .map_err(|_| "tokenizer vocabulary is too large for the native Metal runtime".to_string())?;
+        if self.verbose {
+            eprintln!(
+                "qw35: creating {} session (ctx={}, kv={})",
+                kind.as_str(),
+                self.scratch_ctx,
+                self.kv_cache_type.as_str()
+            );
+        }
+        Ok(RuntimeSession {
+            runtime: metal::MetalRuntime::new(
+                &self.gguf,
+                &self.graph_plan.hparams,
+                self.scratch_ctx,
+                vocab_size,
+                self.prefill_chunk,
+                self.kv_cache_type,
+                self.attn_window,
+                self.attn_sink,
+            )?,
+            evaluated: Vec::new(),
+            checkpoints: CheckpointStack::new(2),
+            ctx_limit: self.scratch_ctx,
+        })
+    }
+
+    /// Raise `session`'s context ceiling so the prompt plus its decode budget
+    /// fits, instead of rejecting the request outright. The ceiling grows in
+    /// KV-slab steps and is capped at --ctx, so an aux session that outgrows
+    /// its cheap initial size ends up with the same budget as the main
+    /// session. Growth failures are logged and non-fatal: admission then runs
+    /// against the old ceiling and reports the honest limit error.
+    fn ensure_session_ctx(
+        &self,
+        session: &mut RuntimeSession,
+        kind: SessionKind,
+        limit: TokenLimit,
+        prompt_tokens: usize,
+    ) -> u32 {
+        let desired_output = match limit {
+            TokenLimit::Fixed(max_tokens) => max_tokens as u64,
+            TokenLimit::Context => CTX_GROW_HEADROOM as u64,
+        };
+        let needed = prompt_tokens as u64 + desired_output;
+        let cap = self.ctx_size as u64;
+        if needed <= session.ctx_limit as u64 || session.ctx_limit as u64 >= cap {
+            return session.ctx_limit;
+        }
+        let slab = CTX_GROW_SLAB as u64;
+        let target = (needed.div_ceil(slab) * slab).min(cap) as u32;
+        if target <= session.ctx_limit {
+            return session.ctx_limit;
+        }
+        match session.runtime.set_ctx_size(target) {
+            Ok(()) => {
+                eprintln!(
+                    "qw35: grew {} session ctx {} -> {} (prompt {} tok)",
+                    kind.as_str(),
+                    session.ctx_limit,
+                    target,
+                    prompt_tokens
+                );
+                session.ctx_limit = target;
+            }
+            Err(err) => {
+                eprintln!("qw35: failed to grow {} session ctx: {err}", kind.as_str());
+            }
+        }
+        session.ctx_limit
+    }
+
+    /// Measured byte size of one recurrent-state snapshot (0 without the
+    /// native runtime). Startup logs it so the --checkpoints RAM budget
+    /// (cap x this) is visible.
+    pub fn state_snapshot_size(&self) -> usize {
+        self.metal_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.lock().ok())
+            .map(|session| session.runtime.state_size())
+            .unwrap_or(0)
     }
 
     /// True when decode uses baked FFN weights — i.e. a unified .gguf whose
@@ -450,7 +767,7 @@ impl Engine {
         self.validate_generate_request(request)?;
 
         if !self.test_responder {
-            return self.generate_native(request, |_| Ok(()), |_, _| {});
+            return self.generate_native(request, |_| Ok(()), |_, _, _| {});
         }
 
         let last_user = request
@@ -478,6 +795,8 @@ impl Engine {
             &request.messages,
             request.enable_thinking,
             request.preserve_thinking,
+            request.tool_choice_enforcement.as_deref(),
+            request.forced_tool_prefix.as_deref(),
         );
         let render_duration = render_start.elapsed();
 
@@ -487,7 +806,8 @@ impl Engine {
             .encode(&prompt, true)
             .map(|tokens| tokens.len() as u32)
             .unwrap_or_else(|_| rough_token_count(&prompt));
-        let max_tokens = self.resolve_max_tokens(request.max_tokens, prompt_tokens as usize)?;
+        let max_tokens =
+            self.resolve_max_tokens(request.max_tokens, prompt_tokens as usize, self.ctx_size)?;
         let mut finish_reason = FinishReason::Stop;
         if let Some(idx) = earliest_stop_match(&text, &request.stop_sequences) {
             text.truncate(idx);
@@ -516,6 +836,7 @@ impl Engine {
                 tokenize_duration,
                 prompt_eval_count: prompt_tokens,
                 eval_count: completion_tokens,
+                session_ctx: self.ctx_size,
                 prefill_chunk: self.prefill_chunk,
                 prefill_path: PrefillPath::Scalar,
                 ..GenerationTimings::default()
@@ -531,13 +852,16 @@ impl Engine {
     where
         F: FnMut(&str) -> Result<(), String>,
     {
-        self.generate_stream_with_progress(request, on_text, |_, _| {})
+        self.generate_stream_with_progress(request, on_text, |_, _, _| {})
     }
 
     /// Like [`generate_stream`], but also reports prompt-processing (prefill)
-    /// progress through `on_prefill(processed_tokens, total_tokens)`. This is a
-    /// pure server-side side-channel; the OpenAI streaming contract is unchanged
-    /// (the handler ships progress in choice-less chunks that clients ignore).
+    /// progress through `on_prefill(processed_tokens, total_tokens,
+    /// session_ctx)` — the third value is the serving session's live context
+    /// ceiling after any on-demand growth, so clients can scale a usage
+    /// display. This is a pure server-side side-channel; the OpenAI streaming
+    /// contract is unchanged (the handler ships progress in choice-less
+    /// chunks that clients ignore).
     pub fn generate_stream_with_progress<F, P>(
         &self,
         request: &GenerateRequest,
@@ -546,7 +870,7 @@ impl Engine {
     ) -> Result<Generation, GenerateError>
     where
         F: FnMut(&str) -> Result<(), String>,
-        P: FnMut(usize, usize),
+        P: FnMut(usize, usize, u32),
     {
         let total_start = Instant::now();
         self.validate_generate_request(request)?;
@@ -578,6 +902,8 @@ impl Engine {
             &request.messages,
             request.enable_thinking,
             request.preserve_thinking,
+            request.tool_choice_enforcement.as_deref(),
+            request.forced_tool_prefix.as_deref(),
         );
         match self.tokenizer.encode(&prompt, true) {
             Ok(tokens) => Ok(tokens.len() as u32),
@@ -647,12 +973,12 @@ impl Engine {
         &self,
         limit: TokenLimit,
         prompt_tokens: usize,
+        session_ctx: u32,
     ) -> Result<u32, GenerateError> {
-        let ctx_size = self.ctx_size as usize;
+        let ctx_size = session_ctx as usize;
         if prompt_tokens >= ctx_size {
             return Err(GenerateError::BadRequest(format!(
-                "prompt requires {prompt_tokens} context slots, but --ctx is {}",
-                self.ctx_size
+                "prompt requires {prompt_tokens} context slots, but the session context is {session_ctx}"
             )));
         }
 
@@ -661,8 +987,7 @@ impl Engine {
                 let max_needed = prompt_tokens.saturating_add(max_tokens as usize);
                 if max_needed > ctx_size {
                     return Err(GenerateError::BadRequest(format!(
-                        "prompt plus max_tokens requires {max_needed} context slots, but --ctx is {}",
-                        self.ctx_size
+                        "prompt plus max_tokens requires {max_needed} context slots, but the session context is {session_ctx}"
                     )));
                 }
                 Ok(max_tokens)
@@ -720,17 +1045,19 @@ impl Engine {
         &self,
         request: &GenerateRequest,
         mut on_text: F,
-        mut on_prefill: P,
+        mut report_prefill: P,
     ) -> Result<Generation, GenerateError>
     where
         F: FnMut(&str) -> Result<(), String>,
-        P: FnMut(usize, usize),
+        P: FnMut(usize, usize, u32),
     {
         let total_start = Instant::now();
         let (prompt, stable_len, preamble_len) = render_qwen35_chat_prompt_with_boundaries(
             &request.messages,
             request.enable_thinking,
             request.preserve_thinking,
+            request.tool_choice_enforcement.as_deref(),
+            request.forced_tool_prefix.as_deref(),
         );
         let render_duration = total_start.elapsed();
 
@@ -775,17 +1102,58 @@ impl Engine {
                 "rendered prompt produced no tokens".to_string(),
             ));
         }
-        let max_tokens = self.resolve_max_tokens(request.max_tokens, prompt_tokens.len())?;
-
-        let runtime = self.metal_runtime.as_ref().ok_or_else(|| {
-            GenerateError::InferenceUnavailable(self.inference_unavailable_message())
-        })?;
         let lock_start = Instant::now();
-        let mut session_guard = runtime.lock().map_err(|_| {
-            GenerateError::InferenceUnavailable("native Metal runtime lock is poisoned".to_string())
-        })?;
-        let session = &mut *session_guard;
+        let mut main_guard;
+        let mut aux_guard;
+        let session: &mut RuntimeSession = match request.session {
+            SessionKind::Main => {
+                let runtime = self.metal_runtime.as_ref().ok_or_else(|| {
+                    GenerateError::InferenceUnavailable(self.inference_unavailable_message())
+                })?;
+                main_guard = runtime.lock().map_err(|_| {
+                    GenerateError::InferenceUnavailable(
+                        "native Metal runtime lock is poisoned".to_string(),
+                    )
+                })?;
+                &mut *main_guard
+            }
+            SessionKind::Scratch | SessionKind::Plan => {
+                let slot = match request.session {
+                    SessionKind::Plan => &self.plan_runtime,
+                    _ => &self.scratch_runtime,
+                };
+                aux_guard = slot.lock().map_err(|_| {
+                    GenerateError::InferenceUnavailable(
+                        "auxiliary Metal runtime lock is poisoned".to_string(),
+                    )
+                })?;
+                if aux_guard.is_none() {
+                    // Lazy build under the lock: only ever one aux client per
+                    // slot (the qwowl35 orchestrator runs agents sequentially).
+                    *aux_guard = Some(
+                        self.open_aux_session(request.session)
+                            .map_err(GenerateError::InferenceUnavailable)?,
+                    );
+                }
+                aux_guard.as_mut().expect("aux session just created")
+            }
+        };
         let runtime_lock_duration = lock_start.elapsed();
+
+        // Admission runs against the session's LIVE ceiling, grown on demand
+        // toward --ctx first: a long conversation upgrades its session instead
+        // of dying on the aux size it happened to start with.
+        let session_ctx = self.ensure_session_ctx(
+            session,
+            request.session,
+            request.max_tokens,
+            prompt_tokens.len(),
+        );
+        let max_tokens =
+            self.resolve_max_tokens(request.max_tokens, prompt_tokens.len(), session_ctx)?;
+        // Prefill progress carries the (possibly just-grown) live ceiling.
+        let mut on_prefill =
+            |processed: usize, total: usize| report_prefill(processed, total, session_ctx);
 
         // Pin system prompt + first user turn under the sliding window: the
         // effective sink is at least the preamble length, so the windowed
@@ -796,14 +1164,10 @@ impl Engine {
         }
 
         // Session prefix cache: reuse live GPU state when the new prompt
-        // extends it, rewind to the prompt-boundary checkpoint when it
-        // diverged inside the previous generation, else start from scratch.
+        // extends it, rewind to the deepest matching boundary checkpoint when
+        // it diverged further back, else start from scratch.
         let reuse = if self.session_cache {
-            plan_session_reuse(
-                &session.evaluated,
-                session.checkpoint.as_deref(),
-                &prompt_tokens,
-            )
+            plan_session_reuse(&session.evaluated, &session.checkpoints, &prompt_tokens)
         } else {
             SessionReuse::Reset
         };
@@ -811,11 +1175,18 @@ impl Engine {
         let reset_start = Instant::now();
         let (cached, session_path) = match reuse {
             SessionReuse::Extend(n) => (n, SessionPath::Extend),
-            SessionReuse::Checkpoint(c) => {
-                if session.runtime.state_checkpoint_restore().is_ok() {
-                    (c, SessionPath::Checkpoint)
+            SessionReuse::Checkpoint { index, len } => {
+                let restored = {
+                    let state = session.checkpoints.state_of(index);
+                    session.runtime.state_import(state).is_ok()
+                };
+                if restored {
+                    // Prefill will overwrite KV rows above this boundary:
+                    // deeper entries become garbage and are dropped.
+                    session.checkpoints.mark_restored(index);
+                    (len, SessionPath::Checkpoint)
                 } else {
-                    session.checkpoint = None;
+                    session.checkpoints.clear();
                     (0, SessionPath::Reset)
                 }
             }
@@ -826,9 +1197,9 @@ impl Engine {
                 .runtime
                 .reset()
                 .map_err(GenerateError::InferenceUnavailable)?;
-            // The full prompt will overwrite KV rows from position 0, so the
-            // checkpoint's cache rows are no longer trustworthy.
-            session.checkpoint = None;
+            // The full prompt will overwrite KV rows from position 0, so
+            // every checkpoint's cache rows are no longer trustworthy.
+            session.checkpoints.clear();
         }
         // Pessimistic: the live state is unknown until this request finishes
         // cleanly; the checkpoint stays valid because positions below it are
@@ -861,8 +1232,11 @@ impl Engine {
         .map_err(GenerateError::InferenceUnavailable)?;
         if history_len > 0 && cached < history_len {
             // Waits for phase A internally; failure only disables the rewind.
-            if session.runtime.state_checkpoint_save().is_ok() {
-                session.checkpoint = Some(prompt_tokens[..history_len].to_vec());
+            let mut state = vec![0u8; session.runtime.state_size()].into_boxed_slice();
+            if !state.is_empty() && session.runtime.state_export(&mut state).is_ok() {
+                session
+                    .checkpoints
+                    .save(prompt_tokens[..history_len].to_vec(), state);
             }
         }
         // Phase B: the generation header (plus any history already covered by
@@ -928,6 +1302,20 @@ impl Engine {
             self.tokenizer.spec.tool_call_token_id,
             self.tokenizer.spec.end_tool_call_token_id,
         );
+
+        // A forced tool-call opening was prefilled as prompt bytes, which the
+        // emitted text and the penalty guard never see: seed both, so the
+        // downstream parser reconstructs a complete `<tool_call>` block (the
+        // OpenAI tool_calls array and finish_reason depend on it) and
+        // penalties stay suspended inside the forced body. The stop watcher
+        // is deliberately not fed — the forced region cannot end generation.
+        if let Some(prefix) = request.forced_tool_prefix.as_deref() {
+            tool_penalty_guard.arm();
+            let callback_start = Instant::now();
+            on_text(prefix).map_err(GenerateError::InferenceUnavailable)?;
+            stream_callback_duration += callback_start.elapsed();
+            rendered.push_str(prefix);
+        }
 
         // Fast-path per-window decode-tps trace (QW35_DECODE_TRACE): prints the
         // instantaneous tok/s every 128 decoded tokens with the current ctx, so a
@@ -1085,6 +1473,9 @@ impl Engine {
                 eval_count,
                 cached_prompt_tokens: cached as u32,
                 session_path,
+                session: request.session,
+                session_ctx,
+                checkpoint_depth: session.checkpoints.entries.len() as u32,
                 prefill_chunk: self.prefill_chunk,
                 prefill_path,
             },
@@ -1319,3 +1710,7 @@ fn unix_time() -> u64 {
 #[cfg(test)]
 #[path = "tests/model.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/model_checkpoints.rs"]
+mod tests_checkpoints;

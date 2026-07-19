@@ -19,6 +19,13 @@ constant int QW35_ATTN_HEAD_DIM_CONST [[function_constant(FC_ATTN_HEAD_DIM)]];
 
 constant int QW35_ATTN_ROPE_DIM_CONST [[function_constant(FC_ATTN_ROPE_DIM)]];
 
+// Gated attention (Qwen3.5 hybrid): the Q projection emits [q | gate] per head
+// (stride head_dim*2) and a sigmoid output gate multiplies the attention
+// result. Ungated dense Qwen3 (the reranker) has stride head_dim and no gate.
+// Compile-time constant, so the gated-true codegen is identical to the
+// pre-constant kernels.
+constant bool QW35_ATTN_HAS_GATE [[function_constant(FC_ATTN_HAS_GATE)]];
+
 kernel void qw35_attn_decode_preprocess_f32(
     device const float * q_full [[buffer(0)]],
     device const float * k_src [[buffer(1)]],
@@ -58,7 +65,7 @@ kernel void qw35_attn_decode_preprocess_f32(
     if (idx < uint(q_dim)) {
         const int h = int(idx) / hd;
         const int d = int(idx) - h * hd;
-        const int q_base = h * hd * 2;
+        const int q_base = h * hd * (QW35_ATTN_HAS_GATE ? 2 : 1);
         float ss = 0.0f;
         for (int j = 0; j < hd; j++) {
             const float v = q_full[q_base + j];
@@ -74,7 +81,9 @@ kernel void qw35_attn_decode_preprocess_f32(
         } else {
             q_dst[idx] = q_full[q_base + d] * inv * q_norm_w[d];
         }
-        gate_dst[idx] = q_full[q_base + hd + d];
+        if (QW35_ATTN_HAS_GATE) {
+            gate_dst[idx] = q_full[q_base + hd + d];
+        }
     }
 
     if (idx < uint(kv_dim)) {
@@ -151,7 +160,8 @@ kernel void qw35_attn_prefill_preprocess_f32(
     if (idx < q_dim) {
         const int h = idx / hd;
         const int d = idx - h * hd;
-        const int q_base = token * q_dim * 2 + h * hd * 2;
+        const int qs = QW35_ATTN_HAS_GATE ? 2 : 1;
+        const int q_base = (token * q_dim + h * hd) * qs;
         float ss = 0.0f;
         for (int j = 0; j < hd; j++) {
             const float v = q_full[q_base + j];
@@ -168,7 +178,9 @@ kernel void qw35_attn_prefill_preprocess_f32(
         } else {
             q_dst[out] = q_full[q_base + d] * inv * q_norm_w[d];
         }
-        gate_dst[out] = q_full[q_base + hd + d];
+        if (QW35_ATTN_HAS_GATE) {
+            gate_dst[out] = q_full[q_base + hd + d];
+        }
     }
 
     if (idx < kv_dim) {
@@ -223,6 +235,9 @@ kernel void qw35_attention_gqa_flash_decode_f32(
     const int kv_dim = QW35_ATTN_N_KV_HEAD * hd;
     const int q_off = h * hd;
     const int d0 = int(lane) * 8;
+    // 32 lanes x 8 elems cover head_dim 256; smaller heads (dense Qwen3, 128)
+    // leave the high lanes idle. Compile-time no-op when head_dim == 256.
+    if (QW35_ATTN_HEAD_DIM_CONST < 256 && d0 >= hd) return;
     const int layer_base = slot_i * (kv_slab * kv_dim);
 
     float qv[8];
@@ -272,7 +287,7 @@ kernel void qw35_attention_gqa_flash_decode_f32(
 
     const int out = h * hd + d0;
     for (int i = 0; i < 8; i++) {
-        dst[out + i] = (acc[i] / l) * qw35_sigmoid_f32(gate[out + i]);
+        dst[out + i] = (acc[i] / l) * (QW35_ATTN_HAS_GATE ? qw35_sigmoid_f32(gate[out + i]) : 1.0f);
     }
 }
 
@@ -351,7 +366,7 @@ kernel void qw35_attn_decode_preprocess_##TAG##_f32( \
     if (idx < uint(q_dim)) { \
         const int h = int(idx) / hd; \
         const int d = int(idx) - h * hd; \
-        const int q_base = h * hd * 2; \
+        const int q_base = h * hd * (QW35_ATTN_HAS_GATE ? 2 : 1); \
         float ss = 0.0f; \
         for (int j = 0; j < hd; j++) { ss += q_full[q_base + j] * q_full[q_base + j]; } \
         const float inv = rsqrt(ss / float(hd) + eps); \
@@ -364,7 +379,9 @@ kernel void qw35_attn_decode_preprocess_##TAG##_f32( \
         } else { \
             q_dst[idx] = q_full[q_base + d] * inv * q_norm_w[d]; \
         } \
-        gate_dst[idx] = q_full[q_base + hd + d]; \
+        if (QW35_ATTN_HAS_GATE) { \
+            gate_dst[idx] = q_full[q_base + hd + d]; \
+        } \
     } \
     if (idx < uint(kv_dim)) { \
         const int h = int(idx) / hd; \
@@ -438,7 +455,8 @@ kernel void qw35_attn_prefill_preprocess_##TAG##_f32( \
     if (active && idx < q_dim) { \
         const int h = idx / hd; \
         const int d = idx - h * hd; \
-        const int q_base = token * q_dim * 2 + h * hd * 2; \
+        const int qs = QW35_ATTN_HAS_GATE ? 2 : 1; \
+        const int q_base = (token * q_dim + h * hd) * qs; \
         float ss = 0.0f; \
         for (int j = 0; j < hd; j++) { ss += q_full[q_base + j] * q_full[q_base + j]; } \
         const float inv = rsqrt(ss / float(hd) + eps); \
@@ -452,7 +470,9 @@ kernel void qw35_attn_prefill_preprocess_##TAG##_f32( \
         } else { \
             q_dst[out] = q_full[q_base + d] * inv * q_norm_w[d]; \
         } \
-        gate_dst[out] = q_full[q_base + hd + d]; \
+        if (QW35_ATTN_HAS_GATE) { \
+            gate_dst[out] = q_full[q_base + hd + d]; \
+        } \
     } \
     if (active && idx < kv_dim) { \
         const int h = idx / hd; \
@@ -507,6 +527,7 @@ kernel void qw35_attention_gqa_flash_decode_##TAG##_f32( \
     const int blocks_per_row = kv_dim / QK; \
     const int q_off = h * hd; \
     const int d0 = int(lane) * 8; \
+    if (QW35_ATTN_HEAD_DIM_CONST < 256 && d0 >= hd) return; \
     const int eb = kv_h * hd + d0; \
     const int blk_i = eb / QK; \
     const int e0 = eb % QK; \
@@ -544,7 +565,7 @@ kernel void qw35_attention_gqa_flash_decode_##TAG##_f32( \
     } \
     const int out = h * hd + d0; \
     for (int i = 0; i < 8; i++) { \
-        dst[out + i] = (acc[i] / l) * qw35_sigmoid_f32(gate[out + i]); \
+        dst[out + i] = (acc[i] / l) * (QW35_ATTN_HAS_GATE ? qw35_sigmoid_f32(gate[out + i]) : 1.0f); \
     } \
 }
 
@@ -584,6 +605,7 @@ kernel void qw35_attention_gqa_prefill_f32(
     const int kv_dim = QW35_ATTN_N_KV_HEAD * hd;
     const int q_off = token * out_dim + h * hd;
     const int d0 = int(lane) * 8;
+    if (QW35_ATTN_HEAD_DIM_CONST < 256 && d0 >= hd) return;
     const int seq_len = int(pos0) + token + 1;
     const int layer_base = slot_i * (kv_slab * kv_dim);
 
@@ -615,7 +637,7 @@ kernel void qw35_attention_gqa_prefill_f32(
 
     const int out = token * out_dim + h * hd + d0;
     for (int i = 0; i < 8; i++)
-        dst[out + i] = (acc[i] / l) * qw35_sigmoid_f32(gate[out + i]);
+        dst[out + i] = (acc[i] / l) * (QW35_ATTN_HAS_GATE ? qw35_sigmoid_f32(gate[out + i]) : 1.0f);
 }
 
 kernel void qw35_attention_gqa_prefill_q8_0_f32(
@@ -647,6 +669,7 @@ kernel void qw35_attention_gqa_prefill_q8_0_f32(
     const int blocks_per_row = kv_dim / QW35_QK8_0;
     const int q_off = token * out_dim + h * hd;
     const int d0 = int(lane) * 8;
+    if (QW35_ATTN_HEAD_DIM_CONST < 256 && d0 >= hd) return;
     const int eb = kv_h * hd + d0;
     const int blk_i = eb / QW35_QK8_0;
     const int e0 = eb % QW35_QK8_0;
@@ -682,5 +705,5 @@ kernel void qw35_attention_gqa_prefill_q8_0_f32(
 
     const int out = token * out_dim + h * hd + d0;
     for (int i = 0; i < 8; i++)
-        dst[out + i] = (acc[i] / l) * qw35_sigmoid_f32(gate[out + i]);
+        dst[out + i] = (acc[i] / l) * (QW35_ATTN_HAS_GATE ? qw35_sigmoid_f32(gate[out + i]) : 1.0f);
 }
