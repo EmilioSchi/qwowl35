@@ -62,6 +62,7 @@ GUIDANCE_EXECUTOR = _BASE.replace(
     "<<WRITE_FEEDBACK_BULLET>>",
     """\
 - When a command writes a source file via `>` or `>>`, the result ends with a
-  `Syntax check (<lang>)` block for that file. If it lists errors, fix ONLY
-  those lines with the `edit` tool — do NOT rewrite the file through bash.""",
+  `Syntax check (<lang>)` block for that file. If it lists errors, fix the
+  reported lines (and whatever else the fix requires) with the `edit` tool — do
+  NOT rewrite the file through bash.""",
 )

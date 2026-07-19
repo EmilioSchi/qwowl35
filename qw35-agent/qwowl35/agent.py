@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -96,6 +97,12 @@ def repeated_tool_message(
 # The shell tool's wire name (qwen-code's trained `run_shell_command`) plus
 # the legacy "bash" alias still used by older transcripts and tests.
 SHELL_TOOL_NAMES = frozenset({"bash", "run_shell_command"})
+
+# The anchored mutation tools. When the model emits several of these together in
+# one turn on the SAME file, the runner coalesces the contiguous run into one
+# batch (one write, one diff, one syntax/LSP pass) via ``registry.execute_batch``
+# instead of validating each separately. See ``_edit_batch_slice`` / ``_run_edit_batch``.
+_EDIT_TOOL_NAMES = frozenset({"replace", "insert", "delete"})
 
 # Registry strings for a bash command that was gated and never executed. No file
 # was written, so a wholesale-write target in such a command must not be recorded
@@ -722,94 +729,28 @@ class TurnRunner:
 
             malformed_tool_retries = 0
             executed_this_turn = False
-            for call in turn.tool_calls:
-                self.ui.set_state(mascot.state_for_tool(call.name))
-                # Stage discipline: a call outside the active stage's toolset is
-                # denied with an error result — never executed. Inert (None) in
-                # freestyle mode.
-                if self.allowed_tools is not None and call.name not in self.allowed_tools:
-                    result = stage_violation_message(call.name, self.allowed_tools)
-                    self.ui.chat.add_tool_result(call.index, call.name, result, is_error=True)
-                    self._append_tool_message(call, result, is_error=True)
-                    continue
-                # The call box was already streamed in during _stream_assistant.
-                signature = self._tool_signature(call.name, call.arguments)
-                # Dedup semantics differ by tool. `plan` and `explore`:
-                # per-tool and turn-persistent (a planner once laundered
-                # identical lists through interleaved ask_user_question
-                # calls; an identical `explore` re-spawn burns a whole
-                # sub-agent run for a report it already has). Shell and
-                # web_fetch: STRICTLY CONSECUTIVE — an identical command is
-                # denied only when nothing else executed since, because a
-                # re-run after other work (edit -> re-run the tests) is
-                # meaningful. Edit tools are never deduped: a content-free
-                # "already did that" note would misreport the file state.
-                if call.name in ("plan", "explore"):
-                    is_repeat = signature == self._last_signatures.get(call.name)
-                elif call.name in (*SHELL_TOOL_NAMES, "web_fetch"):
-                    is_repeat = signature == self._last_executed_signature
+            calls = turn.tool_calls
+            batch_fn = getattr(self.registry, "execute_batch", None)
+            i = 0
+            while i < len(calls):
+                # Coalesce a contiguous run of edit calls (replace/insert/delete)
+                # on the SAME file into ONE batch: one write, one diff, one
+                # syntax/LSP pass, instead of validating each separately. A lone
+                # edit (group of one) or any non-edit call stays on the exact
+                # single-call path (`_run_single_call`), so its behavior — and
+                # every guard — is unchanged. Registries without execute_batch
+                # (e.g. the planner) also fall through to the single-call path.
+                group = self._edit_batch_slice(calls, i)
+                if len(group) >= 2 and batch_fn is not None:
+                    if await self._run_edit_batch(group, batch_fn):
+                        executed_this_turn = True
+                        executed_any = True
                 else:
-                    is_repeat = False
-                if is_repeat and not self._tool_arguments_invalid(call.arguments):
-                    # Repeated identical call: deny without executing and feed
-                    # back a randomly-worded note (different from the previous
-                    # one). Leave the guard set so a third identical call is
-                    # denied too; a changed call clears it below.
-                    result = repeated_tool_message(call.name, exclude=self._last_repeat_msg)
-                    self._last_repeat_msg = result
-                    self.ui.chat.add_tool_result(call.index, call.name, result, is_error=True)
-                    self._append_tool_message(call, result, is_error=True)
-                    continue
-                is_error = False
-                executed_this_turn = True
-                executed_any = True
-                try:
-                    result = await self.registry.execute(call.name, call.arguments)
-                except Exception as exc:  # noqa: BLE001 - feed errors back to the model
-                    result = f"Tool error: {exc}"
-                    is_error = True
-                # A file tool flags a successful-but-needs-attention result (syntax
-                # errors present) with an in-band marker. Strip it and surface the
-                # result as an error so the model prioritises the fix.
-                if result.startswith(TOOL_ATTENTION_MARKER):
-                    result = result[len(TOOL_ATTENTION_MARKER):]
-                    is_error = True
-                if (
-                    call.name in SHELL_TOOL_NAMES
-                    and not is_error
-                    and not result.startswith(_BASH_NOT_RUN_PREFIXES)
-                ):
-                    advice, escalate = self._rewrite_advice_for(call.arguments)
-                    if advice:
-                        result = f"{result}\n\n{advice}"
-                        # A repeated full rewrite is a loop; flag it as an error so
-                        # it reads as a correction, not another optional tip.
-                        if escalate:
-                            is_error = True
-                    # Deterministic low-level syntax check of the command itself.
-                    # Informational (not an error): bash also reports its own
-                    # syntax errors at runtime; this adds a clean, anchored note.
-                    syntax = _bash_syntax_warning(call.arguments)
-                    if syntax:
-                        result = f"{result}\n\n{syntax}"
-                    # If the command authored a file, hand the model its fresh line
-                    # anchors so it can edit in place without a separate read. A
-                    # marked block means a written file failed its syntax/LSP check;
-                    # surface it as an error exactly like an edit would be.
-                    anchors = await self._auto_read_written_files(call.arguments)
-                    if anchors:
-                        if anchors.startswith(TOOL_ATTENTION_MARKER):
-                            anchors = anchors[len(TOOL_ATTENTION_MARKER):]
-                            is_error = True
-                        result = f"{result}\n\n{anchors}"
-                self.ui.chat.add_tool_result(call.index, call.name, result, is_error=is_error)
-                self._append_tool_message(call, result, is_error=is_error)
-                # A distinct call ran: it becomes ITS TOOL'S new guard target
-                # (`plan`) and the overall last-executed one (shell/
-                # web_fetch), and the repeat streak restarts.
-                self._last_signatures[call.name] = signature
-                self._last_executed_signature = signature
-                self._last_repeat_msg = None
+                    for call in group:
+                        if await self._run_single_call(call):
+                            executed_this_turn = True
+                            executed_any = True
+                i += len(group)
             # Tools ran this turn — real progress, so refresh the continuation budget.
             continuation_nudges = 0
             self._inject_queued_user_batch()
@@ -852,6 +793,167 @@ class TurnRunner:
                 self.ui.set_state(mascot.State.OK)
                 return True
             # Loop again so the model sees the tool results.
+
+    async def _run_single_call(self, call) -> bool:
+        """Execute one tool call with every guard. Returns True iff a tool
+        actually ran (False for a stage-denial or a deduped repeat).
+
+        This is the per-call loop body, extracted verbatim so a lone edit and
+        any non-edit call take the exact same path they always did.
+        """
+        self.ui.set_state(mascot.state_for_tool(call.name))
+        # Stage discipline: a call outside the active stage's toolset is
+        # denied with an error result — never executed. Inert (None) in
+        # freestyle mode.
+        if self.allowed_tools is not None and call.name not in self.allowed_tools:
+            result = stage_violation_message(call.name, self.allowed_tools)
+            self.ui.chat.add_tool_result(call.index, call.name, result, is_error=True)
+            self._append_tool_message(call, result, is_error=True)
+            return False
+        # The call box was already streamed in during _stream_assistant.
+        signature = self._tool_signature(call.name, call.arguments)
+        # Dedup semantics differ by tool. `plan` and `explore`:
+        # per-tool and turn-persistent (a planner once laundered
+        # identical lists through interleaved ask_user_question
+        # calls; an identical `explore` re-spawn burns a whole
+        # sub-agent run for a report it already has). Shell and
+        # web_fetch: STRICTLY CONSECUTIVE — an identical command is
+        # denied only when nothing else executed since, because a
+        # re-run after other work (edit -> re-run the tests) is
+        # meaningful. Edit tools are never deduped: a content-free
+        # "already did that" note would misreport the file state.
+        if call.name in ("plan", "explore"):
+            is_repeat = signature == self._last_signatures.get(call.name)
+        elif call.name in (*SHELL_TOOL_NAMES, "web_fetch"):
+            is_repeat = signature == self._last_executed_signature
+        else:
+            is_repeat = False
+        if is_repeat and not self._tool_arguments_invalid(call.arguments):
+            # Repeated identical call: deny without executing and feed
+            # back a randomly-worded note (different from the previous
+            # one). Leave the guard set so a third identical call is
+            # denied too; a changed call clears it below.
+            result = repeated_tool_message(call.name, exclude=self._last_repeat_msg)
+            self._last_repeat_msg = result
+            self.ui.chat.add_tool_result(call.index, call.name, result, is_error=True)
+            self._append_tool_message(call, result, is_error=True)
+            return False
+        is_error = False
+        try:
+            result = await self.registry.execute(call.name, call.arguments)
+        except Exception as exc:  # noqa: BLE001 - feed errors back to the model
+            result = f"Tool error: {exc}"
+            is_error = True
+        # A file tool flags a successful-but-needs-attention result (syntax
+        # errors present) with an in-band marker. Strip it and surface the
+        # result as an error so the model prioritises the fix.
+        if result.startswith(TOOL_ATTENTION_MARKER):
+            result = result[len(TOOL_ATTENTION_MARKER):]
+            is_error = True
+        if (
+            call.name in SHELL_TOOL_NAMES
+            and not is_error
+            and not result.startswith(_BASH_NOT_RUN_PREFIXES)
+        ):
+            advice, escalate = self._rewrite_advice_for(call.arguments)
+            if advice:
+                result = f"{result}\n\n{advice}"
+                # A repeated full rewrite is a loop; flag it as an error so
+                # it reads as a correction, not another optional tip.
+                if escalate:
+                    is_error = True
+            # Deterministic low-level syntax check of the command itself.
+            # Informational (not an error): bash also reports its own
+            # syntax errors at runtime; this adds a clean, anchored note.
+            syntax = _bash_syntax_warning(call.arguments)
+            if syntax:
+                result = f"{result}\n\n{syntax}"
+            # If the command authored a file, hand the model its fresh line
+            # anchors so it can edit in place without a separate read. A
+            # marked block means a written file failed its syntax/LSP check;
+            # surface it as an error exactly like an edit would be.
+            anchors = await self._auto_read_written_files(call.arguments)
+            if anchors:
+                if anchors.startswith(TOOL_ATTENTION_MARKER):
+                    anchors = anchors[len(TOOL_ATTENTION_MARKER):]
+                    is_error = True
+                result = f"{result}\n\n{anchors}"
+        self.ui.chat.add_tool_result(call.index, call.name, result, is_error=is_error)
+        self._append_tool_message(call, result, is_error=is_error)
+        # A distinct call ran: it becomes ITS TOOL'S new guard target
+        # (`plan`) and the overall last-executed one (shell/
+        # web_fetch), and the repeat streak restarts.
+        self._last_signatures[call.name] = signature
+        self._last_executed_signature = signature
+        self._last_repeat_msg = None
+        return True
+
+    def _edit_group_key(self, call) -> str | None:
+        """The batch key (absolute target path) of a groupable edit call, else
+        None. None keeps the call on the single-call path: non-edit tools, an
+        edit denied by stage discipline, invalid-JSON args, or an edit with no
+        explicit ``file`` (one relying on the engine's remembered last file)."""
+        if call.name not in _EDIT_TOOL_NAMES:
+            return None
+        if self.allowed_tools is not None and call.name not in self.allowed_tools:
+            return None
+        args = call.arguments
+        if not isinstance(args, dict) or args.get("_invalid_json") is True:
+            return None
+        target = args.get("file")
+        if not isinstance(target, str) or not target:
+            return None
+        return os.path.abspath(target)
+
+    def _edit_batch_slice(self, calls: list, i: int) -> list:
+        """The maximal contiguous run of edit calls from ``i`` sharing one file
+        key (length >= 1). A lone or ungroupable call returns just ``[calls[i]]``."""
+        key = self._edit_group_key(calls[i])
+        if key is None:
+            return [calls[i]]
+        group = [calls[i]]
+        j = i + 1
+        while j < len(calls) and self._edit_group_key(calls[j]) == key:
+            group.append(calls[j])
+            j += 1
+        return group
+
+    async def _run_edit_batch(self, group: list, batch_fn) -> bool:
+        """Dispatch a group of same-file edit calls as ONE batch and append one
+        tool result per call.id. Returns True (a batch always attempts to run).
+
+        On a result-count mismatch or an unexpected raise, emits one error per
+        call and does NOT re-dispatch — re-running would double-apply the writes
+        the batch already made.
+        """
+        for call in group:
+            self.ui.set_state(mascot.state_for_tool(call.name))
+        fallback = None
+        try:
+            results = await batch_fn([(c.name, c.arguments) for c in group])
+        except Exception as exc:  # noqa: BLE001 - execute_batch is designed not to raise
+            results = None
+            fallback = f"Tool error: {exc}"
+        if not isinstance(results, list) or len(results) != len(group):
+            msg = fallback or "Tool error: batch result count mismatch."
+            for call in group:
+                self.ui.chat.add_tool_result(call.index, call.name, msg, is_error=True)
+                self._append_tool_message(call, msg, is_error=True)
+            return True
+        for call, result in zip(group, results):
+            is_error = False
+            if isinstance(result, str) and result.startswith(TOOL_ATTENTION_MARKER):
+                result = result[len(TOOL_ATTENTION_MARKER):]
+                is_error = True
+            self.ui.chat.add_tool_result(call.index, call.name, result, is_error=is_error)
+            self._append_tool_message(call, result, is_error=is_error)
+            # Mirror the single-call guard-signature updates (cosmetic for edit
+            # tools, which are never deduped, but keeps the state identical).
+            signature = self._tool_signature(call.name, call.arguments)
+            self._last_signatures[call.name] = signature
+            self._last_executed_signature = signature
+        self._last_repeat_msg = None
+        return True
 
     def _emit_event(self, kind: str, **fields) -> None:
         if self.event_sink is None:

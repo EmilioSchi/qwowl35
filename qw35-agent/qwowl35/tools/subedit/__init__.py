@@ -15,11 +15,12 @@ EDIT_NAME = "edit"
 EDIT_SCHEMA = {
     "name": "edit",
     "description": (
-        "Delegate a change to an existing file. Name the file, the line range(s) "
-        "involved (as printed by `grep -n`), and describe precisely what must "
-        "change and why. A dedicated editor applies the change and returns a "
-        "summary with the diff. Use bash heredocs only to CREATE new files; "
-        "every change to an existing file goes through this tool."
+        "Delegate a change to an existing file. Name the file and describe "
+        "precisely what must change and why; optionally point at the line "
+        "range(s) involved (as printed by `grep -n`) to focus a large file. A "
+        "dedicated editor applies the change and returns a summary with the "
+        "diff. Use bash heredocs only to CREATE new files; every change to an "
+        "existing file goes through this tool."
     ),
     "parameters": {
         "properties": {
@@ -30,9 +31,10 @@ EDIT_SCHEMA = {
             "line_ranges": {
                 "type": "string",
                 "description": (
-                    'The line range(s) to modify, e.g. "12-18" or "40-45, 102" '
-                    "(from `grep -n` / `grep -nr` output). Use \"all\" only when "
-                    "the whole file is genuinely in scope."
+                    'Optional. The line range(s) to focus on, e.g. "12-18" or '
+                    '"40-45, 102" (from `grep -n` / `grep -nr` output) — helps '
+                    'the editor on a large file. Omit (or use "all") to let the '
+                    "editor see and change the whole file."
                 ),
             },
             "instructions": {
@@ -43,21 +45,22 @@ EDIT_SCHEMA = {
                 ),
             },
         },
-        "required": ["filename", "line_ranges", "instructions"],
+        "required": ["filename", "instructions"],
         "type": "object",
     },
 }
 
 GUIDANCE = """\
-To change an existing file, call `edit` with the filename, the line range(s)
-(find them with `grep -n pattern file`), and precise instructions for the
-change. Do not rewrite existing files through bash redirects — `edit` applies
-targeted changes and shows you the diff. Create brand-new files with a bash
-heredoc, then use `edit` for every later adjustment."""
+To change an existing file, call `edit` with the filename and precise
+instructions for the change; optionally add the line range(s) (find them with
+`grep -n pattern file`) to focus a large file. Do not rewrite existing files
+through bash redirects — `edit` applies targeted changes and shows you the diff.
+Create brand-new files with a bash heredoc, then use `edit` for every later
+adjustment."""
 
 
 def validate_edit_args(arguments: dict) -> str | None:
-    for key in ("filename", "line_ranges", "instructions"):
+    for key in ("filename", "instructions"):
         value = arguments.get(key) if isinstance(arguments, dict) else None
         if not isinstance(value, str) or not value.strip():
             return f"Error: '{key}' is required."

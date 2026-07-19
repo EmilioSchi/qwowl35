@@ -1409,6 +1409,120 @@ def test_last_reasoning_tracks_issuing_turn_mid_dispatch() -> None:
     assert_equal(agent.last_reasoning, "", "reset_turn_guards clears the capture")
 
 
+# --- coalescing parallel edit calls into one batch --------------------------
+
+
+class FakeBatchRegistry(FakeRegistry):
+    """A registry that also records batch dispatches, so tests can tell the
+    coalesced path from the per-call path."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batched: list[list[tuple[str, dict]]] = []
+
+    async def execute_batch(self, ops: list[tuple[str, dict]]) -> list[str]:
+        self.batched.append([(name, args) for name, args in ops])
+        return [f"batched {name}" for name, _ in ops]
+
+
+def test_parallel_edits_coalesced_into_one_batch() -> None:
+    # Several edit calls on the same file in ONE turn go through execute_batch
+    # once (one write/diff/syntax pass), not per-call execute.
+    turns = [
+        AssistantTurn(tool_calls=[
+            call("replace", {"file": "a.py", "id": "1af", "content": "x"}, index=0),
+            call("replace", {"file": "a.py", "id": "2bd", "content": "y"}, index=1),
+            call("replace", {"file": "a.py", "id": "3ce", "content": "z"}, index=2),
+        ]),
+        AssistantTurn(content="done"),
+    ]
+    reg = FakeBatchRegistry()
+    agent, _reg, ui = make_agent(turns, registry=reg)
+    asyncio.run(agent.run_turn("hi"))
+
+    assert_equal(len(reg.batched), 1, "exactly one batch dispatched")
+    assert_equal(
+        [name for name, _ in reg.batched[0]], ["replace", "replace", "replace"],
+        "all three edits in the batch",
+    )
+    assert_equal(reg.executed, [], "no per-op execute calls")
+    assert_equal(len(ui.chat.tool_results), 3, "one tool result per call id")
+
+
+def test_single_edit_uses_single_call_path() -> None:
+    # A lone edit never reaches execute_batch — identical to today's behavior.
+    turns = [
+        AssistantTurn(tool_calls=[call("replace", {"file": "a.py", "id": "1af", "content": "x"})]),
+        AssistantTurn(content="done"),
+    ]
+    reg = FakeBatchRegistry()
+    agent, _reg, _ui = make_agent(turns, registry=reg)
+    asyncio.run(agent.run_turn("hi"))
+
+    assert_equal(reg.batched, [], "no batch for a lone edit")
+    assert_equal(
+        reg.executed, [("replace", {"file": "a.py", "id": "1af", "content": "x"})],
+        "single-call path used",
+    )
+
+
+def test_edits_split_by_file_into_separate_groups() -> None:
+    # Contiguous same-file edits coalesce; a different-file edit is its own unit.
+    turns = [
+        AssistantTurn(tool_calls=[
+            call("replace", {"file": "a.py", "id": "1af", "content": "x"}, index=0),
+            call("replace", {"file": "a.py", "id": "2bd", "content": "y"}, index=1),
+            call("replace", {"file": "b.py", "id": "1aa", "content": "z"}, index=2),
+        ]),
+        AssistantTurn(content="done"),
+    ]
+    reg = FakeBatchRegistry()
+    agent, _reg, _ui = make_agent(turns, registry=reg)
+    asyncio.run(agent.run_turn("hi"))
+
+    assert_equal(len(reg.batched), 1, "one batch (a.py's two edits)")
+    assert_equal(len(reg.batched[0]), 2, "a.py batch has two ops")
+    assert_equal(
+        reg.executed, [("replace", {"file": "b.py", "id": "1aa", "content": "z"})],
+        "the lone b.py edit runs on the single-call path",
+    )
+
+
+def test_non_edit_between_edits_breaks_the_group() -> None:
+    # A non-edit call between two edits ends the contiguous run, so nothing
+    # coalesces (each unit is size 1).
+    turns = [
+        AssistantTurn(tool_calls=[
+            call("replace", {"file": "a.py", "id": "1af", "content": "x"}, index=0),
+            call("read_file", {"file_path": "/tmp/a.py"}, index=1),
+            call("replace", {"file": "a.py", "id": "2bd", "content": "y"}, index=2),
+        ]),
+        AssistantTurn(content="done"),
+    ]
+    reg = FakeBatchRegistry()
+    agent, _reg, _ui = make_agent(turns, registry=reg)
+    asyncio.run(agent.run_turn("hi"))
+
+    assert_equal(reg.batched, [], "no coalescing across a non-edit call")
+    assert_equal(len(reg.executed), 3, "all three run on the single-call path")
+
+
+def test_registry_without_execute_batch_falls_back() -> None:
+    # A registry lacking execute_batch (e.g. the planner) runs edits one by one.
+    turns = [
+        AssistantTurn(tool_calls=[
+            call("replace", {"file": "a.py", "id": "1af", "content": "x"}, index=0),
+            call("replace", {"file": "a.py", "id": "2bd", "content": "y"}, index=1),
+        ]),
+        AssistantTurn(content="done"),
+    ]
+    reg = FakeRegistry()  # no execute_batch attribute
+    agent, _reg, _ui = make_agent(turns, registry=reg)
+    asyncio.run(agent.run_turn("hi"))
+
+    assert_equal(len(reg.executed), 2, "both edits run sequentially without a batch path")
+
+
 def main() -> None:
     test_inspect_file_lsp_section_reaches_model_verbatim()
     test_last_reasoning_tracks_issuing_turn_mid_dispatch()
@@ -1466,6 +1580,11 @@ def main() -> None:
     test_stop_on_stall_skips_continuation_nudge_after_work()
     test_out_of_stage_tool_call_is_denied_without_executing()
     test_appended_tool_message_is_compressed()
+    test_parallel_edits_coalesced_into_one_batch()
+    test_single_edit_uses_single_call_path()
+    test_edits_split_by_file_into_separate_groups()
+    test_non_edit_between_edits_breaks_the_group()
+    test_registry_without_execute_batch_falls_back()
     print("agent guard tests passed")
 
 

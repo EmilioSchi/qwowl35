@@ -25,6 +25,7 @@ from tools.files.adapter import (  # noqa: E402
     stream_replace_line,
     xxh32,
 )
+from tools.files.adapter import TOOL_ATTENTION_MARKER  # noqa: E402
 
 
 def assert_equal(actual, expected, label: str) -> None:
@@ -459,6 +460,227 @@ def test_read_file_ids_header_only_on_first_open() -> None:
     _in_tmp(body)
 
 
+# --- execute_batch: coalesced parallel edits (one write, one diff, one check) ---
+
+
+def test_execute_batch_replaces_apply_once() -> None:
+    """Several replace calls that arrive together apply in one pass: all land,
+    exactly one result carries the combined diff, the rest are terse."""
+    def body() -> None:
+        Path("m.py").write_text("a = 1\nb = 2\nc = 3\nd = 4\n", encoding="utf-8")
+        tools = HashlineTools()
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
+        ops = [
+            ("replace", {"file": "m.py", "id": _line_id(shown, 1), "content": "a = 10"}),
+            ("replace", {"file": "m.py", "id": _line_id(shown, 2), "content": "b = 20"}),
+            ("replace", {"file": "m.py", "id": _line_id(shown, 4), "content": "d = 40"}),
+        ]
+        results = tools.execute_batch(ops)
+        assert_equal(len(results), 3, "one result per op")
+        assert_equal(
+            Path("m.py").read_text(encoding="utf-8"),
+            "a = 10\nb = 20\nc = 3\nd = 40\n",
+            "all three edits applied",
+        )
+        with_diff = [r for r in results if "Diff:" in r]
+        assert_equal(len(with_diff), 1, f"exactly one combined diff: {results}")
+        assert_true(
+            "a = 10" in with_diff[0] and "d = 40" in with_diff[0],
+            "combined diff spans every edit",
+        )
+        terse = [r for r in results if "Diff:" not in r]
+        assert_true(
+            all(r.startswith("Edited line") for r in terse),
+            f"other ops get terse success lines: {terse}",
+        )
+
+    _in_tmp(body)
+
+
+def test_execute_batch_writes_once() -> None:
+    """A whole group is a single atomic write, not one per op."""
+    import tools.files.hashline.tool_calling as tc
+
+    def body() -> None:
+        orig = tc.atomic_write_document
+        calls: list[str] = []
+
+        def spy(path, doc):
+            calls.append(str(path))
+            return orig(path, doc)
+
+        tc.atomic_write_document = spy
+        try:
+            Path("m.py").write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+            tools = HashlineTools()
+            shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
+            ops = [
+                ("replace", {"file": "m.py", "id": _line_id(shown, 1), "content": "a = 10"}),
+                ("replace", {"file": "m.py", "id": _line_id(shown, 2), "content": "b = 20"}),
+                ("replace", {"file": "m.py", "id": _line_id(shown, 3), "content": "c = 30"}),
+            ]
+            tools.execute_batch(ops)
+            assert_equal(len(calls), 1, f"exactly one atomic write for the batch: {calls}")
+        finally:
+            tc.atomic_write_document = orig
+
+    _in_tmp(body)
+
+
+def test_execute_batch_mixed_ops_apply_in_order() -> None:
+    """replace + delete + insert in one group apply bottom-to-top, so every
+    op lands where the model's original ids pointed."""
+    def body() -> None:
+        Path("m.py").write_text("a = 1\nb = 2\nc = 3\nd = 4\n", encoding="utf-8")
+        tools = HashlineTools()
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
+        ops = [
+            ("replace", {"file": "m.py", "id": _line_id(shown, 1), "content": "a = 10"}),
+            ("delete", {"file": "m.py", "id": _line_id(shown, 3)}),
+            ("insert", {"file": "m.py", "id": _line_id(shown, 4), "position": "after", "content": "e = 5"}),
+        ]
+        results = tools.execute_batch(ops)
+        assert_equal(len(results), 3, "one result per op")
+        assert_equal(
+            Path("m.py").read_text(encoding="utf-8"),
+            "a = 10\nb = 2\nd = 4\ne = 5\n",
+            "mixed ops applied correctly against the original snapshot",
+        )
+
+    _in_tmp(body)
+
+
+def test_execute_batch_stale_op_errors_others_apply() -> None:
+    """A stale anchor fails only its own op (plain Error, not flagged); the
+    valid ops still apply."""
+    def body() -> None:
+        Path("m.py").write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+        tools = HashlineTools()
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
+        ops = [
+            ("replace", {"file": "m.py", "id": _line_id(shown, 1), "content": "a = 10"}),
+            ("replace", {"file": "m.py", "id": "59ff", "content": "nope"}),  # no line 59
+        ]
+        results = tools.execute_batch(ops)
+        assert_true(results[1].startswith("Error"), f"stale op errors: {results[1]}")
+        assert_true(not results[1].startswith(TOOL_ATTENTION_MARKER), "stale error is not flagged")
+        assert_equal(
+            Path("m.py").read_text(encoding="utf-8"),
+            "a = 10\nb = 2\nc = 3\n",
+            "only the valid edit changed the file",
+        )
+
+    _in_tmp(body)
+
+
+def test_execute_batch_overlapping_ops_first_wins() -> None:
+    """Two ops on the same line: the first applies, the second reports an
+    overlap instead of silently clobbering."""
+    def body() -> None:
+        Path("m.py").write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+        tools = HashlineTools()
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
+        same = _line_id(shown, 2)
+        ops = [
+            ("replace", {"file": "m.py", "id": same, "content": "b = 20"}),
+            ("replace", {"file": "m.py", "id": same, "content": "b = 99"}),
+        ]
+        results = tools.execute_batch(ops)
+        assert_true("overlaps another edit" in results[1], f"second op flagged: {results[1]}")
+        assert_equal(
+            Path("m.py").read_text(encoding="utf-8"),
+            "a = 1\nb = 20\nc = 3\n",
+            "first op wins the overlap",
+        )
+
+    _in_tmp(body)
+
+
+def test_execute_batch_broken_result_is_marked() -> None:
+    """When the group leaves the file unparseable, the combined result (on the
+    last applicable op) carries the attention marker and the syntax block."""
+    def body() -> None:
+        Path("m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        tools = HashlineTools()
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("m.py")})
+        ops = [
+            ("replace", {"file": "m.py", "id": _line_id(shown, 2), "content": "    return 2"}),
+            ("replace", {"file": "m.py", "id": _line_id(shown, 1), "content": "def f("}),  # breaks parse
+        ]
+        results = tools.execute_batch(ops)
+        assert_true(
+            results[1].startswith(TOOL_ATTENTION_MARKER),
+            f"broken batch flags attention on the combined result: {results[1]!r}",
+        )
+        assert_true("Syntax check (python)" in results[1], "combined result names the break")
+
+    _in_tmp(body)
+
+
+# --- empty-file population (editor has no bash; a 0-byte stub is fillable) ---
+
+
+def test_insert_into_empty_file_populates_it() -> None:
+    """An existing empty file can be filled by insert without a prior read_file,
+    and any id is accepted; the file is then registered for follow-up edits."""
+    def body() -> None:
+        Path("new.py").write_text("", encoding="utf-8")  # 0-byte stub
+        tools = HashlineTools()
+        result = tools.execute("insert", {"file": "new.py", "id": "start", "content": "x = 1"})
+        clean = (
+            result[len(TOOL_ATTENTION_MARKER):]
+            if result.startswith(TOOL_ATTENTION_MARKER)
+            else result
+        )
+        assert_true("denied" not in clean, f"empty-file insert is not gated: {clean}")
+        assert_equal(Path("new.py").read_text(encoding="utf-8"), "x = 1\n", "file populated")
+        # The file is now registered, so a normal follow-up edit works.
+        shown = tools.execute("read_file", {"file_path": os.path.abspath("new.py")})
+        edited = tools.execute("replace", {"file": "new.py", "id": _line_id(shown, 1), "content": "x = 2"})
+        assert_true(edited.startswith("Edited line 1"), f"follow-up edit works: {edited}")
+        assert_equal(Path("new.py").read_text(encoding="utf-8"), "x = 2\n", "follow-up edit applied")
+
+    _in_tmp(body)
+
+
+def test_replace_on_empty_file_populates_it() -> None:
+    """replace on an empty file is treated as 'set the content' — any id works."""
+    def body() -> None:
+        Path("new.py").write_text("", encoding="utf-8")
+        tools = HashlineTools()
+        result = tools.execute("replace", {"file": "new.py", "id": "1af", "content": "y = 1"})
+        assert_true("denied" not in result, f"empty-file replace is not gated: {result}")
+        assert_equal(Path("new.py").read_text(encoding="utf-8"), "y = 1\n", "file populated via replace")
+
+    _in_tmp(body)
+
+
+def test_empty_file_populate_splits_multiline_content() -> None:
+    def body() -> None:
+        Path("new.py").write_text("", encoding="utf-8")
+        tools = HashlineTools()
+        tools.execute("insert", {"file": "new.py", "id": "start", "content": "def f():\n    return 1"})
+        assert_equal(
+            Path("new.py").read_text(encoding="utf-8"),
+            "def f():\n    return 1\n",
+            "multi-line content becomes the file's lines",
+        )
+
+    _in_tmp(body)
+
+
+def test_mutation_on_nonexistent_file_is_still_denied() -> None:
+    """The empty-file exception is only for files that EXIST — a missing file
+    still routes creation through bash (the gate denies the guess)."""
+    def body() -> None:
+        tools = HashlineTools()
+        result = tools.execute("insert", {"file": "ghost.py", "id": "start", "content": "z = 1"})
+        assert_true(result.startswith("Error"), f"missing file is an error: {result}")
+        assert_true(not Path("ghost.py").exists(), "no file was created by the mutation")
+
+    _in_tmp(body)
+
+
 def main() -> None:
     test_xxh32_matches_hashline_reference_values()
     test_line_ref_has_no_separator_and_round_trips()
@@ -480,6 +702,16 @@ def main() -> None:
     test_read_file_string_offset_limit_coerced()
     test_paged_read_does_not_set_or_consult_f1_baseline()
     test_read_file_ids_header_only_on_first_open()
+    test_execute_batch_replaces_apply_once()
+    test_execute_batch_writes_once()
+    test_execute_batch_mixed_ops_apply_in_order()
+    test_execute_batch_stale_op_errors_others_apply()
+    test_execute_batch_overlapping_ops_first_wins()
+    test_execute_batch_broken_result_is_marked()
+    test_insert_into_empty_file_populates_it()
+    test_replace_on_empty_file_populates_it()
+    test_empty_file_populate_splits_multiline_content()
+    test_mutation_on_nonexistent_file_is_still_denied()
     print("hashline tool tests passed")
 
 

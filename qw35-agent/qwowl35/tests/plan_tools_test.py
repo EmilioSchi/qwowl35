@@ -493,17 +493,24 @@ def test_explore_and_resume_schemas() -> None:
 
 def test_subedit_schema_and_validation() -> None:
     assert_equal(EDIT_SCHEMA["name"], "edit", "freestyle edit wire name")
+    # line_ranges is optional now (the editor sees the whole file when omitted),
+    # so only filename + instructions are required.
     assert_equal(
         sorted(EDIT_SCHEMA["parameters"]["required"]),
-        ["filename", "instructions", "line_ranges"],
-        "all three params required",
+        ["filename", "instructions"],
+        "filename and instructions required; line_ranges optional",
     )
     assert_equal(
         validate_edit_args(
             {"filename": "a.py", "line_ranges": "3-9", "instructions": "rename x to y"}
         ),
         None,
-        "valid args accepted",
+        "valid args with a range accepted",
+    )
+    assert_equal(
+        validate_edit_args({"filename": "a.py", "instructions": "rename x to y"}),
+        None,
+        "line_ranges may be omitted",
     )
     assert_true(
         validate_edit_args({"filename": "a.py", "line_ranges": "3-9"}).startswith("Error"),

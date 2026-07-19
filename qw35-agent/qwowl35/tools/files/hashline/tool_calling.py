@@ -11,14 +11,28 @@ from typing import Any
 import xxhash
 
 from .commands.common import atomic_write_document
-from .commands.delete import DeleteCmd, run as run_delete
-from .commands.edit import EditCmd, run as run_edit
+from .commands.delete import DeleteCmd, DeleteSummary, run as run_delete
+from .commands.edit import EditCmd, EditSummary, run as run_edit
 from .commands.insert import InsertCmd, run as run_insert
 from .commands.read import ReadCmd, run as run_read
-from .anchor import looks_like_range_anchor
+from .anchor import (
+    looks_like_range_anchor,
+    parse_anchor,
+    parse_range,
+    resolve,
+    resolve_range,
+)
 from .document import Document
 from .error import HashlineError
-from .mutation import delete_adjacent_duplicates
+from .mutation import (
+    delete_adjacent_duplicates,
+    delete_line,
+    delete_range,
+    insert_line,
+    replace_line,
+    replace_range,
+    split_content_lines,
+)
 from .output import line_view, render_lines, unified_diff
 
 try:  # validation is best-effort; never let it break the file tools.
@@ -125,6 +139,27 @@ class ReadRecord:
     byte_len: int  # len(content.encode("utf-8")) at that read
 
 
+@dataclass
+class _OpPlan:
+    """One resolved edit within a coalesced batch, ready to apply against the
+    ORIGINAL document. All indices are 0-based into that original doc, captured
+    BEFORE any mutation runs, so applying the batch bottom-to-top never
+    invalidates a not-yet-applied op's anchor. See :meth:`HashlineTools.execute_batch`.
+    """
+
+    index: int  # emission order (position in the batch's tool_calls)
+    name: str  # "replace" | "insert" | "delete"
+    mutation: tuple  # tagged args for _apply_op, e.g. ("replace_line", idx, content)
+    success_line: str  # terse per-op acknowledgment, in ORIGINAL line numbers
+    primary_line: int  # 1-based original line the op targeted (for the batch summary)
+    kind: str  # "consuming" (replace/delete) | "insert"
+    pos: int  # primary apply-order key: start index, or the insert position
+    tie_rank: int  # 0 consuming, 1 insert — consuming applies first at a tie
+    span: tuple[int, int]  # inclusive original indices a consuming op occupies
+    anchor_idx: int  # the resolved anchor index (insert: the line it anchors to)
+    boundary: int  # insert only: the gap index the new line lands at
+
+
 class HashlineTools:
     """Model-facing tool-calling adapter around anchored file commands."""
 
@@ -207,7 +242,7 @@ class HashlineTools:
                 "type": "function",
                 "function": {
                     "name": "replace",
-                    "description": "Replace one line or range by id only in an existing non-empty file. This tool cannot create files.",
+                    "description": "Replace one line or range by id only in an existing non-empty file. This tool cannot create files. Prefer this over delete+insert when changing existing code — editing in place keeps surrounding ids stable.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -223,7 +258,7 @@ class HashlineTools:
                 "type": "function",
                 "function": {
                     "name": "insert",
-                    "description": "Insert before or after one line id only in an existing non-empty file. This tool cannot create files.",
+                    "description": "Insert before or after one line id only in an existing file. This tool cannot create files.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -244,7 +279,7 @@ class HashlineTools:
                 "type": "function",
                 "function": {
                     "name": "delete",
-                    "description": "Delete one line or range by id only from an existing non-empty file. This tool cannot create files.",
+                    "description": "Delete one line or range by id only from an existing non-empty file. This tool cannot create files. Use this only to remove code outright; to change a line, use replace instead of delete+insert.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -284,6 +319,238 @@ class HashlineTools:
             return f"Error: {exc}"
         except Exception as exc:  # noqa: BLE001
             return f"Error running {name}: {exc}"
+
+    def execute_batch(self, ops: list[tuple[str, dict[str, Any]]]) -> list[str]:
+        """Apply a group of edit calls (replace/insert/delete) that arrived
+        together in ONE assistant turn against the SAME file as a single unit:
+        one atomic write, one diff, one syntax/LSP pass — instead of one of each
+        per call. Returns one result string per input op, aligned by index.
+
+        All ids in a parallel batch come from the same pre-turn snapshot, so
+        every op is resolved against the ORIGINAL document (loaded once) and the
+        applicable ops are applied bottom-to-top (descending position): a
+        mutation at position p only shifts indices >= p, so no not-yet-applied
+        op's anchor is invalidated. This is strictly more faithful than the
+        sequential path, where op #2 must fuzzy-relocate against op #1's write.
+
+        Overlap policy is greedy, emission-order-wins: the first op of a
+        conflict applies; a later op overlapping it gets a clear per-op error
+        (so two identical replaces apply once, and duplicate inserts collapse to
+        one copy). Per-op resolution failures (stale anchor, bad range) return a
+        plain ``Error:`` string on that op, matching the single-call path
+        (is_error stays False). The combined diff + refreshed-ids snippet + one
+        syntax block ride on the LAST applicable op's result via
+        :meth:`_present_mutation`; earlier applicable ops get a terse success
+        line in the file's ORIGINAL line numbers. Never raises.
+        """
+        n = len(ops)
+        results: list[str | None] = [None] * n
+        # The runner groups by absolute path, so every op names the same file;
+        # pick the first usable one and resolve everything against its document.
+        file = next(
+            (
+                a.get("file")
+                for _name, a in ops
+                if isinstance(a, dict) and isinstance(a.get("file"), str) and a.get("file")
+            ),
+            None,
+        )
+        if file is None:  # defensive: the runner shouldn't group file-less edits
+            return [self.execute(name, a) for name, a in ops]
+        self._last_file = file
+        try:
+            self._require_transaction(file, "edit")
+            before = self._read_text(file)
+            doc = Document.load(Path(file))
+        except FileNotFoundError:
+            return [f"Error: file not found: {file}"] * n
+        except HashlineError as exc:
+            return [f"Error: {exc}"] * n
+
+        if before == "":
+            # An empty file has no anchors to batch against: route each op
+            # through the single-op path, where the first insert/replace
+            # populates it (any id accepted). Later ops then see the filled file.
+            return [self.execute(name, a) for name, a in ops]
+
+        index = doc.build_index()  # ONE index over the ORIGINAL doc
+        plans: list[_OpPlan | None] = [None] * n
+        for k, (name, a) in enumerate(ops):
+            if not isinstance(a, dict) or a.get("_invalid_json") is True:
+                results[k] = (
+                    f"Error: Your {name} call's arguments were not a valid JSON "
+                    "object. Resend exactly one JSON object."
+                )
+                continue
+            try:
+                plans[k] = self._plan_op(k, name, a, doc, index)
+            except HashlineError as exc:
+                results[k] = f"Error: {exc}"
+            except Exception as exc:  # noqa: BLE001 - report, never crash the batch
+                results[k] = f"Error running {name}: {exc}"
+
+        # Overlap resolution in emission order: the first op of a conflict wins.
+        kept: list[_OpPlan] = []
+        for k in range(n):
+            plan = plans[k]
+            if plan is None:
+                continue
+            clash = self._conflict(plan, kept)
+            if clash is not None:
+                results[k] = f"Error: {self._conflict_message(clash)}"
+            else:
+                kept.append(plan)
+        if not kept:
+            return [r if r is not None else "Error: not applied." for r in results]
+
+        # Apply bottom-to-top: highest position first so lower positions stay
+        # valid; at a shared position a consuming op (replace/delete) applies
+        # before an insert, so the insert lands relative to the final content.
+        for plan in sorted(kept, key=lambda p: (-p.pos, p.tie_rank)):
+            self._apply_op(doc, plan)
+        atomic_write_document(Path(file), doc)  # ONE write
+
+        last_index = kept[-1].index  # last APPLICABLE op, in emission order
+        touched = ", ".join(str(x) for x in sorted({p.primary_line for p in kept}))
+        summary = (
+            f"Applied {len(kept)} grouped edit{'s' if len(kept) != 1 else ''} to "
+            f"{file} (lines {touched})."
+        )
+        for plan in kept:
+            if plan.index == last_index:
+                # ONE dedup + ONE diff (original before -> final) + ONE window +
+                # ONE syntax/LSP pass, reusing the single-call presentation.
+                results[plan.index] = self._present_mutation(file, summary + "\n", before)
+            else:
+                results[plan.index] = plan.success_line
+        return [r if r is not None else "Error: not applied." for r in results]
+
+    def _plan_op(
+        self, k: int, name: str, args: dict[str, Any], doc: Document, index
+    ) -> _OpPlan:
+        """Resolve one batch op against the ORIGINAL doc into an :class:`_OpPlan`.
+
+        Mirrors the resolve+summary branching of the single-call command
+        ``run()`` bodies (commands/edit.py, insert.py, delete.py) but captures
+        indices without mutating or writing, so the whole group can be applied
+        together afterwards. Raises HashlineError on a stale/invalid anchor.
+        """
+        if name == "replace":
+            anchor = self._id(args, required=True)
+            content = self._content(args)
+            if looks_like_range_anchor(anchor):
+                start, end = resolve_range(parse_range(anchor), doc, index)
+                after = split_content_lines(content)
+                success = EditSummary.range(start.line_no, end.line_no, after).success_message()
+                return _OpPlan(
+                    index=k, name=name,
+                    mutation=("replace_range", start.index, end.index, content),
+                    success_line=success, primary_line=start.line_no, kind="consuming",
+                    pos=start.index, tie_rank=0, span=(start.index, end.index),
+                    anchor_idx=start.index, boundary=start.index,
+                )
+            resolved = resolve(parse_anchor(anchor), doc, index)
+            if "\n" in content or "\r" in content:
+                after = split_content_lines(content)
+                success = EditSummary.range(resolved.line_no, resolved.line_no, after).success_message()
+                mutation = ("replace_range", resolved.index, resolved.index, content)
+            else:
+                success = EditSummary.single(resolved.line_no).success_message()
+                mutation = ("replace_line", resolved.index, content)
+            return _OpPlan(
+                index=k, name=name, mutation=mutation, success_line=success,
+                primary_line=resolved.line_no, kind="consuming", pos=resolved.index,
+                tie_rank=0, span=(resolved.index, resolved.index),
+                anchor_idx=resolved.index, boundary=resolved.index,
+            )
+        if name == "insert":
+            anchor = self._id(args, required=True)
+            if looks_like_range_anchor(anchor):
+                left, right = anchor.split("..", 1)
+                raise HashlineError(
+                    "insert requires one line id, not a range. "
+                    f"Use id {left!r} with position='after', or id {right!r} with position='before'."
+                )
+            content = self._content(args)
+            position = str(args.get("position") or "after").lower()
+            if position not in {"before", "after"}:
+                raise HashlineError("'position' must be 'before' or 'after'")
+            resolved = resolve(parse_anchor(anchor), doc, index)
+            insert_at = resolved.index if position == "before" else resolved.index + 1
+            return _OpPlan(
+                index=k, name=name, mutation=("insert_line", insert_at, content),
+                success_line=f"Inserted line {insert_at + 1}.", primary_line=insert_at + 1,
+                kind="insert", pos=insert_at, tie_rank=1, span=(insert_at, insert_at),
+                anchor_idx=resolved.index, boundary=insert_at,
+            )
+        if name == "delete":
+            anchor = self._id(args, required=True)
+            if looks_like_range_anchor(anchor):
+                start, end = resolve_range(parse_range(anchor), doc, index)
+                success = DeleteSummary.range(start.line_no, end.line_no).success_message()
+                return _OpPlan(
+                    index=k, name=name, mutation=("delete_range", start.index, end.index),
+                    success_line=success, primary_line=start.line_no, kind="consuming",
+                    pos=start.index, tie_rank=0, span=(start.index, end.index),
+                    anchor_idx=start.index, boundary=start.index,
+                )
+            resolved = resolve(parse_anchor(anchor), doc, index)
+            success = DeleteSummary.single(resolved.line_no).success_message()
+            return _OpPlan(
+                index=k, name=name, mutation=("delete_line", resolved.index),
+                success_line=success, primary_line=resolved.line_no, kind="consuming",
+                pos=resolved.index, tie_rank=0, span=(resolved.index, resolved.index),
+                anchor_idx=resolved.index, boundary=resolved.index,
+            )
+        raise HashlineError(f"unknown edit op {name!r}")
+
+    @staticmethod
+    def _apply_op(doc: Document, plan: _OpPlan) -> None:
+        """Run one planned mutation on the in-memory doc (indices pre-resolved)."""
+        m = plan.mutation
+        if m[0] == "replace_line":
+            replace_line(doc, m[1], m[2])
+        elif m[0] == "replace_range":
+            replace_range(doc, m[1], m[2], m[3])
+        elif m[0] == "insert_line":
+            insert_line(doc, m[1], m[2])
+        elif m[0] == "delete_line":
+            delete_line(doc, m[1])
+        elif m[0] == "delete_range":
+            delete_range(doc, m[1], m[2])
+
+    @staticmethod
+    def _conflict(plan: _OpPlan, kept: list[_OpPlan]) -> _OpPlan | None:
+        """The already-kept op ``plan`` collides with, or None.
+
+        Consuming vs consuming: their inclusive spans intersect. Insert vs
+        consuming: the insert's anchor line is inside the consumed span (its
+        anchor is being replaced/deleted). Insert vs insert: same landing gap.
+        """
+        for other in kept:
+            if plan.kind == "consuming" and other.kind == "consuming":
+                if max(plan.span[0], other.span[0]) <= min(plan.span[1], other.span[1]):
+                    return other
+            elif plan.kind == "insert" and other.kind == "consuming":
+                if other.span[0] <= plan.anchor_idx <= other.span[1]:
+                    return other
+            elif plan.kind == "consuming" and other.kind == "insert":
+                if plan.span[0] <= other.anchor_idx <= plan.span[1]:
+                    return other
+            elif plan.kind == "insert" and other.kind == "insert":
+                if plan.boundary == other.boundary:
+                    return other
+        return None
+
+    @staticmethod
+    def _conflict_message(other: _OpPlan) -> str:
+        lo, hi = other.span
+        where = f"line {lo + 1}" if lo == hi else f"lines {lo + 1}-{hi + 1}"
+        return (
+            f"overlaps another edit in this turn targeting {where}, which was "
+            "applied first. Re-target this against the refreshed ids in the "
+            "grouped result, or combine them into one range edit."
+        )
 
     def begin_transaction(self, args: dict[str, Any]) -> str:
         """Open a file: return its whole-file line ids.
@@ -481,8 +748,18 @@ class HashlineTools:
 
         The model only holds line ids for files it has opened; without a prior
         read_file any id it sends is a guess.
+
+        Exception: an existing but EMPTY (0-byte) file has no line ids to hold,
+        so requiring a prior read is pointless — allow (and record) a mutation
+        that populates it. The editor has no bash, so this is its only way to
+        fill an empty stub. A NONEXISTENT file still falls through to the guard:
+        create it with bash first.
         """
-        if self._key(file) in self._read_headered:
+        key = self._key(file)
+        if key in self._read_headered:
+            return
+        if os.path.exists(file) and self._read_text(file) == "":
+            self._read_headered.add(key)
             return
         raise HashlineError(
             f"{action} denied: {file} was not opened with read_file in this "
@@ -491,12 +768,32 @@ class HashlineTools:
             "retry using an id copied from that output."
         )
 
+    def _populate_empty(self, file: str, content: str, before: str) -> str:
+        """Write ``content`` as the initial lines of an existing EMPTY file.
+
+        A 0-line file has no anchors to address, so replace/insert on it are
+        treated as "set the content": whatever id the model sent is irrelevant.
+        The file must already exist — creating brand-new files still goes
+        through bash. Presented like any other mutation (diff + fresh ids +
+        syntax check) so the caller can keep editing with the returned ids.
+        """
+        doc = Document.load(Path(file))
+        insert_line(doc, 0, content)
+        # A 0-byte file loads with trailing_newline=False; a populated source
+        # file should end with a newline like any other.
+        doc.trailing_newline = True
+        atomic_write_document(Path(file), doc)
+        return self._present_mutation(file, "Added the file's initial content.\n", before)
+
     def edit(self, args: dict[str, Any]) -> str:
         file = self._file(args)
         self._require_transaction(file, "replace")
+        before = self._read_text(file)
+        if before == "" and os.path.exists(file):
+            # Nothing to replace in an empty file: treat it as "set the content".
+            return self._populate_empty(file, self._content(args), before)
         anchor = self._id(args, required=not self._has_start_query(args))
         content = self._content(args)
-        before = self._read_text(file)
         raw = run_edit(
             EditCmd(
                 file=Path(file),
@@ -511,6 +808,11 @@ class HashlineTools:
     def insert(self, args: dict[str, Any]) -> str:
         file = self._file(args)
         self._require_transaction(file, "insert")
+        before = self._read_text(file)
+        if before == "" and os.path.exists(file):
+            # Empty file: nothing to anchor to, so any id is accepted and the
+            # content becomes the file's first lines.
+            return self._populate_empty(file, self._content(args), before)
         anchor = self._id(args, required=not self._has_start_query(args))
         if anchor and looks_like_range_anchor(anchor):
             left, right = anchor.split("..", 1)
@@ -522,7 +824,6 @@ class HashlineTools:
         position = str(args.get("position") or "after").lower()
         if position not in {"before", "after"}:
             raise HashlineError("'position' must be 'before' or 'after'")
-        before = self._read_text(file)
         cmd = InsertCmd(
             file=Path(file),
             anchor=anchor,

@@ -471,6 +471,77 @@ def test_editor_leaving_file_broken_reports_syntax_to_executor() -> None:
     assert_true("\x00" not in report, "no marker bytes leak to the UI")
 
 
+def test_editor_registry_execute_batch_records_and_flags() -> None:
+    # EditorRegistry.execute_batch must record ONE result per op (so the
+    # orchestrator's "N edits applied" count is right) and OR saw_attention when
+    # the batch leaves the file broken (so the final re-validation still fires).
+    from orchestrator import EditorRegistry
+    from tools.files.adapter import HashlineTools
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            Path("m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+            files = HashlineTools()
+            shown = files.execute("read_file", {"file_path": os.path.abspath("m.py")})
+            rows = shown.splitlines()
+            first_id = rows[1].split("|", 1)[0]
+            second_id = rows[2].split("|", 1)[0]
+            registry = EditorRegistry(files)
+            ops = [
+                ("replace", {"file": "m.py", "id": second_id, "content": "    return 2"}),
+                ("replace", {"file": "m.py", "id": first_id, "content": "def f("}),  # breaks parse
+            ]
+            results = asyncio.run(registry.execute_batch(ops))
+        finally:
+            os.chdir(cwd)
+
+    assert_equal(len(results), 2, "one result per op")
+    assert_equal(len(registry.results), 2, "each op recorded toward the edit count")
+    assert_true(registry.saw_attention, "a broken batch trips saw_attention")
+    assert_true(
+        all("\x00" not in recorded for _n, recorded in registry.results),
+        "recorded results are the stripped form (no marker leaks into the report)",
+    )
+
+
+def test_editor_populates_an_empty_file_via_edit_delegate() -> None:
+    # A 0-byte stub delegated to the editor must be fillable: the read_file gate
+    # is bypassed for empty files and insert populates it (any id), instead of
+    # the old "not opened with read_file" denial.
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = os.getcwd()
+        os.chdir(tmp)
+        try:
+            Path("main.js").write_text("", encoding="utf-8")  # empty stub
+            abs_main = os.path.abspath("main.js")
+            turns = [
+                AssistantTurn(tool_calls=[call("edit", {
+                    "filename": "main.js",
+                    "instructions": "Create a Simulation class that sets up the canvas.",
+                })]),
+                AssistantTurn(tool_calls=[call("insert", {
+                    "file": abs_main, "id": "start",
+                    "content": "class Simulation {\n  constructor(ctx) { this.ctx = ctx; }\n}",
+                })]),
+                AssistantTurn(content="Created the Simulation class."),
+                AssistantTurn(content="Done."),
+            ]
+            ok, orch, ui, script = run_orchestrated(turns, goal="create the entry point")
+            populated = Path("main.js").read_text(encoding="utf-8")
+        finally:
+            os.chdir(cwd)
+
+    assert_true("class Simulation" in populated, f"empty file was populated: {populated!r}")
+    reports = [r for n, r, e in ui.chat.tool_results if "Editor result for main.js" in r]
+    assert_true(reports, "executor received an editor report, not a spawn failure")
+    assert_true("denied" not in reports[0], f"no read_file denial leaked: {reports[0]}")
+    assert_true(
+        "not opened with read_file" not in reports[0], "the gate did not block the populate"
+    )
+
+
 def test_editor_spawn_diag_memory_is_fresh_and_executor_dedup_persists() -> None:
     # Diagnostics memory follows the agent seams: every editor spawn is a
     # fresh context, so its OPENING view lists the broken file's rows in full

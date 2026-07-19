@@ -132,6 +132,22 @@ class EditorRegistry:
         self.results.append((name, recorded))
         return result
 
+    async def execute_batch(self, ops: list[tuple[str, dict]]) -> list[str]:
+        """Apply a group of edit calls that arrived together in one turn as ONE
+        batch (one write, one diff, one syntax pass) and record one result per
+        op — mirroring :meth:`execute`'s record/strip contract so
+        ``_run_editor``'s ``len(results)`` edit count and the ``saw_attention``
+        final re-validation stay correct. The runner only ever groups the
+        mutation tools, so this handles replace/insert/delete only."""
+        results = await asyncio.to_thread(self.files.execute_batch, ops)
+        for (name, _args), result in zip(ops, results):
+            recorded = result
+            if isinstance(recorded, str) and recorded.startswith(TOOL_ATTENTION_MARKER):
+                recorded = recorded[len(TOOL_ATTENTION_MARKER):]
+                self.saw_attention = True
+            self.results.append((name, recorded))
+        return results
+
 
 class Orchestrator:
     """Drop-in for Agent at the app level: run_turn(text, mode) + clear()."""
@@ -714,6 +730,11 @@ class Orchestrator:
             annotated = editor_agent.slice_annotated_body(body, spans)
             if tail.strip():
                 annotated = f"{annotated}\n\n{tail.strip()}"
+            if total_lines == 0 and not annotated.strip():
+                # An empty (0-byte) stub has no line ids to show — give the editor
+                # the one actionable move (insert to write the content) instead of
+                # leaving it staring at a blank "Current content".
+                annotated = "(file empty — insert to add its content)"
 
             # Background for the editor: the plan excerpt (PLAN turns only —
             # PlanState is stale in any other mode), the delegating agent's
