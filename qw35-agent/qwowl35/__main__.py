@@ -90,6 +90,7 @@ def _serve_webgui(port: int | None) -> None:
 
 def _serve_gui(port: int | None) -> None:
     """--ui webgui in a subprocess, wrapped in a native desktop window."""
+    import signal
     import socket
     import subprocess
     import time
@@ -101,7 +102,19 @@ def _serve_gui(port: int | None) -> None:
             port = sock.getsockname()[1]
     url = f"http://localhost:{port}"
 
-    server = subprocess.Popen(_child_command(["--ui", "webgui", "--ui-port", str(port)]))
+    # New session: the server leads its own process group, which the per-tab
+    # app instances it spawns inherit — closing the window must reap those too,
+    # and terminating just the server PID leaves them orphaned.
+    server = subprocess.Popen(
+        _child_command(["--ui", "webgui", "--ui-port", str(port)]),
+        start_new_session=True,
+    )
+
+    def _kill_server_group(sig: int) -> None:
+        try:
+            os.killpg(server.pid, sig)
+        except ProcessLookupError:
+            pass
     try:
         deadline = time.monotonic() + 30.0
         while True:
@@ -132,12 +145,11 @@ def _serve_gui(port: int | None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        if server.poll() is None:
-            server.terminate()
-            try:
-                server.wait(5)
-            except subprocess.TimeoutExpired:
-                server.kill()
+        _kill_server_group(signal.SIGTERM)
+        try:
+            server.wait(5)
+        except subprocess.TimeoutExpired:
+            _kill_server_group(signal.SIGKILL)
 
 
 def main() -> None:
