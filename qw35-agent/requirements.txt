@@ -9,6 +9,11 @@ magika>=0.6           # ML content-type detection routing compression's language
 multilspy>=0.0.15     # LSP client: semantic diagnostics as the primary read/edit validation (tools/lsp) — https://github.com/microsoft/multilspy
 jedi-language-server>=0.41   # python LSP backend multilspy launches from PATH (jedi = syntax-level diagnostics, not a type checker)
 
+# Optional — only for `--ui webgui` / `--ui gui` (render the SAME terminal UI in a
+# browser page or a native desktop window; a missing package exits with an install hint):
+# textual-serve>=1.1   # --ui webgui/gui: serves the Textual app over HTTP+websocket — https://github.com/Textualize/textual-serve
+# pywebview>=5.0       # --ui gui: native window chrome (without it, gui falls back to the default browser)
+
 # Note: imports of tree-sitter-language-pack stay guarded throughout, so a missing
 # install degrades to a no-op (no syntax warnings) rather than crashing. magika
 # imports are guarded the same way, degrading to extension-based detection.

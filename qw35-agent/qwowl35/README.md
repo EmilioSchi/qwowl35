@@ -63,7 +63,25 @@ startup/exit.
 pip install -r ../requirements.txt       # textual, rich, httpx, xxhash (at the qw35-agent root)
 python -m qwowl35                         # qw35-server must listen on 127.0.0.1:8080
 python -m qwowl35 --base-url http://127.0.0.1:8080 --reasoning-effort xhigh
+python -m qwowl35 --ui webgui             # same UI at http://localhost:8000 (pip install textual-serve)
+python -m qwowl35 --ui gui                # …wrapped in a desktop window (pip install pywebview)
 ```
+
+`--ui` picks the render target without changing the UI itself: `webgui` serves
+the app through textual-serve, which relaunches this same entry point (all
+other flags forwarded) as one subprocess per browser tab and streams its render
+output — colors, layout, mouse, and themes are identical to the terminal.
+`gui` starts that server on a free port (`--ui-port` overrides either mode) and
+wraps the page in a pywebview desktop window, falling back to the default
+browser when pywebview is missing; closing the window stops the server.
+
+The web page renders in **Mononoki Nerd Font Mono** (SIL OFL 1.1), vendored as
+woff2 under `webui/fonts/` and served locally — no Google Fonts request. The
+stock textual-serve page hardcodes "Roboto Mono" in its JS bundle, so
+`webui/app_index.html` (a vendored template with the remote font link removed)
+re-binds that family name to the Mononoki files via `@font-face`. To swap the
+font, drop replacement woff2 files in `webui/fonts/` and update the
+`@font-face` `src` names in the template.
 
 Configuration is CLI-only — no environment-variable overrides. The bash analyzer
 gains an AST mode if the optional `tree-sitter-language-pack` is installed, but
