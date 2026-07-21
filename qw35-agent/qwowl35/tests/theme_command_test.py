@@ -39,6 +39,7 @@ def _dispatch_app():
     app.exit = lambda: calls.append("quit")  # quit/exit/abort/close -> App.exit()
     app._clear_conversation = lambda: calls.append("clear")
     app._open_theme_selector = lambda: calls.append("theme")
+    app._open_font_selector = lambda: calls.append("fonts")
     return app, calls
 
 
@@ -50,6 +51,7 @@ def test_dispatch_routes_exact_commands() -> None:
         ("/close", "quit"),
         ("/clear", "clear"),
         ("/theme", "theme"),
+        ("/fonts", "fonts"),
     ]:
         app, calls = _dispatch_app()
         assert_true(app._dispatch_command(cmd), f"{cmd} handled")

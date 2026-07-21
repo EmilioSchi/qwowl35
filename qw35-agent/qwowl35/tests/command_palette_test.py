@@ -47,6 +47,7 @@ def test_filter_prefix_match() -> None:
     assert_equal(_names(filter_commands("cle")), ["/clear"], "cle -> /clear")
     assert_equal(_names(filter_commands("se")), ["/sessions"], "se -> /sessions")
     assert_equal(_names(filter_commands("the")), ["/theme"], "the -> /theme")
+    assert_equal(_names(filter_commands("fo")), ["/fonts"], "fo -> /fonts")
 
 
 def test_filter_prefix_can_match_several() -> None:
@@ -89,7 +90,13 @@ def test_render_empty_state() -> None:
 def test_render_aligns_descriptions() -> None:
     specs = list(COMMANDS)
     lines = render_palette(specs, 0, "").plain.split("\n")
-    starts = {spec.description: lines[i].index(spec.description) for i, spec in enumerate(specs)}
+    # Blank descriptions (e.g. /quit's " ") match any whitespace at index 0,
+    # so only real descriptions can pin the column.
+    starts = {
+        spec.description: lines[i].index(spec.description)
+        for i, spec in enumerate(specs)
+        if spec.description.strip()
+    }
     assert_equal(len(set(starts.values())), 1, "every description starts at the same column")
 
 
@@ -102,6 +109,7 @@ def _dispatch_app():
     app.exit = lambda: calls.append("quit")
     app._clear_conversation = lambda: calls.append("clear")
     app._open_theme_selector = lambda: calls.append("theme")
+    app._open_font_selector = lambda: calls.append("fonts")
     app._open_session_selector = lambda: calls.append("sessions")
     app._mode_command = lambda args: calls.append(("mode", args))
     return app, calls

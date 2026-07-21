@@ -26,8 +26,10 @@ from textual.widgets import Static
 import mascot
 import mascot_states
 import theme
+import webfonts
 from theme import preference as theme_preference
 from theme import registry as theme_registry
+from webfonts import preference as font_preference
 from approval import ApprovalDecision
 from client import Qw35Client
 from config import Config, load_config
@@ -43,6 +45,7 @@ from widgets.approval_modal import ApprovalModal
 from widgets.chat import BlockquoteFrame, ChatView, set_terminal_host
 from widgets.command_palette import CommandPalette
 from widgets.explorer_budget_modal import ExplorerBudgetModal
+from widgets.font_selector import FontSelector
 from widgets.mascot import MascotWidget
 from widgets.plan_approval import PlanApprovalModal
 from widgets.prompt_input import PromptInput
@@ -527,6 +530,9 @@ class QwowlApp(App):
         if text == "/theme":
             self._open_theme_selector()
             return True
+        if text == "/fonts":
+            self._open_font_selector()
+            return True
         if text == "/sessions":
             self._open_session_selector()
             return True
@@ -584,6 +590,25 @@ class QwowlApp(App):
             self.apply_theme_preview(name, mode)  # commit
             # apply_theme_preview snaps mode to an available one; persist that.
             theme_preference.save(self._theme_name, self._theme_mode)
+        self.query_one(PromptInput).focus()
+
+    @work(exclusive=True, group="fonts")
+    async def _open_font_selector(self) -> None:
+        """``/fonts``: pick the web-UI font. No live preview — the font lives in
+        the browser page, out of this process's reach; the commit persists the
+        choice and rewrites the served active.css (when running under webgui)
+        so a reload of any open tab applies it."""
+        options = [(family.slug, family.label) for family in webfonts.CATALOG]
+        result = await self.push_screen_wait(FontSelector(options, font_preference.load()))
+        if result is not None:
+            font_preference.save(result)
+            fonts_dir = os.environ.get(webfonts.FONTS_DIR_ENV)
+            family = webfonts.get(result)
+            if fonts_dir and family is not None:
+                webfonts.write_active_css(fonts_dir, family)
+                self.set_info("font saved — reload the browser tab to apply")
+            else:
+                self.set_info("font saved — applies in --ui webgui/gui")
         self.query_one(PromptInput).focus()
 
     @work(exclusive=True, group="sessions")

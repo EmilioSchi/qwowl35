@@ -3,69 +3,22 @@
   Vendored from textual-serve 1.1.3 templates/app_index.html for `--ui webgui`.
 
   Two changes vs stock: the Google Fonts stylesheet link is removed, and the
-  @font-face rules below serve Mononoki Nerd Font Mono (SIL OFL 1.1, files in
-  qwowl35/webui/fonts/) from our static root. The terminal renderer inside
-  js/textual.js hardcodes fontFamily "Roboto Mono", so that name is re-bound
-  here as an alias to the same Mononoki files — @font-face beats any local
-  "Roboto Mono" install during CSS font matching, and no JS patching is needed.
+  fonts/active.css stylesheet below carries the @font-face rules for the font
+  picked with /fonts (families vendored in qwowl35/webui/fonts/<slug>/). The
+  server generates active.css from the persisted preference at startup, and a
+  /fonts commit rewrites it, so a reload applies the new font. The terminal
+  renderer inside js/textual.js hardcodes fontFamily "Roboto Mono"; active.css
+  re-binds that name as an alias to the active family's files — @font-face
+  beats any local "Roboto Mono" install during CSS font matching, and no JS
+  patching is needed. This page therefore uses "Roboto Mono" everywhere.
 -->
 <html>
   <head>
     <link rel="stylesheet" href="{{ config.static.url }}css/xterm.css" />
+    <link rel="stylesheet" href="{{ config.static.url }}fonts/active.css" />
 
     <script src="{{ config.static.url }}js/textual.js"></script>
     <style>
-      @font-face {
-        font-family: "Mononoki Nerd Font Mono";
-        src: url("{{ config.static.url }}fonts/MononokiNerdFontMono-Regular.woff2") format("woff2");
-        font-weight: normal;
-        font-style: normal;
-      }
-      @font-face {
-        font-family: "Mononoki Nerd Font Mono";
-        src: url("{{ config.static.url }}fonts/MononokiNerdFontMono-Bold.woff2") format("woff2");
-        font-weight: bold;
-        font-style: normal;
-      }
-      @font-face {
-        font-family: "Mononoki Nerd Font Mono";
-        src: url("{{ config.static.url }}fonts/MononokiNerdFontMono-Italic.woff2") format("woff2");
-        font-weight: normal;
-        font-style: italic;
-      }
-      @font-face {
-        font-family: "Mononoki Nerd Font Mono";
-        src: url("{{ config.static.url }}fonts/MononokiNerdFontMono-BoldItalic.woff2") format("woff2");
-        font-weight: bold;
-        font-style: italic;
-      }
-
-      /* Alias: the terminal JS hardcodes "Roboto Mono" — point it at Mononoki. */
-      @font-face {
-        font-family: "Roboto Mono";
-        src: url("{{ config.static.url }}fonts/MononokiNerdFontMono-Regular.woff2") format("woff2");
-        font-weight: normal;
-        font-style: normal;
-      }
-      @font-face {
-        font-family: "Roboto Mono";
-        src: url("{{ config.static.url }}fonts/MononokiNerdFontMono-Bold.woff2") format("woff2");
-        font-weight: bold;
-        font-style: normal;
-      }
-      @font-face {
-        font-family: "Roboto Mono";
-        src: url("{{ config.static.url }}fonts/MononokiNerdFontMono-Italic.woff2") format("woff2");
-        font-weight: normal;
-        font-style: italic;
-      }
-      @font-face {
-        font-family: "Roboto Mono";
-        src: url("{{ config.static.url }}fonts/MononokiNerdFontMono-BoldItalic.woff2") format("woff2");
-        font-weight: bold;
-        font-style: italic;
-      }
-
       body {
         background: #0c181f;
       }
@@ -92,7 +45,7 @@
         height: 240px;
         font-size: 16px;
         z-index: 20;
-        font-family: "Mononoki Nerd Font Mono", menlo, monospace;
+        font-family: "Roboto Mono", menlo, monospace;
         text-align: center;
         opacity: 1;
         color: rgba(255, 255, 255, 0.95);
@@ -129,7 +82,7 @@
         background-color: #5e0ba7;
         color: rgba(255, 255, 255, 0.95);
         border: none;
-        font-family: "Mononoki Nerd Font Mono", menlo, monospace;
+        font-family: "Roboto Mono", menlo, monospace;
         margin: 16px;
         display: block;
       }

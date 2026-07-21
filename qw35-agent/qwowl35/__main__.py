@@ -49,27 +49,43 @@ def _webui_overrides(tmp_dir: str) -> dict:
     """Statics/templates overriding textual-serve's stock page with webui/.
 
     The page is served from a merged scratch copy: the package's bundled assets
-    (js/css/images) plus the Mononoki Nerd Font files vendored in webui/fonts/,
-    with webui/app_index.html as the template. Falls back to the stock page
-    (Roboto Mono from Google Fonts) when webui/ is incomplete.
+    (js/css/images) plus the font families vendored in webui/fonts/<slug>/,
+    with webui/app_index.html as the template. The page's fonts/active.css is
+    generated here from the persisted /fonts preference, and the scratch fonts
+    dir is exported via webfonts.FONTS_DIR_ENV so the per-tab app subprocesses
+    (which inherit this environment) can rewrite it when /fonts commits. Falls
+    back to the stock page (Roboto Mono from Google Fonts) when webui/ is
+    incomplete — the env var stays unset there, which is how /fonts knows a
+    reload would change nothing.
     """
+    import glob
     import shutil
 
     import textual_serve
 
+    import webfonts
+    from webfonts import preference as font_preference
+
     webui = os.path.join(_HERE, "webui")
     fonts_dir = os.path.join(webui, "fonts")
-    if not os.path.isfile(os.path.join(webui, "app_index.html")) or not (
-        os.path.isdir(fonts_dir) and any(f.endswith(".woff2") for f in os.listdir(fonts_dir))
+    default_dir = os.path.join(fonts_dir, webfonts.DEFAULT_SLUG)
+    if not os.path.isfile(os.path.join(webui, "app_index.html")) or not glob.glob(
+        os.path.join(default_dir, "*.woff2")
     ):
         print("webui/ template or fonts missing — serving the stock textual-serve page")
         return {}
 
     statics = os.path.join(tmp_dir, "static")
     shutil.copytree(os.path.join(os.path.dirname(textual_serve.__file__), "static"), statics)
-    for name in os.listdir(fonts_dir):
-        if name.endswith(".woff2"):
-            shutil.copy(os.path.join(fonts_dir, name), os.path.join(statics, "fonts", name))
+    scratch_fonts = os.path.join(statics, "fonts")
+    for family in webfonts.CATALOG:
+        src = os.path.join(fonts_dir, family.slug)
+        if os.path.isdir(src):  # a partially populated fonts dir must not crash
+            shutil.copytree(src, os.path.join(scratch_fonts, family.slug))
+
+    active = webfonts.get(font_preference.load()) or webfonts.get(webfonts.DEFAULT_SLUG)
+    webfonts.write_active_css(scratch_fonts, active)
+    os.environ[webfonts.FONTS_DIR_ENV] = scratch_fonts
     return {"statics_path": statics, "templates_path": webui}
 
 

@@ -35,6 +35,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         takes_args=True, arg_hint="[normal|plan|web|chat]",
     ),
     CommandSpec("/theme", (), "pick a color theme"),
+    CommandSpec("/fonts", (), "pick a terminal font (web/gui)"),
     CommandSpec("/sessions", (), "restore a past session"),
     CommandSpec("/quit", ("/exit", "/abort", "/close"), " "),
 )
