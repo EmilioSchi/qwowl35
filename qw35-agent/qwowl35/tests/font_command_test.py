@@ -94,10 +94,41 @@ def test_fonts_picker_escape_saves_nothing() -> None:
     asyncio.run(scenario())
 
 
-def test_commit_rewrites_active_css_only_under_webgui() -> None:
+def test_highlight_previews_and_escape_reverts_under_webgui() -> None:
     # With FONTS_DIR_ENV set (webgui: the server exported the scratch statics
-    # dir), a commit rewrites active.css there; without it (plain TUI), the
-    # commit only persists the preference.
+    # dir), moving the highlight rewrites the served active.css live, and
+    # escape restores the committed family.
+    async def scenario() -> None:
+        with _Env(), tempfile.TemporaryDirectory() as fonts_dir:
+            os.environ[webfonts.FONTS_DIR_ENV] = fonts_dir
+            app = QwowlApp()
+            async with app.run_test() as pilot:
+                app._dispatch_command("/fonts")
+                await pilot.pause()
+                await pilot.pause()
+                await pilot.press("down")
+                await pilot.pause()
+                assert_equal(
+                    (Path(fonts_dir) / "active.css").read_text(),
+                    webfonts.active_css(webfonts.CATALOG[1]),
+                    "highlight previewed live",
+                )
+                await pilot.press("escape")
+                await pilot.pause()
+                await pilot.pause()
+            assert_equal(
+                (Path(fonts_dir) / "active.css").read_text(),
+                webfonts.active_css(webfonts.CATALOG[0]),
+                "escape reverted the preview",
+            )
+            assert_true(not preference._pref_path().exists(), "nothing persisted")
+
+    asyncio.run(scenario())
+
+
+def test_commit_rewrites_active_css_only_under_webgui() -> None:
+    # A commit rewrites the served active.css when FONTS_DIR_ENV is set;
+    # without it (plain TUI), the commit only persists the preference.
     async def scenario() -> None:
         with _Env(), tempfile.TemporaryDirectory() as fonts_dir:
             os.environ[webfonts.FONTS_DIR_ENV] = fonts_dir

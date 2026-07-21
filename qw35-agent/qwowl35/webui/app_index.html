@@ -5,17 +5,24 @@
   Two changes vs stock: the Google Fonts stylesheet link is removed, and the
   fonts/active.css stylesheet below carries the @font-face rules for the font
   picked with /fonts (families vendored in qwowl35/webui/fonts/<slug>/). The
-  server generates active.css from the persisted preference at startup, and a
-  /fonts commit rewrites it, so a reload applies the new font. The terminal
-  renderer inside js/textual.js hardcodes fontFamily "Roboto Mono"; active.css
-  re-binds that name as an alias to the active family's files — @font-face
-  beats any local "Roboto Mono" install during CSS font matching, and no JS
-  patching is needed. This page therefore uses "Roboto Mono" everywhere.
+  server generates active.css from the persisted preference at startup, and
+  /fonts previews/commits rewrite it in place. The terminal renderer inside
+  js/textual.js hardcodes fontFamily "Roboto Mono"; active.css re-binds that
+  name as an alias to the active family's files — @font-face beats any local
+  "Roboto Mono" install during CSS font matching — so this page uses
+  "Roboto Mono" everywhere.
+
+  Live apply: the watcher script at the bottom polls fonts/active.json and, on
+  a slug change, hot-swaps the active.css link (restyling this page's DOM via
+  the alias) and re-fonts the running terminal through the wrapper instance
+  the server patches onto the element as el.__qwowlTerm (see
+  __main__._expose_terminal_instance) — pywebview windows have no reload
+  button, so /fonts must land without one.
 -->
 <html>
   <head>
     <link rel="stylesheet" href="{{ config.static.url }}css/xterm.css" />
-    <link rel="stylesheet" href="{{ config.static.url }}fonts/active.css" />
+    <link rel="stylesheet" href="{{ config.static.url }}fonts/active.css" id="active-font-css" />
 
     <script src="{{ config.static.url }}js/textual.js"></script>
     <style>
@@ -111,6 +118,60 @@
       }
     </style>
     <script>
+      // /fonts live apply: watch the generated active.json manifest; on a slug
+      // change, reload the stylesheet and re-font the running terminal.
+      (function () {
+        const fontsUrl = "{{ config.static.url }}fonts/";
+        let activeSlug = null;
+
+        function swapStylesheet() {
+          return new Promise((resolve) => {
+            const link = document.getElementById("active-font-css");
+            link.onload = link.onerror = resolve;
+            link.href = fontsUrl + "active.css?v=" + Date.now();
+          });
+        }
+
+        async function applyFont(info) {
+          await swapStylesheet();
+          const family = "'" + info.family + "'";
+          // Pull the faces in now so the terminal never measures a fallback.
+          try {
+            await Promise.all(
+              ["16px", "bold 16px", "italic 16px", "bold italic 16px"].map(
+                (prefix) => document.fonts.load(prefix + " " + family)
+              )
+            );
+          } catch (err) {}
+          document.querySelectorAll(".textual-terminal").forEach((el) => {
+            const term = el.__qwowlTerm; // absent if the server-side JS patch missed
+            if (term && term.terminal) {
+              // A genuinely new fontFamily string makes xterm re-measure the
+              // cell box and rebuild its glyph atlas; refit resizes the app.
+              term.terminal.options.fontFamily =
+                family + ", Monaco, 'Courier New', monospace";
+              if (term.fit) term.fit();
+            }
+          });
+        }
+
+        async function pollFont() {
+          try {
+            const resp = await fetch(fontsUrl + "active.json", { cache: "no-store" });
+            if (!resp.ok) return;
+            const info = await resp.json();
+            if (activeSlug === null) {
+              activeSlug = info.slug; // initial load already ships this font
+            } else if (info.slug !== activeSlug) {
+              activeSlug = info.slug;
+              await applyFont(info);
+            }
+          } catch (err) {}
+        }
+
+        setInterval(pollFont, 1000);
+      })();
+
       function getStartUrl() {
         const url = new URL(window.location.href);
         const params = new URLSearchParams(url.search);

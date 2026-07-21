@@ -592,21 +592,30 @@ class QwowlApp(App):
             theme_preference.save(self._theme_name, self._theme_mode)
         self.query_one(PromptInput).focus()
 
+    def apply_font_preview(self, slug: str) -> None:
+        """Point the served active.css/json at ``slug``; open web/gui pages
+        poll the manifest and restyle live (within about a second). Best-effort
+        no-op in a plain terminal, where the served files don't exist."""
+        fonts_dir = os.environ.get(webfonts.FONTS_DIR_ENV)
+        family = webfonts.get(slug)
+        if fonts_dir and family is not None:
+            webfonts.write_active_css(fonts_dir, family)
+
     @work(exclusive=True, group="fonts")
     async def _open_font_selector(self) -> None:
-        """``/fonts``: pick the web-UI font. No live preview — the font lives in
-        the browser page, out of this process's reach; the commit persists the
-        choice and rewrites the served active.css (when running under webgui)
-        so a reload of any open tab applies it."""
+        """``/fonts``: open the picker (live in web/gui via the polled
+        active.css), persist on commit, revert the preview on escape. In a
+        plain terminal there is nothing to restyle; only the choice persists."""
         options = [(family.slug, family.label) for family in webfonts.CATALOG]
-        result = await self.push_screen_wait(FontSelector(options, font_preference.load()))
-        if result is not None:
+        original = font_preference.load()
+        result = await self.push_screen_wait(FontSelector(options, original))
+        if result is None:
+            self.apply_font_preview(original)  # undo any highlight preview
+        else:
             font_preference.save(result)
-            fonts_dir = os.environ.get(webfonts.FONTS_DIR_ENV)
-            family = webfonts.get(result)
-            if fonts_dir and family is not None:
-                webfonts.write_active_css(fonts_dir, family)
-                self.set_info("font saved — reload the browser tab to apply")
+            self.apply_font_preview(result)
+            if os.environ.get(webfonts.FONTS_DIR_ENV):
+                self.set_info("font saved")
             else:
                 self.set_info("font saved — applies in --ui webgui/gui")
         self.query_one(PromptInput).focus()

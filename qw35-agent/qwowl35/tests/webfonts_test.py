@@ -107,14 +107,26 @@ def test_active_css_regular_only_family_emits_two_blocks() -> None:
 
 
 def test_write_active_css_writes_and_rewrites() -> None:
+    import json
+
     with tempfile.TemporaryDirectory() as tmp:
         first = webfonts.get("mononoki")
         second = webfonts.get("terminus")
         webfonts.write_active_css(tmp, first)
         assert_equal((Path(tmp) / "active.css").read_text(), webfonts.active_css(first), "written")
+        # The manifest the page polls for live apply names the slug + family.
+        assert_equal(
+            json.loads((Path(tmp) / "active.json").read_text()),
+            {"slug": "mononoki", "family": first.css_family},
+            "manifest written",
+        )
         webfonts.write_active_css(tmp, second)
         assert_equal((Path(tmp) / "active.css").read_text(), webfonts.active_css(second), "rewritten")
-        leftovers = [p for p in Path(tmp).iterdir() if p.name != "active.css"]
+        assert_equal(
+            json.loads((Path(tmp) / "active.json").read_text())["slug"], "terminus",
+            "manifest follows",
+        )
+        leftovers = [p for p in Path(tmp).iterdir() if p.name not in ("active.css", "active.json")]
         assert_equal(leftovers, [], "no temp files left behind")
 
 

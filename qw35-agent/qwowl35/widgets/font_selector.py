@@ -1,13 +1,14 @@
 """A keyboard-driven picker for the web-UI font.
 
-Mirrors :class:`~widgets.theme_selector.ThemeSelector`, minus the live preview:
+Mirrors :class:`~widgets.theme_selector.ThemeSelector`, live preview included:
 the font is a property of the *browser* page (``--ui webgui``/``gui``), so the
-TUI process cannot restyle it — the committed choice is persisted and takes
-effect when the browser tab reloads.
+preview happens indirectly — ``App.apply_font_preview`` rewrites the served
+active.css/json, which open pages poll and apply within about a second. In a
+plain terminal the preview is a no-op and only the committed choice persists.
 
-    Up/Down    highlight a family
+    Up/Down    highlight a family → previews it in open web/gui pages
     Enter      confirm (returns the family slug)
-    Escape     cancel (returns ``None``)
+    Escape     cancel (returns ``None``; the app reverts the preview)
 """
 
 from __future__ import annotations
@@ -88,21 +89,23 @@ class FontSelector(ModalScreen["str | None"]):
             opt.set_class(i == self._selected, "option-active")
         self.query_one(f"#font-{self._selected}", Static).scroll_visible()
         self.query_one("#hint", Static).update(
-            Text(
-                "↑↓ font   enter save   esc cancel — applies after a browser reload",
-                style=theme.FG_GHOST,
-            )
+            Text("↑↓ font   enter save   esc cancel", style=theme.FG_GHOST)
         )
+
+    def _apply(self) -> None:
+        """Preview the highlighted family in open web/gui pages, then repaint."""
+        self.app.apply_font_preview(self._options[self._selected][0])
+        self._repaint()
 
     def on_key(self, event) -> None:
         key = event.key
         if key == "up":
             self._selected = (self._selected - 1) % len(self._options)
-            self._repaint()
+            self._apply()
             event.stop()
         elif key == "down":
             self._selected = (self._selected + 1) % len(self._options)
-            self._repaint()
+            self._apply()
             event.stop()
         elif key == "enter":
             self.dismiss(self._options[self._selected][0])

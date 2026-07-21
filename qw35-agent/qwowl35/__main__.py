@@ -45,18 +45,47 @@ def _require_textual_serve():
     return Server
 
 
+def _expose_terminal_instance(js_path: str) -> None:
+    """Patch the scratch copy of textual.js to hang the terminal wrapper off
+    its DOM element (``el.__qwowlTerm``).
+
+    The bundle constructs the wrapper (with the xterm ``Terminal`` inside) in a
+    local and drops it, leaving the page no handle to restyle the terminal —
+    but the /fonts live-apply script in app_index.html needs one to swap
+    ``terminal.options.fontFamily`` and refit. Best-effort: if a textual-serve
+    upgrade reshapes the minified bootstrap the pattern just won't match, and
+    the page degrades to DOM-only font swaps (terminal font applies on the
+    next page load).
+    """
+    import re
+
+    try:
+        with open(js_path, encoding="utf-8") as f:
+            js = f.read()
+        patched, count = re.subn(
+            r"const (\w+)=new (\w+)\((\w+),\{ping:(\w+)\}\);",
+            r"const \1=new \2(\3,{ping:\4});\3.__qwowlTerm=\1;",
+            js,
+        )
+        if count:
+            with open(js_path, "w", encoding="utf-8") as f:
+                f.write(patched)
+    except OSError:
+        pass
+
+
 def _webui_overrides(tmp_dir: str) -> dict:
     """Statics/templates overriding textual-serve's stock page with webui/.
 
     The page is served from a merged scratch copy: the package's bundled assets
     (js/css/images) plus the font families vendored in webui/fonts/<slug>/,
-    with webui/app_index.html as the template. The page's fonts/active.css is
-    generated here from the persisted /fonts preference, and the scratch fonts
-    dir is exported via webfonts.FONTS_DIR_ENV so the per-tab app subprocesses
-    (which inherit this environment) can rewrite it when /fonts commits. Falls
-    back to the stock page (Roboto Mono from Google Fonts) when webui/ is
-    incomplete — the env var stays unset there, which is how /fonts knows a
-    reload would change nothing.
+    with webui/app_index.html as the template. The page's fonts/active.css and
+    active.json are generated here from the persisted /fonts preference, and
+    the scratch fonts dir is exported via webfonts.FONTS_DIR_ENV so the per-tab
+    app subprocesses (which inherit this environment) can rewrite them when
+    /fonts previews or commits — open pages poll the manifest and restyle live.
+    Falls back to the stock page (Roboto Mono from Google Fonts) when webui/ is
+    incomplete — the env var stays unset there, so /fonts only persists.
     """
     import glob
     import shutil
@@ -77,6 +106,7 @@ def _webui_overrides(tmp_dir: str) -> dict:
 
     statics = os.path.join(tmp_dir, "static")
     shutil.copytree(os.path.join(os.path.dirname(textual_serve.__file__), "static"), statics)
+    _expose_terminal_instance(os.path.join(statics, "js", "textual.js"))
     scratch_fonts = os.path.join(statics, "fonts")
     for family in webfonts.CATALOG:
         src = os.path.join(fonts_dir, family.slug)
