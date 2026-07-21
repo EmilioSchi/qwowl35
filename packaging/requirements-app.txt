@@ -1,0 +1,23 @@
+# Everything qw35.app bundles: the qwowl35 runtime deps (see
+# qw35-agent/requirements.txt for the rationale of each), the GUI stack, and
+# the build tools. jedi-language-server is deliberately absent — multilspy
+# launches it from PATH, which has no sane story inside a frozen app; LSP
+# degrades to tree-sitter diagnostics (all imports are guarded).
+
+# qwowl35 runtime
+textual>=1.0
+rich>=13.0
+httpx[http2]>=0.27
+xxhash>=3.4
+platformdirs>=4.0
+tree-sitter-language-pack>=0.2
+magika>=0.6
+multilspy>=0.0.15
+
+# GUI: the agent served over HTTP + a native window, and the setup page
+textual-serve>=1.1
+pywebview>=5.0
+
+# build tools
+pyinstaller>=6.10
+Pillow>=10

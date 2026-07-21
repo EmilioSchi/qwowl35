@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qw35</title>
+<style>
+/*{{CSS}}*/
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="owl" aria-hidden="true">{&ograve;,o}</div>
+    <h1>qw35</h1>
+    <p class="tagline">local Qwowl3.5-9B server + qwowl35 coding agent</p>
+  </header>
+
+  <!-- checking -->
+  <section id="checking" class="card" hidden>
+    <div class="spinner" aria-hidden="true"></div>
+    <p>Checking for the model files&hellip;</p>
+  </section>
+
+  <!-- consent -->
+  <section id="consent" class="card" hidden>
+    <h2>Model download needed</h2>
+    <p>qw35 runs entirely on this Mac. Before the first start it needs to
+       download its model weights from Hugging Face &mdash; this happens once.</p>
+    <table id="model-table"></table>
+    <p id="disk-line" class="muted"></p>
+    <p id="eta-line" class="muted"></p>
+    <p id="resume-line" class="resume" hidden></p>
+    <p id="skip-line" class="muted small" hidden></p>
+    <div class="buttons">
+      <button id="download-btn" class="primary"></button>
+      <button id="quit-btn">Quit</button>
+    </div>
+    <p class="muted small">Files are stored in <code id="gguf-dir"></code>
+       <a href="#" id="reveal-link">(show in Finder)</a></p>
+  </section>
+
+  <!-- downloading -->
+  <section id="downloading" class="card" hidden>
+    <h2>Downloading models</h2>
+    <div id="file-progress"></div>
+    <div class="buttons">
+      <button id="cancel-btn">Pause &amp; keep partial download</button>
+    </div>
+    <p class="muted small">You can quit at any time &mdash; the download resumes
+       from where it stopped on the next launch.</p>
+  </section>
+
+  <!-- starting -->
+  <section id="starting" class="card" hidden>
+    <div class="spinner" aria-hidden="true"></div>
+    <h2 id="starting-title"></h2>
+    <p id="starting-detail" class="muted"></p>
+  </section>
+
+  <!-- error -->
+  <section id="error" class="card error-card" hidden>
+    <h2>Something went wrong</h2>
+    <pre id="error-message"></pre>
+    <div class="buttons">
+      <button id="retry-btn" class="primary" hidden>Retry</button>
+      <button id="error-quit-btn">Quit</button>
+    </div>
+  </section>
+</main>
+<script>
+/*{{JS}}*/
+</script>
+</body>
+</html>
