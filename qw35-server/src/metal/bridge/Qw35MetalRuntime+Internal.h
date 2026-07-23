@@ -99,6 +99,24 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
          threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
 }
 
+// Number of decode-matvec weight codecs with a resolved pipeline slot; indexed
+// by qw35_matvec_codec_index below.
+#define QW35_MATVEC_CODECS 6
+
+/// Maps a decode-matvec tensor type_id to its _psMatvec row, -1 if the codec
+/// has no dedicated decode kernel.
+static inline int qw35_matvec_codec_index(uint32_t type_id) {
+    switch (type_id) {
+        case 8:   return 0;  // q8_0
+        case 12:  return 1;  // q4_k
+        case 13:  return 2;  // q5_k (no residual variant)
+        case 14:  return 3;  // q6_k
+        case 100: return 4;  // GF4
+        case 101: return 5;  // GF2
+        default:  return -1;
+    }
+}
+
 @interface Qw35MetalRuntime () {
     id<MTLDevice> _device;
     id<MTLCommandQueue> _queue;
@@ -160,6 +178,23 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
     // so the name-based prefill path and the resolved decode path agree.
     NSString *_preFfnNormSuffix;
 
+    // Compute pipelines resolved once by -prewarmPipelines: at init and
+    // read-only afterwards, so the per-token encode loop never pays the
+    // Qw35PipelineCache dispatch_sync serial-queue hop (~324 lookups/token).
+    // Slots stay nil when the model never exercises them; call sites fall
+    // back to the cache lookup (which also reports the error) on nil.
+    id<MTLComputePipelineState> _psRms, _psResidualRms, _psRmsBatch, _psResidualRmsBatch, _psSwiglu;
+    id<MTLComputePipelineState> _psGetRow, _psGetRows;
+    id<MTLComputePipelineState> _psGf4FusedFfn;
+    id<MTLComputePipelineState> _psMatvec[QW35_MATVEC_CODECS][2]; // [codec][residual]
+    id<MTLComputePipelineState> _psSsmFused, _psSsmConvBatch, _psSsmL2Batch, _psSsmRecBatch, _psSsmGateNormBatch;
+    id<MTLComputePipelineState> _psAttnPrepDecode, _psAttnFlashDecode, _psAttnPrepPrefill, _psAttnPrefill;
+    // Split-K flash decode (8 simdgroups/head, threadgroup merge) for long
+    // contexts; encodeAttentionDecodeLayer: switches to it above a
+    // sequence-length threshold.
+    id<MTLComputePipelineState> _psAttnFlashDecodeSplit;
+    id<MTLComputePipelineState> _psArgmaxPartials, _psArgmaxReduce;
+
     // Last committed command buffer of the most recent eval.
     id<MTLCommandBuffer> _lastCB;
 
@@ -193,6 +228,12 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
     int _attnWindow;
     int _attnSink;
 
+    // Attended-length threshold above which flash decode switches to the
+    // split-K kernel. QW35_SPLITK_MIN overrides (set huge to disable — the
+    // split merge reassociates the softmax sums, so this is also the A/B
+    // knob for isolating it).
+    int64_t _splitKMin;
+
     // MTLResidencySet (macOS 15+) pinning the mmap-backed weight + KV + scratch
     // buffers GPU-resident, so the driver does not page them out under
     // unified-memory pressure during a long session (decode is weight-bandwidth
@@ -222,6 +263,7 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
 - (BOOL)resolveLayerTensors:(NSError **)error;
 - (BOOL)allocateBuffers:(NSError **)error;
 - (BOOL)ensureKvCapacityForPositions:(uint64_t)positions error:(NSError **)error;
+- (void)kvShrinkToInitial;
 - (void)updateSlabPtrs;
 - (void)useKvSlabsForRead:(id<MTLComputeCommandEncoder>)enc;
 - (id<MTLBuffer>)newFloatBuffer:(uint64_t)count label:(NSString *)label;
@@ -288,13 +330,13 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
 - (BOOL)encodeDeltaPrefillLayer:(id<MTLComputeCommandEncoder>)enc
                            slot:(uint32_t)slot
                          tokens:(uint32_t)tokensCount
-                         prefix:(NSString *)prefix
+                          layer:(Qw35LayerTensors *)layer
                           error:(NSError **)error;
 - (BOOL)encodeAttentionPrefillLayer:(id<MTLComputeCommandEncoder>)enc
                                slot:(uint32_t)slot
                                pos0:(uint32_t)pos0
                              tokens:(uint32_t)tokensCount
-                             prefix:(NSString *)prefix
+                              layer:(Qw35LayerTensors *)layer
                               error:(NSError **)error;
 - (BOOL)encodeEmbedding:(id<MTLComputeCommandEncoder>)enc
                   token:(uint32_t)token
@@ -310,11 +352,11 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
              weightTensor:(Qw35Tensor *)w
                     error:(NSError **)error;
 - (BOOL)encodeRmsBatch:(id<MTLComputeCommandEncoder>)enc
-                weight:(NSString *)weightName
+          weightTensor:(Qw35Tensor *)w
                 tokens:(uint32_t)tokensCount
                  error:(NSError **)error;
 - (BOOL)encodeResidualRmsBatch:(id<MTLComputeCommandEncoder>)enc
-                        weight:(NSString *)weightName
+                  weightTensor:(Qw35Tensor *)w
                         tokens:(uint32_t)tokensCount
                          error:(NSError **)error;
 - (BOOL)encodeDecodeMatvecTensor:(id<MTLComputeCommandEncoder>)enc
@@ -325,7 +367,7 @@ static inline void qw35_dispatch_1d(id<MTLComputeCommandEncoder> enc, NSUInteger
                         residual:(BOOL)residual
                            error:(NSError **)error;
 - (BOOL)encodeMatvecBatch:(id<MTLComputeCommandEncoder>)enc
-                   weight:(NSString *)weightName
+                   weight:(Qw35Tensor *)w
                     input:(id<MTLBuffer>)input
               inputOffset:(NSUInteger)inputOffset
                       dst:(id<MTLBuffer>)dst

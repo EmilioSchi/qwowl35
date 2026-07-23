@@ -38,10 +38,10 @@
 
     Qw35Tensor *q_norm = layer.attnQNorm;
     Qw35Tensor *k_norm = layer.attnKNorm;
-    id<MTLComputePipelineState> prep =
-        [self attnPipeline:_kvQ8 ? @"qw35_attn_decode_preprocess_q8_0_f32"
-                                 : @"qw35_attn_decode_preprocess_f32"
-                     error:error];
+    id<MTLComputePipelineState> prep = _psAttnPrepDecode
+        ?: [self attnPipeline:_kvQ8 ? @"qw35_attn_decode_preprocess_q8_0_f32"
+                                    : @"qw35_attn_decode_preprocess_f32"
+                        error:error];
     if (!prep) return NO;
 
     int64_t n_head = _h.attention_heads;
@@ -70,14 +70,25 @@
     [enc setBytes:&cache_row length:sizeof(cache_row) atIndex:16];
     qw35_dispatch_1d(enc, (NSUInteger)(_h.attention_heads * _h.attention_key_length), 256);
 
-    // Barrier-free flash decode: one simdgroup per head, sigmoid output gate
-    // applied in-kernel.
-    id<MTLComputePipelineState> attn =
-        [self attnPipeline:_kvQ8 ? @"qw35_attention_gqa_flash_decode_q8_0_f32"
-                                 : @"qw35_attention_gqa_flash_decode_f32"
-                     error:error];
-    if (!attn) return NO;
+    // Flash decode. Short contexts: one simdgroup per head walking the whole
+    // attended range (barrier-free, sigmoid output gate applied in-kernel).
+    // Long contexts: the split-K variant (8 simdgroups per head over
+    // contiguous chunks + threadgroup merge) — the serial walk is what makes
+    // decode tok/s decay with context length. The threshold is on the
+    // attended length (window-bounded), below which the split's merge
+    // overhead outweighs the parallelism.
     int64_t seq_len = (int64_t)pos + 1;
+    int64_t attended = seq_len;
+    if (_attnWindow > 0 && (int64_t)_attnSink + (int64_t)_attnWindow < seq_len) {
+        attended = (int64_t)_attnSink + (int64_t)_attnWindow;
+    }
+    const BOOL useSplit = attended >= _splitKMin && _psAttnFlashDecodeSplit != nil;
+    id<MTLComputePipelineState> attn = useSplit ? _psAttnFlashDecodeSplit
+        : (_psAttnFlashDecode
+            ?: [self attnPipeline:_kvQ8 ? @"qw35_attention_gqa_flash_decode_q8_0_f32"
+                                        : @"qw35_attention_gqa_flash_decode_f32"
+                            error:error]);
+    if (!attn) return NO;
     [enc setComputePipelineState:attn];
     [enc setBuffer:_q_rep offset:0 atIndex:0];
     [enc setBuffer:_kSlabPtrs offset:0 atIndex:1];
@@ -97,7 +108,7 @@
     [enc setBytes:&slot_i length:sizeof(slot_i) atIndex:17];
     [self useKvSlabsForRead:enc];  // bindless slabs: ensure residency + write->read hazard
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)_h.attention_heads, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+         threadsPerThreadgroup:MTLSizeMake(useSplit ? 256 : 32, 1, 1)];
 
     if (![self encodeDecodeMatvecTensor:enc weight:layer.attnOutput input:_core inputOffset:0 dst:_act_b residual:NO error:error]) return NO;
     return YES;
@@ -107,7 +118,7 @@
                                slot:(uint32_t)slot
                                pos0:(uint32_t)pos0
                              tokens:(uint32_t)tokensCount
-                             prefix:(NSString *)prefix
+                              layer:(Qw35LayerTensors *)layer
                               error:(NSError **)error {
     // Segmented KV: evalTokens guarantees this batch does not straddle a slab,
     // so the whole [pos0, pos0+tokens) range writes into slab s.
@@ -118,17 +129,17 @@
     int slot_i = (int)slot;
     const float scale = 1.0f / sqrtf((float)_h.attention_key_length);
 
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_q.weight"] input:_norm inputOffset:0 dst:_qkv dstOffset:0 tokens:tokensCount error:error]) return NO;
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_k.weight"] input:_norm inputOffset:0 dst:_ffn_gate dstOffset:0 tokens:tokensCount error:error]) return NO;
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_v.weight"] input:_norm inputOffset:0 dst:_ffn_up dstOffset:0 tokens:tokensCount error:error]) return NO;
+    if (![self encodeMatvecBatch:enc weight:layer.attnQ input:_norm inputOffset:0 dst:_qkv dstOffset:0 tokens:tokensCount error:error]) return NO;
+    if (![self encodeMatvecBatch:enc weight:layer.attnK input:_norm inputOffset:0 dst:_ffn_gate dstOffset:0 tokens:tokensCount error:error]) return NO;
+    if (![self encodeMatvecBatch:enc weight:layer.attnV input:_norm inputOffset:0 dst:_ffn_up dstOffset:0 tokens:tokensCount error:error]) return NO;
 
-    Qw35Tensor *q_norm = [self tensorNamed:[prefix stringByAppendingString:@"attn_q_norm.weight"] error:error];
-    Qw35Tensor *k_norm = [self tensorNamed:[prefix stringByAppendingString:@"attn_k_norm.weight"] error:error];
+    Qw35Tensor *q_norm = layer.attnQNorm;
+    Qw35Tensor *k_norm = layer.attnKNorm;
     if (!q_norm || !k_norm) return NO;
-    id<MTLComputePipelineState> prep =
-        [self attnPipeline:_kvQ8 ? @"qw35_attn_prefill_preprocess_q8_0_f32"
-                                 : @"qw35_attn_prefill_preprocess_f32"
-                     error:error];
+    id<MTLComputePipelineState> prep = _psAttnPrepPrefill
+        ?: [self attnPipeline:_kvQ8 ? @"qw35_attn_prefill_preprocess_q8_0_f32"
+                                    : @"qw35_attn_prefill_preprocess_f32"
+                        error:error];
     if (!prep) return NO;
 
     int64_t n_head = _h.attention_heads;
@@ -162,10 +173,10 @@
     [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:20];
     qw35_dispatch_1d(enc, (NSUInteger)((uint64_t)tokensCount * max_work), 256);
 
-    id<MTLComputePipelineState> attn =
-        [self attnPipeline:_kvQ8 ? @"qw35_attention_gqa_prefill_q8_0_f32"
-                                 : @"qw35_attention_gqa_prefill_f32"
-                     error:error];
+    id<MTLComputePipelineState> attn = _psAttnPrefill
+        ?: [self attnPipeline:_kvQ8 ? @"qw35_attention_gqa_prefill_q8_0_f32"
+                                    : @"qw35_attention_gqa_prefill_f32"
+                        error:error];
     if (!attn) return NO;
     [enc setComputePipelineState:attn];
     [enc setBuffer:_q_rep offset:0 atIndex:0];
@@ -187,7 +198,7 @@
                                           1)
          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_output.weight"] input:_core inputOffset:0 dst:_act_b dstOffset:0 tokens:tokensCount error:error]) return NO;
+    if (![self encodeMatvecBatch:enc weight:layer.attnOutput input:_core inputOffset:0 dst:_act_b dstOffset:0 tokens:tokensCount error:error]) return NO;
     return YES;
 }
 

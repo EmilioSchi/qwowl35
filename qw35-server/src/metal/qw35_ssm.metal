@@ -252,6 +252,164 @@ kernel void qw35_ssm_conv_recurrent_gate_norm_step128_f32(
     }
 }
 
+// Parallel-reduction variant of the fused decode step above: the L2 norms,
+// the k·q dot, and the per-head y-RMS run as threadgroup/simdgroup tree
+// reductions instead of single-thread 128-element loops. The sums
+// reassociate, so values can differ from the serial kernel in the last ulp —
+// the serial kernel stays the QW35_SSM_SERIAL fallback.
+kernel void qw35_ssm_conv_recurrent_gate_norm_step128_par_f32(
+    device const float * qkv [[buffer(0)]],
+    device const float * conv_w [[buffer(1)]],
+    device float * conv_state [[buffer(2)]],
+    device const float * beta_raw [[buffer(3)]],
+    device const float * alpha_raw [[buffer(4)]],
+    device const float * dt [[buffer(5)]],
+    device const float * a [[buffer(6)]],
+    device float * state [[buffer(7)]],
+    device const float * z [[buffer(8)]],
+    device const float * norm_w [[buffer(9)]],
+    device float * gated [[buffer(10)]],
+    constant int &conv_channels [[buffer(11)]],
+    constant int &num_v_heads [[buffer(12)]],
+    constant int &head_v_dim [[buffer(13)]],
+    constant float &scale [[buffer(14)]],
+    constant float &eps [[buffer(15)]],
+    uint qk_group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr int GROUPS = 16;
+    constexpr int STATE_SIZE = 128;
+    constexpr int Q_OFF = 0;
+    constexpr int K_OFF = GROUPS * STATE_SIZE;
+    constexpr int V_OFF = 2 * GROUPS * STATE_SIZE;
+
+    if (tg_size != 256 || conv_channels != 8192 || head_v_dim != STATE_SIZE || qk_group >= GROUPS) {
+        return;
+    }
+
+    threadgroup float q_cache[STATE_SIZE];
+    threadgroup float k_cache[STATE_SIZE];
+    threadgroup float partial8[8];
+
+    const int d = int(tid & 127u);
+    // Raw conv+SiLU q/k for this lane's element; threads 128..255 carry zeros
+    // so the whole-threadgroup reductions below stay well-defined.
+    float q = 0.0f;
+    float k = 0.0f;
+    if (tid < STATE_SIZE) {
+        const int g = int(qk_group);
+        const int q_c = Q_OFF + g * STATE_SIZE + d;
+        const int k_c = K_OFF + g * STATE_SIZE + d;
+        const int q_state_base = q_c * 3;
+        const int k_state_base = k_c * 3;
+        const int q_weight_base = q_c * 4;
+        const int k_weight_base = k_c * 4;
+
+        const float q_s0 = conv_state[q_state_base + 0];
+        const float q_s1 = conv_state[q_state_base + 1];
+        const float q_s2 = conv_state[q_state_base + 2];
+        const float k_s0 = conv_state[k_state_base + 0];
+        const float k_s1 = conv_state[k_state_base + 1];
+        const float k_s2 = conv_state[k_state_base + 2];
+        const float q_x = qkv[q_c];
+        const float k_x = qkv[k_c];
+        q = qw35_silu_f32(q_s0 * conv_w[q_weight_base + 0]
+                        + q_s1 * conv_w[q_weight_base + 1]
+                        + q_s2 * conv_w[q_weight_base + 2]
+                        + q_x  * conv_w[q_weight_base + 3]);
+        k = qw35_silu_f32(k_s0 * conv_w[k_weight_base + 0]
+                        + k_s1 * conv_w[k_weight_base + 1]
+                        + k_s2 * conv_w[k_weight_base + 2]
+                        + k_x  * conv_w[k_weight_base + 3]);
+
+        conv_state[q_state_base + 0] = q_s1;
+        conv_state[q_state_base + 1] = q_s2;
+        conv_state[q_state_base + 2] = q_x;
+        conv_state[k_state_base + 0] = k_s1;
+        conv_state[k_state_base + 1] = k_s2;
+        conv_state[k_state_base + 2] = k_x;
+    }
+
+    // L2 norms, normalized k·q dot, and the normalized caches — parallel
+    // tree reductions across the threadgroup instead of single-thread loops.
+    // The explicit barriers between the reductions keep one call's final
+    // partial8 read ordered before the next call's first partial8 write
+    // (they share the scratch array).
+    const float q_ss = qw35_threadgroup_sum_256(q * q, partial8, tid, lane, simd_group);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float k_ss = qw35_threadgroup_sum_256(k * k, partial8, tid, lane, simd_group);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float qn = q * (1.0f / max(sqrt(q_ss), eps));
+    const float kn = k * (1.0f / max(sqrt(k_ss), eps));
+    const float kq_dot = qw35_threadgroup_sum_256(qn * kn, partial8, tid, lane, simd_group);
+    if (tid < STATE_SIZE) {
+        q_cache[d] = qn;
+        k_cache[d] = kn;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int pair = int(tid >> 7);
+    const int h = int(qk_group) + pair * GROUPS;
+    const bool active_head = h < num_v_heads;
+
+    float y = 0.0f;
+    if (active_head) {
+        const int v = h * STATE_SIZE + d;
+        const int c = V_OFF + v;
+        const int v_state_base = c * 3;
+        const int v_weight_base = c * 4;
+        const float v_s0 = conv_state[v_state_base + 0];
+        const float v_s1 = conv_state[v_state_base + 1];
+        const float v_s2 = conv_state[v_state_base + 2];
+        const float v_x = qkv[c];
+        const float v_conv = qw35_silu_f32(v_s0 * conv_w[v_weight_base + 0]
+                                         + v_s1 * conv_w[v_weight_base + 1]
+                                         + v_s2 * conv_w[v_weight_base + 2]
+                                         + v_x  * conv_w[v_weight_base + 3]);
+        conv_state[v_state_base + 0] = v_s1;
+        conv_state[v_state_base + 1] = v_s2;
+        conv_state[v_state_base + 2] = v_x;
+
+        const int row = h * STATE_SIZE * head_v_dim + d * STATE_SIZE;
+        const float beta = qw35_sigmoid_f32(beta_raw[h]);
+        const float alpha = qw35_softplus_f32(alpha_raw[h] + dt[h]) * a[h];
+        const float gate = exp(alpha);
+
+        float k_dot = 0.0f;
+        float q_dot = 0.0f;
+        for (int ki = 0; ki < STATE_SIZE; ++ki) {
+            const float old_s = state[row + ki];
+            k_dot += old_s * k_cache[ki];
+            q_dot += old_s * q_cache[ki];
+        }
+
+        const float delta = (v_conv - gate * k_dot) * beta;
+        for (int ki = 0; ki < STATE_SIZE; ++ki) {
+            const float old_s = state[row + ki];
+            state[row + ki] = old_s * gate + k_cache[ki] * delta;
+        }
+        y = (gate * q_dot + delta * kq_dot) * scale;
+    }
+
+    // Per-head RMS of y: simdgroups 0..3 hold head `pair 0`, 4..7 hold head
+    // `pair 1`; one simd_sum per simdgroup, then each thread folds its half's
+    // four partials — no single-thread 128-element loops.
+    const float y_p = simd_sum(active_head ? y * y : 0.0f);
+    if (lane == 0) partial8[simd_group] = y_p;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (active_head) {
+        const float y_ss = partial8[4 * pair + 0] + partial8[4 * pair + 1]
+                         + partial8[4 * pair + 2] + partial8[4 * pair + 3];
+        const float inv_y = rsqrt(y_ss / float(STATE_SIZE) + eps);
+        const int idx = h * STATE_SIZE + d;
+        gated[idx] = y * inv_y * norm_w[d] * qw35_silu_f32(z[idx]);
+    }
+}
+
 kernel void qw35_ssm_recurrent_step128_batch_rows_f32(
     device const float * q_rep [[buffer(0)]],
     device const float * k_rep [[buffer(1)]],

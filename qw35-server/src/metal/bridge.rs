@@ -577,15 +577,24 @@ impl MetalRuntime {
     }
 
     pub fn copy_logits(&mut self) -> Result<Vec<f32>, String> {
-        let mut logits = vec![0.0f32; self.logits_len];
+        let mut logits = Vec::new();
+        self.copy_logits_into(&mut logits)?;
+        Ok(logits)
+    }
+
+    /// Reads the current logits back into `dst`, reusing its allocation: the
+    /// decode loop calls this every sampled token, so the ~1 MB buffer must
+    /// not be reallocated per call (`resize` is a no-op after the first).
+    pub fn copy_logits_into(&mut self, dst: &mut Vec<f32>) -> Result<(), String> {
+        dst.resize(self.logits_len, 0.0);
         #[cfg(target_os = "macos")]
         {
             let mut err = vec![0i8; 1024];
             let ok = unsafe {
                 qw35_metal_runtime_copy_logits(
                     self.raw.as_ptr(),
-                    logits.as_mut_ptr(),
-                    logits.len(),
+                    dst.as_mut_ptr(),
+                    dst.len(),
                     err.as_mut_ptr(),
                     err.len(),
                 )
@@ -593,7 +602,7 @@ impl MetalRuntime {
             if ok == 0 {
                 return Err(c_string_from_i8(&err));
             }
-            Ok(logits)
+            Ok(())
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -643,7 +652,10 @@ const REQUIRED_NATIVE_KERNELS: &[&str] = &[
     "qw35_attn_prefill_preprocess_q8_0_f32",
     "qw35_attention_gqa_flash_decode_q8_0_f32",
     "qw35_attention_gqa_prefill_q8_0_f32",
+    "qw35_attention_gqa_flash_decode_split_f32",
+    "qw35_attention_gqa_flash_decode_split_q8_0_f32",
     "qw35_ssm_conv_recurrent_gate_norm_step128_f32",
+    "qw35_ssm_conv_recurrent_gate_norm_step128_par_f32",
     "qw35_ssm_conv1d_step4_batch_f32",
     "qw35_ssm_l2_repeat_qk_batch_f32",
     "qw35_ssm_recurrent_step128_batch_rows_f32",

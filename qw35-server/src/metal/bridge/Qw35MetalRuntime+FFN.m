@@ -16,7 +16,8 @@
     const int64_t emb = (int64_t)_h.embedding_length;
     const int64_t ffn = (int64_t)_h.feed_forward_length;
 
-    id<MTLComputePipelineState> gateUp = [_pipelineCache pipelineNamed:@"qw35_ffn_gate_up_swiglu_gf4_f32" error:error];
+    id<MTLComputePipelineState> gateUp = _psGf4FusedFfn
+        ?: [_pipelineCache pipelineNamed:@"qw35_ffn_gate_up_swiglu_gf4_f32" error:error];
     if (!gateUp) return NO;
     int64_t n_groups = emb / 8;
     [enc setComputePipelineState:gateUp];
@@ -52,10 +53,13 @@ static NSString *qw35_get_row_kernel(uint32_t type_id, BOOL batch, NSError **err
 - (BOOL)encodeEmbedding:(id<MTLComputeCommandEncoder>)enc
                   token:(uint32_t)token
                   error:(NSError **)error {
-    NSString *kernel = qw35_get_row_kernel(_tokenEmbd.type_id, NO, error);
-    if (!kernel) return NO;
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:kernel error:error];
-    if (!pipe) return NO;
+    id<MTLComputePipelineState> pipe = _psGetRow;
+    if (!pipe) {
+        NSString *kernel = qw35_get_row_kernel(_tokenEmbd.type_id, NO, error);
+        if (!kernel) return NO;
+        pipe = [_pipelineCache pipelineNamed:kernel error:error];
+        if (!pipe) return NO;
+    }
     int64_t k = (int64_t)_h.embedding_length;
     [enc setComputePipelineState:pipe];
     [enc setBuffer:_tokenEmbd.buffer offset:_tokenEmbd.offset atIndex:0];
@@ -71,10 +75,13 @@ static NSString *qw35_get_row_kernel(uint32_t type_id, BOOL batch, NSError **err
                        error:(NSError **)error {
     Qw35Tensor *embd = [self tensorNamed:@"token_embd.weight" error:error];
     if (!embd) return NO;
-    NSString *kernel = qw35_get_row_kernel(embd.type_id, YES, error);
-    if (!kernel) return NO;
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:kernel error:error];
-    if (!pipe) return NO;
+    id<MTLComputePipelineState> pipe = embd.type_id == _tokenEmbd.type_id ? _psGetRows : nil;
+    if (!pipe) {
+        NSString *kernel = qw35_get_row_kernel(embd.type_id, YES, error);
+        if (!kernel) return NO;
+        pipe = [_pipelineCache pipelineNamed:kernel error:error];
+        if (!pipe) return NO;
+    }
     int64_t k = (int64_t)_h.embedding_length;
     [enc setComputePipelineState:pipe];
     [enc setBuffer:embd.buffer offset:embd.offset atIndex:0];
@@ -90,7 +97,8 @@ static NSString *qw35_get_row_kernel(uint32_t type_id, BOOL batch, NSError **err
               src:(id<MTLBuffer>)src
      weightTensor:(Qw35Tensor *)w
             error:(NSError **)error {
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_rms_norm_weight_f32" error:error];
+    id<MTLComputePipelineState> pipe = _psRms
+        ?: [_pipelineCache pipelineNamed:@"qw35_rms_norm_weight_f32" error:error];
     if (!pipe) return NO;
     float eps = _h.rms_epsilon;
     int64_t n64 = (int64_t)_h.embedding_length;
@@ -109,7 +117,8 @@ static NSString *qw35_get_row_kernel(uint32_t type_id, BOOL batch, NSError **err
 - (BOOL)encodeResidualRms:(id<MTLComputeCommandEncoder>)enc
              weightTensor:(Qw35Tensor *)w
                     error:(NSError **)error {
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_residual_rms_norm_weight_f32" error:error];
+    id<MTLComputePipelineState> pipe = _psResidualRms
+        ?: [_pipelineCache pipelineNamed:@"qw35_residual_rms_norm_weight_f32" error:error];
     if (!pipe) return NO;
     float eps = _h.rms_epsilon;
     int64_t n64 = (int64_t)_h.embedding_length;
@@ -126,12 +135,11 @@ static NSString *qw35_get_row_kernel(uint32_t type_id, BOOL batch, NSError **err
 }
 
 - (BOOL)encodeRmsBatch:(id<MTLComputeCommandEncoder>)enc
-                weight:(NSString *)weightName
+          weightTensor:(Qw35Tensor *)w
                 tokens:(uint32_t)tokensCount
                  error:(NSError **)error {
-    Qw35Tensor *w = [self tensorNamed:weightName error:error];
-    if (!w) return NO;
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_rms_norm_weight_batch_f32" error:error];
+    id<MTLComputePipelineState> pipe = _psRmsBatch
+        ?: [_pipelineCache pipelineNamed:@"qw35_rms_norm_weight_batch_f32" error:error];
     if (!pipe) return NO;
     float eps = _h.rms_epsilon;
     int64_t n64 = (int64_t)_h.embedding_length;
@@ -148,12 +156,11 @@ static NSString *qw35_get_row_kernel(uint32_t type_id, BOOL batch, NSError **err
 
 /// Fused act_a += act_b followed by RMS norm into _norm (all rows).
 - (BOOL)encodeResidualRmsBatch:(id<MTLComputeCommandEncoder>)enc
-                        weight:(NSString *)weightName
+                  weightTensor:(Qw35Tensor *)w
                         tokens:(uint32_t)tokensCount
                          error:(NSError **)error {
-    Qw35Tensor *w = [self tensorNamed:weightName error:error];
-    if (!w) return NO;
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_residual_rms_norm_weight_batch_f32" error:error];
+    id<MTLComputePipelineState> pipe = _psResidualRmsBatch
+        ?: [_pipelineCache pipelineNamed:@"qw35_residual_rms_norm_weight_batch_f32" error:error];
     if (!pipe) return NO;
     float eps = _h.rms_epsilon;
     int64_t n64 = (int64_t)_h.embedding_length;
@@ -226,7 +233,9 @@ static NSString *qw35_get_row_kernel(uint32_t type_id, BOOL batch, NSError **err
         return NO;
     }
 
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:kernel error:error];
+    const int ci = qw35_matvec_codec_index(w.type_id);
+    id<MTLComputePipelineState> pipe = ci >= 0 ? _psMatvec[ci][residual ? 1 : 0] : nil;
+    if (!pipe) pipe = [_pipelineCache pipelineNamed:kernel error:error];
     if (!pipe) return NO;
     int64_t n_blocks = (int64_t)qw35_div_up_u64((uint64_t)k, block_elems);
     [enc setComputePipelineState:pipe];
@@ -249,26 +258,22 @@ static NSString *qw35_get_row_kernel(uint32_t type_id, BOOL batch, NSError **err
 /// Multi-token matvec for prefill: tiled simdgroup matmul for any chunk of
 /// two or more tokens; single tokens fall back to the decode matvec path.
 - (BOOL)encodeMatvecBatch:(id<MTLComputeCommandEncoder>)enc
-                   weight:(NSString *)weightName
+                   weight:(Qw35Tensor *)w
                     input:(id<MTLBuffer>)input
               inputOffset:(NSUInteger)inputOffset
                       dst:(id<MTLBuffer>)dst
                 dstOffset:(NSUInteger)dstOffset
                    tokens:(uint32_t)tokensCount
                     error:(NSError **)error {
-    Qw35Tensor *w = [self tensorNamed:weightName error:error];
-    if (!w) return NO;
     if (w.n_dims < 2) {
-        if (error) *error = qw35_error(@"tensor %@ is not a matrix", weightName);
+        if (error) *error = qw35_error(@"tensor %@ is not a matrix", w.name);
         return NO;
     }
     int64_t k = (int64_t)w.dims[0];
     int64_t rows = (int64_t)w.dims[1];
 
     if (tokensCount == 1) {
-        Qw35Tensor *preferred = [self decodeWeightNamed:weightName error:error];
-        if (!preferred) return NO;
-        return [self encodeDecodeMatvecTensor:enc weight:preferred input:input inputOffset:inputOffset dst:dst residual:NO error:error];
+        return [self encodeDecodeMatvecTensor:enc weight:w input:input inputOffset:inputOffset dst:dst residual:NO error:error];
     }
 
     NSString *tiledKernel = nil;
@@ -284,7 +289,7 @@ static NSString *qw35_get_row_kernel(uint32_t type_id, BOOL batch, NSError **err
         case 100: tiledKernel = @"qw35_mul_mm_gf4_f32"; break;
         case 101: tiledKernel = @"qw35_mul_mm_gf2_f32"; break;
         default:
-            if (error) *error = qw35_error(@"unsupported tensor type %u for %@", w.type_id, weightName);
+            if (error) *error = qw35_error(@"unsupported tensor type %u for %@", w.type_id, w.name);
             return NO;
     }
     return [self encodeTiledKMatmul:enc
@@ -364,7 +369,8 @@ static NSString *qw35_get_row_kernel(uint32_t type_id, BOOL batch, NSError **err
 - (BOOL)encodeSwiGLU:(id<MTLComputeCommandEncoder>)enc
                    n:(uint64_t)n
                error:(NSError **)error {
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_swiglu_f32" error:error];
+    id<MTLComputePipelineState> pipe = _psSwiglu
+        ?: [_pipelineCache pipelineNamed:@"qw35_swiglu_f32" error:error];
     if (!pipe) return NO;
     int64_t n64 = (int64_t)n;
     [enc setComputePipelineState:pipe];

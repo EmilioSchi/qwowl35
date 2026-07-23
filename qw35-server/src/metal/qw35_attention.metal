@@ -291,6 +291,128 @@ kernel void qw35_attention_gqa_flash_decode_f32(
     }
 }
 
+// Split-K flash decode for long contexts: 8 simdgroups per head, each running
+// the same online softmax over a contiguous chunk of the (sink+window) index
+// domain, merged in threadgroup memory with the standard flash-attention
+// combine (exp-rescale partials to the global max, then one division). The
+// host dispatches this variant only above a sequence-length threshold; the
+// single-simdgroup kernel above stays optimal for short contexts. The merge
+// reassociates the softmax accumulation, so outputs can differ from the
+// serial kernel in the last ulp.
+kernel void qw35_attention_gqa_flash_decode_split_f32(
+    device const float * q [[buffer(0)]],
+    device const Qw35KvSlabsU & k_slabs [[buffer(1)]],
+    device const Qw35KvSlabsU & v_slabs [[buffer(2)]],
+    device float * dst [[buffer(3)]],
+    device const float * gate [[buffer(4)]],
+    constant int64_t &n_head [[buffer(5)]],
+    constant int64_t &n_kv_head [[buffer(6)]],
+    constant int64_t &head_dim [[buffer(7)]],
+    constant int64_t &seq_len [[buffer(8)]],
+    constant float &sm_scale [[buffer(9)]],
+    constant int &attn_window [[buffer(10)]],
+    constant int &attn_sink [[buffer(11)]],
+    constant int &kv_slab [[buffer(16)]],
+    constant int &slot_i [[buffer(17)]],
+    uint h_u [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr int NSIMD = 8;
+    const int h = int(h_u);
+    const int hd = QW35_ATTN_HEAD_DIM_CONST;
+    if (h >= QW35_ATTN_N_HEAD || hd <= 0 || hd > 256 || seq_len <= 0) return;
+
+    const int kv_group = QW35_ATTN_N_HEAD / QW35_ATTN_N_KV_HEAD;
+    const int kv_h = h / kv_group;
+    const int kv_dim = QW35_ATTN_N_KV_HEAD * hd;
+    const int q_off = h * hd;
+    // No early lane return here (unlike the single-simdgroup kernel): every
+    // thread must reach the merge barrier. Idle lanes of a sub-256 head carry
+    // zeros instead; for head_dim 256 the flag folds away at compile time.
+    const bool lane_active = !(QW35_ATTN_HEAD_DIM_CONST < 256 && int(lane) * 8 >= hd);
+    const int d0 = lane_active ? int(lane) * 8 : 0;
+    const int layer_base = slot_i * (kv_slab * kv_dim);
+
+    threadgroup float tg_m[NSIMD];
+    threadgroup float tg_l[NSIMD];
+    threadgroup float tg_acc[NSIMD * 256];
+
+    float qv[8];
+    for (int i = 0; i < 8; i++) qv[i] = lane_active ? q[q_off + d0 + i] : 0.0f;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[8] = {0.0f};
+
+    const int sl = int(seq_len);
+    int sink = max(0, min(attn_sink, sl));
+    int recent_start, total;
+    if (attn_window <= 0 || sink + attn_window >= sl) {
+        sink = 0; recent_start = 0; total = sl;
+    } else {
+        recent_start = sl - attn_window; total = sink + attn_window;
+    }
+    const int chunk = (total + NSIMD - 1) / NSIMD;
+    const int c0 = int(sg) * chunk;
+    const int c1 = min(c0 + chunk, total);
+    for (int idx = c0; idx < c1; ++idx) {
+        const int t = (idx < sink) ? idx : (recent_start + (idx - sink));
+        const int s = t / kv_slab;
+        const int lt = t - s * kv_slab;
+        device const ushort * kc = k_slabs.slab[s];
+        device const ushort * vc = v_slabs.slab[s];
+        const int k_off = layer_base + lt * kv_dim + kv_h * hd + d0;
+
+        float dot = 0.0f;
+        for (int i = 0; i < 8; i++) {
+            dot += qv[i] * qw35_bf16_to_f32(kc[k_off + i]);
+        }
+        dot = simd_sum(dot);
+
+        const float score = dot * sm_scale;
+        const float next_m = max(m, score);
+        const float old_scale = isinf(m) ? 0.0f : exp(m - next_m);
+        const float score_scale = exp(score - next_m);
+
+        for (int i = 0; i < 8; i++) {
+            acc[i] = acc[i] * old_scale + score_scale * qw35_bf16_to_f32(vc[k_off + i]);
+        }
+        l = l * old_scale + score_scale;
+        m = next_m;
+    }
+
+    if (lane == 0) {
+        tg_m[sg] = m;
+        tg_l[sg] = l;
+    }
+    if (lane_active) {
+        for (int i = 0; i < 8; i++) tg_acc[int(sg) * 256 + d0 + i] = acc[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Merge: rescale each chunk's partial state to the global running max.
+    // An empty or all -inf chunk contributes weight 0 (isinf guard avoids
+    // exp(-inf - -inf) = NaN); seq_len >= 1 guarantees a finite global max.
+    if (lane_active) {
+        float m_star = tg_m[0];
+        for (int s2 = 1; s2 < NSIMD; s2++) m_star = max(m_star, tg_m[s2]);
+        float l_star = 0.0f;
+        float merged[8] = {0.0f};
+        for (int s2 = 0; s2 < NSIMD; s2++) {
+            const float w = isinf(tg_m[s2]) ? 0.0f : exp(tg_m[s2] - m_star);
+            l_star += w * tg_l[s2];
+            for (int i = 0; i < 8; i++) {
+                merged[i] += w * tg_acc[s2 * 256 + d0 + i];
+            }
+        }
+        const int out = h * hd + d0;
+        for (int i = 0; i < 8; i++) {
+            dst[out + i] = (merged[i] / l_star) * (QW35_ATTN_HAS_GATE ? qw35_sigmoid_f32(gate[out + i]) : 1.0f);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // q8_0 block-quantized KV cache kernels.
 //
@@ -566,6 +688,105 @@ kernel void qw35_attention_gqa_flash_decode_##TAG##_f32( \
     const int out = h * hd + d0; \
     for (int i = 0; i < 8; i++) { \
         dst[out + i] = (acc[i] / l) * (QW35_ATTN_HAS_GATE ? qw35_sigmoid_f32(gate[out + i]) : 1.0f); \
+    } \
+} \
+kernel void qw35_attention_gqa_flash_decode_split_##TAG##_f32( \
+    device const float * q [[buffer(0)]], \
+    device const Qw35KvSlabsQ8 & k_slabs [[buffer(1)]], \
+    device const Qw35KvSlabsQ8 & v_slabs [[buffer(2)]], \
+    device float * dst [[buffer(3)]], \
+    device const float * gate [[buffer(4)]], \
+    constant int64_t &n_head [[buffer(5)]], \
+    constant int64_t &n_kv_head [[buffer(6)]], \
+    constant int64_t &head_dim [[buffer(7)]], \
+    constant int64_t &seq_len [[buffer(8)]], \
+    constant float &sm_scale [[buffer(9)]], \
+    constant int &attn_window [[buffer(10)]], \
+    constant int &attn_sink [[buffer(11)]], \
+    constant int &kv_slab [[buffer(16)]], \
+    constant int &slot_i [[buffer(17)]], \
+    uint h_u [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_simdgroup]], \
+    uint sg [[simdgroup_index_in_threadgroup]] \
+) { \
+    /* Split-K twin of the kernel above — see the f16 split kernel for the */ \
+    /* merge scheme; the chunk walk matches the single-simdgroup version. */ \
+    constexpr int NSIMD = 8; \
+    const int h = int(h_u); \
+    const int hd = QW35_ATTN_HEAD_DIM_CONST; \
+    if (h >= QW35_ATTN_N_HEAD || hd <= 0 || hd > 256 || seq_len <= 0) return; \
+    const int kv_group = QW35_ATTN_N_HEAD / QW35_ATTN_N_KV_HEAD; \
+    const int kv_h = h / kv_group; \
+    const int kv_dim = QW35_ATTN_N_KV_HEAD * hd; \
+    const int blocks_per_row = kv_dim / QK; \
+    const int q_off = h * hd; \
+    const bool lane_active = !(QW35_ATTN_HEAD_DIM_CONST < 256 && int(lane) * 8 >= hd); \
+    const int d0 = lane_active ? int(lane) * 8 : 0; \
+    const int eb = kv_h * hd + d0; \
+    const int blk_i = eb / QK; \
+    const int e0 = eb % QK; \
+    const int layer_base = slot_i * (kv_slab * blocks_per_row); \
+    threadgroup float tg_m[NSIMD]; \
+    threadgroup float tg_l[NSIMD]; \
+    threadgroup float tg_acc[NSIMD * 256]; \
+    float qv[8]; \
+    for (int i = 0; i < 8; i++) qv[i] = lane_active ? q[q_off + d0 + i] : 0.0f; \
+    float m = -INFINITY; \
+    float l = 0.0f; \
+    float acc[8] = {0.0f}; \
+    const int sl = int(seq_len); \
+    int sink = max(0, min(attn_sink, sl)); \
+    int recent_start, total; \
+    if (attn_window <= 0 || sink + attn_window >= sl) { sink = 0; recent_start = 0; total = sl; } \
+    else { recent_start = sl - attn_window; total = sink + attn_window; } \
+    const int chunk = (total + NSIMD - 1) / NSIMD; \
+    const int c0 = int(sg) * chunk; \
+    const int c1 = min(c0 + chunk, total); \
+    for (int idx = c0; idx < c1; ++idx) { \
+        const int t = (idx < sink) ? idx : (recent_start + (idx - sink)); \
+        const int s = t / kv_slab; \
+        const int lt = t - s * kv_slab; \
+        device const BT * kb = &k_slabs.slab[s][layer_base + lt * blocks_per_row + blk_i]; \
+        const float kd = float(kb->d); \
+        float dot = 0.0f; \
+        for (int i = 0; i < 8; i++) { dot += qv[i] * DFN(kb, e0 + i); } \
+        dot = simd_sum(dot * kd); \
+        const float score = dot * sm_scale; \
+        const float next_m = max(m, score); \
+        const float old_scale = isinf(m) ? 0.0f : exp(m - next_m); \
+        const float score_scale = exp(score - next_m); \
+        device const BT * vb = &v_slabs.slab[s][layer_base + lt * blocks_per_row + blk_i]; \
+        const float vd = float(vb->d); \
+        for (int i = 0; i < 8; i++) { \
+            acc[i] = acc[i] * old_scale + score_scale * vd * DFN(vb, e0 + i); \
+        } \
+        l = l * old_scale + score_scale; \
+        m = next_m; \
+    } \
+    if (lane == 0) { \
+        tg_m[sg] = m; \
+        tg_l[sg] = l; \
+    } \
+    if (lane_active) { \
+        for (int i = 0; i < 8; i++) tg_acc[int(sg) * 256 + d0 + i] = acc[i]; \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    if (lane_active) { \
+        float m_star = tg_m[0]; \
+        for (int s2 = 1; s2 < NSIMD; s2++) m_star = max(m_star, tg_m[s2]); \
+        float l_star = 0.0f; \
+        float merged[8] = {0.0f}; \
+        for (int s2 = 0; s2 < NSIMD; s2++) { \
+            const float w = isinf(tg_m[s2]) ? 0.0f : exp(tg_m[s2] - m_star); \
+            l_star += w * tg_l[s2]; \
+            for (int i = 0; i < 8; i++) { \
+                merged[i] += w * tg_acc[s2 * 256 + d0 + i]; \
+            } \
+        } \
+        const int out = h * hd + d0; \
+        for (int i = 0; i < 8; i++) { \
+            dst[out + i] = (merged[i] / l_star) * (QW35_ATTN_HAS_GATE ? qw35_sigmoid_f32(gate[out + i]) : 1.0f); \
+        } \
     } \
 }
 

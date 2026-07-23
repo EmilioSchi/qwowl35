@@ -23,20 +23,60 @@
 // The cache is a list of fixed-size slab buffers rather than one buffer that
 // reallocates on growth, so a crossing never copies, never doubles the transient
 // footprint, and never re-pins the whole cache — it just wires one fresh slab.
-// A short chat keeps only the slabs it touches resident (one slab ~= 142 MiB of
+// A short chat keeps only the slabs it touches resident (one slab ~= 71 MiB of
 // q8_0 KV across the 8 attention layers), not the full --ctx worth.
 //
-// 8192 is chosen by measurement: decode tok/s is independent of slab size across
-// 1024..32768 (weight-bandwidth bound; the per-layer stride does not move it), so
-// the size is set by other concerns — 8192 holds a typical large first prompt in
-// one slab (few prefill-time crossings) and yields a small slab count (<=32 even
-// at the largest supported --ctx 262144), keeping the read-path slab array tiny.
-#define QW35_KV_INITIAL_SLAB 8192u
+// Decode tok/s is independent of slab size across 1024..32768 (weight-bandwidth
+// bound; the per-layer stride does not move it), so the size is set by other
+// concerns: 4096 halves the up-front per-session allocation on tight-memory
+// machines (8 GiB M1) while QW35_MAX_SLABS * 4096 = 262144 still addresses the
+// model's full trained window. QW35_KV_SLAB overrides at runtime (see init).
+#define QW35_KV_INITIAL_SLAB 4096u
 // QW35_MAX_SLABS is defined in Qw35MetalRuntime+Internal.h (it sizes the ivar
 // slab arrays) and must match QW35_MAX_SLABS in qw35_attention.metal.
 
 @implementation Qw35LayerTensors
 @end
+
+// One tensor store per mapped model file, shared by every runtime the process
+// opens over it (main, scratch, and plan sessions all wrap the same weights).
+// Without sharing, each runtime re-wraps the mmap in its own no-copy
+// MTLBuffers: the pages are shared physically, but Metal accounts the buffer
+// SIZES per allocation, so N sessions charge N x ~4.8 GiB against the
+// process's recommendedMaxWorkingSetSize (~5.5 GiB on an 8 GiB M1) and the
+// second aux session dies with kIOGPUCommandBufferCallbackErrorOutOfMemory
+// no matter how much system RAM is free. The store is immutable after init
+// (name -> tensor lookups only), so sharing across sessions is safe; values
+// are held weakly so a store dies with the last runtime using it.
+static Qw35TensorStore *qw35_shared_tensor_store(const void *modelMap,
+                                                 uint64_t modelSize,
+                                                 const qw35_metal_tensor_desc *tensorDescs,
+                                                 uintptr_t tensorCount,
+                                                 id<MTLDevice> device,
+                                                 NSError **error) {
+    static NSMapTable<NSNumber *, Qw35TensorStore *> *cache;
+    static NSLock *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache = [NSMapTable strongToWeakObjectsMapTable];
+        lock = [[NSLock alloc] init];
+    });
+
+    NSNumber *key = @((uintptr_t)modelMap);
+    [lock lock];
+    Qw35TensorStore *store = [cache objectForKey:key];
+    if (!store) {
+        store = [[Qw35TensorStore alloc] initWithModelMap:modelMap
+                                                modelSize:modelSize
+                                                   tensors:tensorDescs
+                                               tensorCount:tensorCount
+                                                    device:device
+                                                     error:error];
+        if (store) [cache setObject:store forKey:key];
+    }
+    [lock unlock];
+    return store;
+}
 
 @implementation Qw35MetalRuntime
 
@@ -82,6 +122,14 @@
         fprintf(stderr, "qw35: per-stage GPU profiler ON (QW35_STAGE_PROFILE); decode is serialised and SLOW\n");
     }
 
+    _splitKMin = 1024;
+    const char *splitKMin = getenv("QW35_SPLITK_MIN");
+    if (splitKMin && *splitKMin) {
+        _splitKMin = strtoll(splitKMin, NULL, 10);
+        fprintf(stderr, "qw35: split-K flash-decode threshold %lld (QW35_SPLITK_MIN)\n",
+                (long long)_splitKMin);
+    }
+
     _attnWindow = hparams->attn_window;
     _attnSink = hparams->attn_sink;
 
@@ -98,13 +146,29 @@
 
     _h = *hparams;
     _preFfnNormSuffix = _h.n_cls_out > 0 ? @"ffn_norm.weight" : @"post_attention_norm.weight";
-    const uint32_t slab = QW35_KV_INITIAL_SLAB;
+    // Slab granularity: 4096 keeps the up-front allocation modest on an 8 GiB
+    // machine (~71 MiB/session at q8_0 vs ~142 MiB at 8192) while the ceiling
+    // QW35_MAX_SLABS * 4096 = 262144 still spans the model's full trained
+    // window. QW35_KV_SLAB overrides for experiments (multiple of 256, and at
+    // least the prefill chunk so a chunk straddles at most one boundary).
+    uint32_t slab = QW35_KV_INITIAL_SLAB;
+    const char *slabEnv = getenv("QW35_KV_SLAB");
+    if (slabEnv && *slabEnv) {
+        long long v = strtoll(slabEnv, NULL, 10);
+        if (v >= 256 && v % 256 == 0 && (uint64_t)v >= (uint64_t)prefillChunk) {
+            slab = (uint32_t)v;
+            fprintf(stderr, "qw35: KV slab size %u positions (QW35_KV_SLAB)\n", slab);
+        } else {
+            fprintf(stderr, "qw35: ignoring QW35_KV_SLAB=%s (must be a multiple of 256 and >= prefill chunk %u)\n",
+                    slabEnv, prefillChunk);
+        }
+    }
     // The segmented KV cache addresses at most QW35_MAX_SLABS slabs. Reject a
     // larger --ctx outright rather than clamping silently: the Rust layer admits
     // prompts against its own ctx, so a cache that quietly held fewer positions
     // would let a request reach a slab index past the array (out of bounds).
-    // QW35_MAX_SLABS * slab = 64 * 8192 = 524288, double the model's 262144
-    // trained window, so this only ever rejects an unsupported oversize ctx.
+    // QW35_MAX_SLABS * slab = 64 * 4096 = 262144, exactly the model's trained
+    // window, so this only ever rejects an unsupported oversize ctx.
     const uint64_t maxCtx = (uint64_t)QW35_MAX_SLABS * slab;
     if ((uint64_t)ctxSize > maxCtx) {
         if (error) *error = qw35_error(@"--ctx %u exceeds the maximum %llu tokens the KV cache can address (%u slabs x %u)",
@@ -125,12 +189,8 @@
     }
     _kvRowBytes = _kvQ8 ? (kv_dim_init / 32) * 34 : kv_dim_init * sizeof(uint16_t);
 
-    _tensorStore = [[Qw35TensorStore alloc] initWithModelMap:modelMap
-                                                   modelSize:modelSize
-                                                      tensors:tensorDescs
-                                                  tensorCount:tensorCount
-                                                       device:_device
-                                                        error:error];
+    _tensorStore = qw35_shared_tensor_store(modelMap, modelSize, tensorDescs,
+                                            tensorCount, _device, error);
     if (!_tensorStore) return nil;
     if (![_tensorStore validateRequiredForEmbeddingLength:_h.embedding_length
                                                 vocabSize:_vocabSize
@@ -484,47 +544,61 @@
 }
 
 - (BOOL)prewarmPipelines:(NSError **)error {
-    static NSString *const plain[] = {
-        @"qw35_rms_norm_weight_f32",
-        @"qw35_rms_norm_weight_batch_f32",
-        @"qw35_residual_rms_norm_weight_f32",
-        @"qw35_residual_rms_norm_weight_batch_f32",
-        @"qw35_swiglu_f32",
-        @"qw35_get_row_q4_k_f32",
-        @"qw35_get_rows_q4_k_f32",
-        @"qw35_decode_matmul_q8_0_f32",
-        @"qw35_decode_matmul_q4_k_2row_f32",
-        @"qw35_decode_matmul_q4_k_2row_residual_f32",
-        @"qw35_decode_matmul_q5_k_2row_f32",
-        @"qw35_decode_matmul_q6_k_llama_f32",
-        @"qw35_decode_matmul_q6_k_llama_residual_f32",
-        @"qw35_ssm_conv_recurrent_gate_norm_step128_f32",
-        @"qw35_ssm_conv1d_step4_batch_f32",
-        @"qw35_ssm_l2_repeat_qk_batch_f32",
-        @"qw35_ssm_recurrent_step128_batch_rows_f32",
-        @"qw35_ssm_gate_norm_batch_f32",
-        @"qw35_output_q6_k_argmax_partials_16row_f32",
-        @"qw35_output_argmax_reduce_partials_f32",
-    };
-    for (size_t i = 0; i < sizeof(plain) / sizeof(plain[0]); i++) {
-        if (![_pipelineCache pipelineNamed:plain[i] error:error]) return NO;
+    // Resolves every pipeline the decode/prefill paths dispatch and stores it
+    // in the _ps* ivars, so the per-token encode loop reads a pointer instead
+    // of paying a dispatch_sync cache lookup per dispatch. Slots the model
+    // never exercises stay nil; call sites fall back to the cache on nil.
+    #define QW35_RESOLVE(slot, name) \
+        do { if (!((slot) = [_pipelineCache pipelineNamed:(name) error:error])) return NO; } while (0)
+    QW35_RESOLVE(_psRms, @"qw35_rms_norm_weight_f32");
+    QW35_RESOLVE(_psRmsBatch, @"qw35_rms_norm_weight_batch_f32");
+    QW35_RESOLVE(_psResidualRms, @"qw35_residual_rms_norm_weight_f32");
+    QW35_RESOLVE(_psResidualRmsBatch, @"qw35_residual_rms_norm_weight_batch_f32");
+    QW35_RESOLVE(_psSwiglu, @"qw35_swiglu_f32");
+    QW35_RESOLVE(_psMatvec[0][0], @"qw35_decode_matmul_q8_0_f32");
+    QW35_RESOLVE(_psMatvec[0][1], @"qw35_decode_matmul_q8_0_residual_f32");
+    QW35_RESOLVE(_psMatvec[1][0], @"qw35_decode_matmul_q4_k_2row_f32");
+    QW35_RESOLVE(_psMatvec[1][1], @"qw35_decode_matmul_q4_k_2row_residual_f32");
+    QW35_RESOLVE(_psMatvec[2][0], @"qw35_decode_matmul_q5_k_2row_f32");
+    QW35_RESOLVE(_psMatvec[3][0], @"qw35_decode_matmul_q6_k_llama_f32");
+    QW35_RESOLVE(_psMatvec[3][1], @"qw35_decode_matmul_q6_k_llama_residual_f32");
+    // Fused SSM decode step: the parallel-reduction variant by default, the
+    // serial-reduction original with QW35_SSM_SERIAL=1 (bit-exact fallback —
+    // the parallel sums reassociate and can differ in the last ulp).
+    {
+        const char *ssmSerial = getenv("QW35_SSM_SERIAL");
+        if (ssmSerial && *ssmSerial) {
+            fprintf(stderr, "qw35: serial SSM fused decode kernel (QW35_SSM_SERIAL)\n");
+            QW35_RESOLVE(_psSsmFused, @"qw35_ssm_conv_recurrent_gate_norm_step128_f32");
+        } else {
+            QW35_RESOLVE(_psSsmFused, @"qw35_ssm_conv_recurrent_gate_norm_step128_par_f32");
+        }
     }
+    QW35_RESOLVE(_psSsmConvBatch, @"qw35_ssm_conv1d_step4_batch_f32");
+    QW35_RESOLVE(_psSsmL2Batch, @"qw35_ssm_l2_repeat_qk_batch_f32");
+    QW35_RESOLVE(_psSsmRecBatch, @"qw35_ssm_recurrent_step128_batch_rows_f32");
+    QW35_RESOLVE(_psSsmGateNormBatch, @"qw35_ssm_gate_norm_batch_f32");
+    QW35_RESOLVE(_psArgmaxReduce, @"qw35_output_argmax_reduce_partials_f32");
     static NSString *const attn_f16[] = {
         @"qw35_attn_decode_preprocess_f32",
         @"qw35_attn_prefill_preprocess_f32",
         @"qw35_attention_gqa_flash_decode_f32",
         @"qw35_attention_gqa_prefill_f32",
+        @"qw35_attention_gqa_flash_decode_split_f32",
     };
     static NSString *const attn_q8[] = {
         @"qw35_attn_decode_preprocess_q8_0_f32",
         @"qw35_attn_prefill_preprocess_q8_0_f32",
         @"qw35_attention_gqa_flash_decode_q8_0_f32",
         @"qw35_attention_gqa_prefill_q8_0_f32",
+        @"qw35_attention_gqa_flash_decode_split_q8_0_f32",
     };
     NSString *const *attn = _kvQ8 ? attn_q8 : attn_f16;
-    for (size_t i = 0; i < 4; i++) {
-        if (![self attnPipeline:attn[i] error:error]) return NO;
-    }
+    if (!(_psAttnPrepDecode = [self attnPipeline:attn[0] error:error])) return NO;
+    if (!(_psAttnPrepPrefill = [self attnPipeline:attn[1] error:error])) return NO;
+    if (!(_psAttnFlashDecode = [self attnPipeline:attn[2] error:error])) return NO;
+    if (!(_psAttnPrefill = [self attnPipeline:attn[3] error:error])) return NO;
+    if (!(_psAttnFlashDecodeSplit = [self attnPipeline:attn[4] error:error])) return NO;
     // Baked FFN codecs (GF4 type-100, GF2 type-101) are per-layer in a mixed
     // unified .gguf, so scan every layer's gate/up/down instead of sampling
     // blk.0 only; prewarm each codec's kernels once if any layer uses it.
@@ -538,30 +612,42 @@
             if (parts[i].type_id == 101) gf2Ffn = YES;
         }
     }
+    // The GF4 decode matvec also serves the full-logits output head when
+    // output.weight is baked GF4, so resolve it for either user.
+    if (gf4Ffn || _outputWeightIsGf4) {
+        QW35_RESOLVE(_psGf4FusedFfn, @"qw35_ffn_gate_up_swiglu_gf4_f32");
+        QW35_RESOLVE(_psMatvec[4][1], @"qw35_decode_matmul_gf4_2row_residual_f32");
+        QW35_RESOLVE(_psMatvec[4][0], @"qw35_decode_matmul_gf4_2row_f32");
+    }
     if (gf4Ffn) {
-        if (![_pipelineCache pipelineNamed:@"qw35_ffn_gate_up_swiglu_gf4_f32" error:error]) return NO;
-        if (![_pipelineCache pipelineNamed:@"qw35_decode_matmul_gf4_2row_residual_f32" error:error]) return NO;
-        if (![_pipelineCache pipelineNamed:@"qw35_decode_matmul_gf4_2row_f32" error:error]) return NO;
         // Tiled GF4 prefill matmul (full and bounded-output tail-chunk variants).
         if (![_pipelineCache mulMmPipelineNamed:@"qw35_mul_mm_gf4_f32" bcInp:NO bcOut:NO error:error]) return NO;
         if (![_pipelineCache mulMmPipelineNamed:@"qw35_mul_mm_gf4_f32" bcInp:NO bcOut:YES error:error]) return NO;
     }
     if (gf2Ffn) {
-        if (![_pipelineCache pipelineNamed:@"qw35_decode_matmul_gf2_2row_residual_f32" error:error]) return NO;
-        if (![_pipelineCache pipelineNamed:@"qw35_decode_matmul_gf2_2row_f32" error:error]) return NO;
+        QW35_RESOLVE(_psMatvec[5][1], @"qw35_decode_matmul_gf2_2row_residual_f32");
+        QW35_RESOLVE(_psMatvec[5][0], @"qw35_decode_matmul_gf2_2row_f32");
         if (![_pipelineCache mulMmPipelineNamed:@"qw35_mul_mm_gf2_f32" bcInp:NO bcOut:NO error:error]) return NO;
         if (![_pipelineCache mulMmPipelineNamed:@"qw35_mul_mm_gf2_f32" bcInp:NO bcOut:YES error:error]) return NO;
     }
-    Qw35Tensor *baseHead = [_tensorStore tensorNamed:@"output.weight"];
-    if (baseHead != nil && baseHead.type_id == 100) {
-        if (![_pipelineCache pipelineNamed:@"qw35_output_gf4_argmax_partials_16row_f32" error:error]) return NO;
+    // Fused argmax head: resolve the variant encodeOutputHead: dispatches for
+    // this model's LM head. A classification head (n_cls_out > 0) never runs
+    // the argmax path, so the slot stays nil there.
+    if (_h.n_cls_out == 0) {
+        QW35_RESOLVE(_psArgmaxPartials, _outputWeightIsGf4
+            ? @"qw35_output_gf4_argmax_partials_16row_f32"
+            : @"qw35_output_q6_k_argmax_partials_16row_f32");
     }
-    // q8_0 token embeddings (the reranker ships them q8_0; the 9B is q4_k and
-    // skips this, keeping its prewarm set byte-identical).
-    if (_tokenEmbd.type_id == 8) {
-        if (![_pipelineCache pipelineNamed:@"qw35_get_row_q8_0_f32" error:error]) return NO;
-        if (![_pipelineCache pipelineNamed:@"qw35_get_rows_q8_0_f32" error:error]) return NO;
+    // Token-embedding row gather, by embedding quantization (q4_k on the 9B,
+    // q8_0 on the reranker). Unknown types keep the encode-time error path.
+    if (_tokenEmbd.type_id == 12) {
+        QW35_RESOLVE(_psGetRow, @"qw35_get_row_q4_k_f32");
+        QW35_RESOLVE(_psGetRows, @"qw35_get_rows_q4_k_f32");
+    } else if (_tokenEmbd.type_id == 8) {
+        QW35_RESOLVE(_psGetRow, @"qw35_get_row_q8_0_f32");
+        QW35_RESOLVE(_psGetRows, @"qw35_get_rows_q8_0_f32");
     }
+    #undef QW35_RESOLVE
     return YES;
 }
 
@@ -611,7 +697,39 @@
         if (!buffer) continue;
         memset([buffer contents], 0, [buffer length]);
     }
+    // Reset means the session restarts from position 0: no live position
+    // addresses slab >= 1 anymore, so give the grown KV cache back instead of
+    // holding a long-dead conversation's slabs until process exit.
+    [self kvShrinkToInitial];
     return YES;
+}
+
+/// Free every KV slab beyond the first. Only legal on the reset path: the
+/// caller has drained in-flight GPU work and the next prefill rewrites rows
+/// from position 0, so slabs >= 1 are unreachable. The checkpoint-restore
+/// path never calls reset (its KV rows below the boundary must stay live).
+- (void)kvShrinkToInitial {
+    if (_kvSlabCount <= 1) return;
+    uint64_t freed = 0;
+    for (uint32_t i = 1; i < _kvSlabCount; i++) {
+        if (_kSlabs[i]) {
+            freed += _kSlabs[i].allocatedSize;
+            if (_residencySet) [_residencySet removeAllocation:_kSlabs[i]];
+            _kSlabs[i] = nil;
+        }
+        if (_vSlabs[i]) {
+            freed += _vSlabs[i].allocatedSize;
+            if (_residencySet) [_residencySet removeAllocation:_vSlabs[i]];
+            _vSlabs[i] = nil;
+        }
+    }
+    if (_residencySet) [_residencySet commit];
+    _kvSlabCount = 1;
+    const uint64_t slab = _kvSlab ? _kvSlab : 1;
+    _kvCapacity = (uint32_t)((uint64_t)_ctxSize < slab ? _ctxSize : (uint32_t)slab);
+    [self updateSlabPtrs];
+    fprintf(stderr, "qw35: KV cache shrunk to 1 slab on session reset (freed %.0f MiB)\n",
+            (double)freed / (1024.0 * 1024.0));
 }
 
 - (uint64_t)stateSize {
@@ -1154,34 +1272,33 @@
 
     do {
         if (![self encodeEmbeddingBatch:enc count:n error:error]) break;
-        if (![self encodeRmsBatch:enc weight:@"blk.0.attn_norm.weight" tokens:n error:error]) break;
+        if (![self encodeRmsBatch:enc weightTensor:_layers[0].attnNorm tokens:n error:error]) break;
 
         uint32_t delta_slot = 0;
         uint32_t attn_slot = 0;
         BOOL failed = NO;
         for (uint32_t il = 0; il < _h.transformer_layers && !failed; il++) {
-            NSString *prefix = [NSString stringWithFormat:@"blk.%u.", il];
+            Qw35LayerTensors *layer = _layers[il];
 
             if (((il + 1) % interval) == 0) {
-                if (![self encodeAttentionPrefillLayer:enc slot:attn_slot pos0:pos0 tokens:n prefix:prefix error:error]) { failed = YES; break; }
+                if (![self encodeAttentionPrefillLayer:enc slot:attn_slot pos0:pos0 tokens:n layer:layer error:error]) { failed = YES; break; }
                 attn_slot++;
             } else {
-                if (![self encodeDeltaPrefillLayer:enc slot:delta_slot tokens:n prefix:prefix error:error]) { failed = YES; break; }
+                if (![self encodeDeltaPrefillLayer:enc slot:delta_slot tokens:n layer:layer error:error]) { failed = YES; break; }
                 delta_slot++;
             }
 
-            if (![self encodeResidualRmsBatch:enc weight:[prefix stringByAppendingString:_preFfnNormSuffix] tokens:n error:error]) { failed = YES; break; }
+            if (![self encodeResidualRmsBatch:enc weightTensor:layer.postAttentionNorm tokens:n error:error]) { failed = YES; break; }
 
-            if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"ffn_gate.weight"] input:_norm inputOffset:0 dst:_ffn_gate dstOffset:0 tokens:n error:error]) { failed = YES; break; }
-            if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"ffn_up.weight"] input:_norm inputOffset:0 dst:_ffn_up dstOffset:0 tokens:n error:error]) { failed = YES; break; }
+            if (![self encodeMatvecBatch:enc weight:layer.ffnGate input:_norm inputOffset:0 dst:_ffn_gate dstOffset:0 tokens:n error:error]) { failed = YES; break; }
+            if (![self encodeMatvecBatch:enc weight:layer.ffnUp input:_norm inputOffset:0 dst:_ffn_up dstOffset:0 tokens:n error:error]) { failed = YES; break; }
             if (![self encodeSwiGLU:enc n:(uint64_t)n * _h.feed_forward_length error:error]) { failed = YES; break; }
-            if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"ffn_down.weight"] input:_ffn_gate inputOffset:0 dst:_act_b dstOffset:0 tokens:n error:error]) { failed = YES; break; }
+            if (![self encodeMatvecBatch:enc weight:layer.ffnDown input:_ffn_gate inputOffset:0 dst:_act_b dstOffset:0 tokens:n error:error]) { failed = YES; break; }
 
             if (il + 1 < _h.transformer_layers) {
-                NSString *next = [NSString stringWithFormat:@"blk.%u.attn_norm.weight", il + 1];
-                if (![self encodeResidualRmsBatch:enc weight:next tokens:n error:error]) { failed = YES; break; }
+                if (![self encodeResidualRmsBatch:enc weightTensor:_layers[il + 1].attnNorm tokens:n error:error]) { failed = YES; break; }
             } else if (logitsMode != QW35_LOGITS_NONE) {
-                if (![self encodeResidualRmsBatch:enc weight:@"output_norm.weight" tokens:n error:error]) { failed = YES; break; }
+                if (![self encodeResidualRmsBatch:enc weightTensor:_outputNorm tokens:n error:error]) { failed = YES; break; }
             }
         }
         if (failed) break;

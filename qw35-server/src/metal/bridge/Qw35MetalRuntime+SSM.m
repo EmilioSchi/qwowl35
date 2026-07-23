@@ -27,7 +27,8 @@
     // Single fused kernel: conv1d step + SiLU, L2 norm of q/k, gated
     // delta-rule state update, per-head group RMS norm and SiLU(z) gating.
     // Reads the z gate from _z_gate and overwrites it with the gated output.
-    id<MTLComputePipelineState> pipe = [_pipelineCache pipelineNamed:@"qw35_ssm_conv_recurrent_gate_norm_step128_f32" error:error];
+    id<MTLComputePipelineState> pipe = _psSsmFused
+        ?: [_pipelineCache pipelineNamed:@"qw35_ssm_conv_recurrent_gate_norm_step128_f32" error:error];
     if (!pipe) return NO;
     int num_v_heads = (int)_h.ssm_time_step_rank;
     int head_dim = (int)_h.ssm_state_size;
@@ -59,7 +60,7 @@
 - (BOOL)encodeDeltaPrefillLayer:(id<MTLComputeCommandEncoder>)enc
                            slot:(uint32_t)slot
                          tokens:(uint32_t)tokensCount
-                         prefix:(NSString *)prefix
+                          layer:(Qw35LayerTensors *)layer
                           error:(NSError **)error {
     const int conv_channels = (int)(_h.ssm_inner_size + 2u * _h.ssm_group_count * _h.ssm_state_size);
     const uint64_t conv_slot_elems = (uint64_t)conv_channels * (_h.ssm_conv_kernel - 1);
@@ -68,14 +69,15 @@
     const NSUInteger state_off = (NSUInteger)(slot * state_slot_elems * sizeof(float));
     const float scale = 1.0f / sqrtf((float)_h.ssm_state_size);
 
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_qkv.weight"] input:_norm inputOffset:0 dst:_qkv dstOffset:0 tokens:tokensCount error:error]) return NO;
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"attn_gate.weight"] input:_norm inputOffset:0 dst:_z_gate dstOffset:0 tokens:tokensCount error:error]) return NO;
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"ssm_beta.weight"] input:_norm inputOffset:0 dst:_beta dstOffset:0 tokens:tokensCount error:error]) return NO;
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"ssm_alpha.weight"] input:_norm inputOffset:0 dst:_alpha dstOffset:0 tokens:tokensCount error:error]) return NO;
+    if (![self encodeMatvecBatch:enc weight:layer.attnQkv input:_norm inputOffset:0 dst:_qkv dstOffset:0 tokens:tokensCount error:error]) return NO;
+    if (![self encodeMatvecBatch:enc weight:layer.attnGate input:_norm inputOffset:0 dst:_z_gate dstOffset:0 tokens:tokensCount error:error]) return NO;
+    if (![self encodeMatvecBatch:enc weight:layer.ssmBeta input:_norm inputOffset:0 dst:_beta dstOffset:0 tokens:tokensCount error:error]) return NO;
+    if (![self encodeMatvecBatch:enc weight:layer.ssmAlpha input:_norm inputOffset:0 dst:_alpha dstOffset:0 tokens:tokensCount error:error]) return NO;
 
-    Qw35Tensor *conv_w = [self tensorNamed:[prefix stringByAppendingString:@"ssm_conv1d.weight"] error:error];
+    Qw35Tensor *conv_w = layer.ssmConv;
     if (!conv_w) return NO;
-    id<MTLComputePipelineState> conv_pipe = [_pipelineCache pipelineNamed:@"qw35_ssm_conv1d_step4_batch_f32" error:error];
+    id<MTLComputePipelineState> conv_pipe = _psSsmConvBatch
+        ?: [_pipelineCache pipelineNamed:@"qw35_ssm_conv1d_step4_batch_f32" error:error];
     if (!conv_pipe) return NO;
     int n_tokens = (int)tokensCount;
     [enc setComputePipelineState:conv_pipe];
@@ -87,7 +89,8 @@
     [enc setBytes:&n_tokens length:sizeof(n_tokens) atIndex:5];
     qw35_dispatch_1d(enc, (NSUInteger)conv_channels, 256);
 
-    id<MTLComputePipelineState> prep_pipe = [_pipelineCache pipelineNamed:@"qw35_ssm_l2_repeat_qk_batch_f32" error:error];
+    id<MTLComputePipelineState> prep_pipe = _psSsmL2Batch
+        ?: [_pipelineCache pipelineNamed:@"qw35_ssm_l2_repeat_qk_batch_f32" error:error];
     if (!prep_pipe) return NO;
     int num_k_heads = (int)_h.ssm_group_count;
     int num_v_heads = (int)_h.ssm_time_step_rank;
@@ -110,10 +113,11 @@
                                           1)
          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
-    Qw35Tensor *dt = [self tensorNamed:[prefix stringByAppendingString:@"ssm_dt.bias"] error:error];
-    Qw35Tensor *a = [self tensorNamed:[prefix stringByAppendingString:@"ssm_a"] error:error];
+    Qw35Tensor *dt = layer.ssmDt;
+    Qw35Tensor *a = layer.ssmA;
     if (!dt || !a) return NO;
-    id<MTLComputePipelineState> rec_pipe = [_pipelineCache pipelineNamed:@"qw35_ssm_recurrent_step128_batch_rows_f32" error:error];
+    id<MTLComputePipelineState> rec_pipe = _psSsmRecBatch
+        ?: [_pipelineCache pipelineNamed:@"qw35_ssm_recurrent_step128_batch_rows_f32" error:error];
     if (!rec_pipe) return NO;
     int v_stride = conv_channels;
     [enc setComputePipelineState:rec_pipe];
@@ -136,9 +140,10 @@
                                           1)
          threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
 
-    Qw35Tensor *ssm_norm = [self tensorNamed:[prefix stringByAppendingString:@"ssm_norm.weight"] error:error];
+    Qw35Tensor *ssm_norm = layer.ssmNorm;
     if (!ssm_norm) return NO;
-    id<MTLComputePipelineState> gate_norm_pipe = [_pipelineCache pipelineNamed:@"qw35_ssm_gate_norm_batch_f32" error:error];
+    id<MTLComputePipelineState> gate_norm_pipe = _psSsmGateNormBatch
+        ?: [_pipelineCache pipelineNamed:@"qw35_ssm_gate_norm_batch_f32" error:error];
     if (!gate_norm_pipe) return NO;
     [enc setComputePipelineState:gate_norm_pipe];
     [enc setBuffer:_core offset:0 atIndex:0];
@@ -152,7 +157,7 @@
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tokensCount, (NSUInteger)_h.ssm_time_step_rank, 1)
          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
-    if (![self encodeMatvecBatch:enc weight:[prefix stringByAppendingString:@"ssm_out.weight"] input:_z_gate inputOffset:0 dst:_act_b dstOffset:0 tokens:tokensCount error:error]) return NO;
+    if (![self encodeMatvecBatch:enc weight:layer.ssmOut input:_z_gate inputOffset:0 dst:_act_b dstOffset:0 tokens:tokensCount error:error]) return NO;
     return YES;
 }
 

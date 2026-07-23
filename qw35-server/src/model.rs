@@ -22,7 +22,12 @@ use think_budget::ThinkBudget;
 use tool_penalty::ToolCallPenaltyGuard;
 
 pub const DEFAULT_MODEL_ID: &str = "qwen3.5-9b";
-pub const DEFAULT_PREFILL_CHUNK: u32 = 32;
+/// 128 amortizes the per-chunk encode pass and full GPU drain (evalTokens
+/// waits on the previous chunk before rewriting _prefill_tokens) 4x better
+/// than the old default 32, at ~+24 MiB of activation buffers. Chunking can
+/// shift which tiled-matmul bounds variant runs for a given prompt length, so
+/// the token-identity harness must pass before this default changes again.
+pub const DEFAULT_PREFILL_CHUNK: u32 = 128;
 pub const MAX_PREFILL_CHUNK: u32 = 256;
 /// Default depth of the session checkpoint stack (recurrent-state snapshots
 /// at prompt history boundaries). Each snapshot costs `state_size()` bytes of
@@ -1325,6 +1330,10 @@ impl Engine {
         let mut trace_win_start = Instant::now();
         let mut trace_win_tokens = 0u32;
 
+        // Logits readback buffer, reused across the sampling path's steps so
+        // the ~1 MB vocab-sized vector is allocated once per request.
+        let mut logits_buf: Vec<f32> = Vec::new();
+
         for step in 0..max_tokens {
             let sample_start = Instant::now();
             // While the thinking-budget tracker is draining a forced close
@@ -1341,14 +1350,14 @@ impl Engine {
                     session.runtime.argmax().map(|(token, _)| token)
                 } else {
                     let bias = think_budget.bias();
-                    session.runtime.copy_logits().map(|mut logits| {
+                    session.runtime.copy_logits_into(&mut logits_buf).map(|()| {
                         if let Some((id, amount)) = bias {
-                            if let Some(slot) = logits.get_mut(id as usize) {
+                            if let Some(slot) = logits_buf.get_mut(id as usize) {
                                 *slot += amount;
                             }
                         }
                         sample_from_logits(
-                            &logits,
+                            &logits_buf,
                             request,
                             &all_seen,
                             prompt_tokens.len(),

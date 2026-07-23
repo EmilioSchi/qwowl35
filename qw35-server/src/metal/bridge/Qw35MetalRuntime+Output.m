@@ -36,7 +36,8 @@
     const int64_t n_blocks =
         _outputWeightIsGf4 ? k / 8 : (int64_t)qw35_div_up_u64((uint64_t)k, 256);
 
-    id<MTLComputePipelineState> partials = [_pipelineCache pipelineNamed:partialsKernel error:error];
+    id<MTLComputePipelineState> partials = _psArgmaxPartials
+        ?: [_pipelineCache pipelineNamed:partialsKernel error:error];
     if (!partials) return NO;
     [enc setComputePipelineState:partials];
     [enc setBuffer:_outputWeight.buffer offset:_outputWeight.offset atIndex:0];
@@ -49,7 +50,8 @@
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)groups, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
 
-    id<MTLComputePipelineState> reduce = [_pipelineCache pipelineNamed:@"qw35_output_argmax_reduce_partials_f32" error:error];
+    id<MTLComputePipelineState> reduce = _psArgmaxReduce
+        ?: [_pipelineCache pipelineNamed:@"qw35_output_argmax_reduce_partials_f32" error:error];
     if (!reduce) return NO;
     [enc setComputePipelineState:reduce];
     [enc setBuffer:_argmax_partial_token offset:0 atIndex:0];

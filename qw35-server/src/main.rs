@@ -585,7 +585,7 @@ Model and runtime:\n\
   --num-predict N\n\
       Default max output tokens when the client omits a limit. Use -1 to generate until EOS or remaining context is exhausted. Default: -1\n\
   --prefill-chunk N\n\
-      Prompt tokens to evaluate per native Metal prefill chunk. Use 1 for the scalar compatibility path; any larger value uses the Q4_K/Q5_K/Q6_K tiled prefill path, fastest at multiples of 32. Default: 32\n\
+      Prompt tokens to evaluate per native Metal prefill chunk. Use 1 for the scalar compatibility path; any larger value uses the Q4_K/Q5_K/Q6_K tiled prefill path, fastest at multiples of 32. Default: 128\n\
   --warm-weights\n\
       Touch mapped tensor pages using the mmap warmup policy. This can pull the full 5+ GiB model into memory/file cache; default is off.\n\
   --test-responder\n\
