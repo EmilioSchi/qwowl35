@@ -3,8 +3,10 @@
 
 <div align="center">
   <a href="assets/app_icon_better.png">
-    <img src="assets/app_icon_better.png" alt="Qwowl35 logo" width="140" />
+    <img src="assets/app_icon_better.png" alt="Qwowl35 logo" width="90" />
   </a>
+</br>
+<strong>qw</strong>owl35
 </br>
 (pronounced /kwaʊl/, a portmanteau of <strong>Qwen</strong> and <strong>owl</strong>)
 </br>
