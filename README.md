@@ -2,8 +2,8 @@
 > This project is still incomplete and not really suitable for practical use yet — but it's a fun one to experiment with as a recreational project.
 
 <div align="center">
-  <a href="assets/qwowl35.png">
-    <img src="assets/qwowl35.png" alt="Qwowl35 logo" width="140" />
+  <a href="assets/app_icon_better.png">
+    <img src="assets/app_icon_better.png" alt="Qwowl35 logo" width="140" />
   </a>
 </br>
 (pronounced /kwaʊl/, a portmanteau of <strong>Qwen</strong> and <strong>owl</strong>)

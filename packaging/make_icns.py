@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Build packaging/qw35.icns from assets/app_icon.png.
 
-The source art is a white squircle with a baked drop shadow on a pure-white
-1254x1254 canvas and no alpha channel. Shipping that as-is would render a
-white square tile in the Dock, so this script rebuilds a proper macOS icon:
+The source art is a squircle with a baked drop shadow on a pure-white opaque
+canvas. Shipping that as-is would render a white square tile in the Dock, so
+this script rebuilds a proper macOS icon:
 
-  1. locate the squircle edge-to-edge (the baked shadow dips darkest just
-     outside the edge, so each side reads as "shadow band, then bright again");
+  1. locate the squircle edge-to-edge (strong shadows read as "shadow band,
+     then bright again"; faint ones as the first sub-white crossing);
   2. crop it and LANCZOS-resize onto the 824x824 Apple icon-grid area of a
      1024x1024 transparent canvas;
   3. alpha-mask with the Apple squircle (superellipse, drawn 2 px inset for
@@ -45,36 +45,63 @@ ICONSET_SIZES = (16, 32, 128, 256, 512)
 
 
 def detect_bbox(im: Image.Image) -> tuple[int, int, int, int]:
-    """Squircle bbox from the center row/column shadow profile.
+    """Squircle bbox from the center row/column edge profiles.
 
-    Walking inward from each side, pixels first dip below the shadow
-    threshold and then return to near-white at the squircle edge; that
-    recovery point is the edge.
+    Two source styles are handled. Art with a strong baked shadow: walking
+    inward, pixels first dip below the shadow threshold and then return to
+    near-white at the squircle edge; that recovery point is the edge. Art
+    whose shadow is too faint to dip (the edge just falls off white): the
+    first sub-250 crossing from the outside is the edge, taken as the median
+    over a band of scan lines so a stray dark pixel cannot skew it.
     """
     w, h = im.size
     px = im.convert("RGB").load()
     row = [min(px[x, h // 2]) for x in range(w)]
     col = [min(px[w // 2, y]) for y in range(h)]
 
-    def edge(vals: list[int]) -> int:
+    def shadow_edge(vals: list[int]) -> int | None:
         in_shadow = False
         for i, v in enumerate(vals):
             if v < 245:
                 in_shadow = True
             elif in_shadow and v >= 252:
                 return i
-        raise SystemExit(
-            "make_icns: could not detect the squircle edge (no shadow-band -> "
-            "bright transition on the center axis); pass --bbox L,T,R,B"
-        )
+        return None
 
-    left = edge(row)
-    right = len(row) - edge(list(reversed(row)))
-    top = edge(col)
-    bottom = len(col) - edge(list(reversed(col)))
-    if not (right - left > w // 2 and bottom - top > h // 2):
+    def plausible(l: int, t: int, r: int, b: int) -> bool:
+        return r - l > w // 2 and b - t > h // 2
+
+    edges = [shadow_edge(row), shadow_edge(list(reversed(row))),
+             shadow_edge(col), shadow_edge(list(reversed(col)))]
+    if None not in edges:
+        left, right = edges[0], len(row) - edges[1]
+        top, bottom = edges[2], len(col) - edges[3]
+        if plausible(left, top, right, bottom):
+            return left, top, right, bottom
+
+    def cross(vals: list[int]) -> int | None:
+        return next((i for i, v in enumerate(vals) if v < 250), None)
+
+    def median_edge(scan_rows: bool, reverse: bool) -> int | None:
+        hits = []
+        span = w if scan_rows else h
+        for c in range(span * 3 // 8, span * 5 // 8, max(1, span // 40)):
+            vals = [min(px[x, c]) for x in range(w)] if scan_rows else [min(px[c, y]) for y in range(h)]
+            if reverse:
+                vals = list(reversed(vals))
+            i = cross(vals)
+            if i is not None:
+                hits.append(len(vals) - i if reverse else i)
+        if not hits:
+            return None
+        hits.sort()
+        return hits[len(hits) // 2]
+
+    left, right = median_edge(True, False), median_edge(True, True)
+    top, bottom = median_edge(False, False), median_edge(False, True)
+    if None in (left, right, top, bottom) or not plausible(left, top, right, bottom):
         raise SystemExit(
-            f"make_icns: implausible detected bbox ({left},{top},{right},{bottom}); "
+            f"make_icns: could not detect the squircle edge (got {left},{top},{right},{bottom}); "
             "pass --bbox L,T,R,B"
         )
     return left, top, right, bottom
