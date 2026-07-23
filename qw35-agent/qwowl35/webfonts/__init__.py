@@ -36,7 +36,7 @@ from pathlib import Path
 # meaningless.
 FONTS_DIR_ENV = "QWOWL35_WEBUI_FONTS_DIR"
 
-DEFAULT_SLUG = "mononoki"
+DEFAULT_SLUG = "proggyclean"
 
 
 @dataclass(frozen=True)
