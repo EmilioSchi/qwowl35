@@ -290,8 +290,13 @@ kernel void qw35_ssm_conv_recurrent_gate_norm_step128_par_f32(
         return;
     }
 
-    threadgroup float q_cache[STATE_SIZE];
-    threadgroup float k_cache[STATE_SIZE];
+    // float4-backed so the state sweep can read q/k as float4 without relying
+    // on the default 4-byte alignment of a threadgroup float array.
+    threadgroup float4 q_cache4[STATE_SIZE / 4];
+    threadgroup float4 k_cache4[STATE_SIZE / 4];
+    threadgroup float *q_cache = (threadgroup float *)q_cache4;
+    threadgroup float *k_cache = (threadgroup float *)k_cache4;
+    threadgroup float y_cache[2 * STATE_SIZE];
     threadgroup float partial8[8];
 
     const int d = int(tid & 127u);
@@ -351,62 +356,97 @@ kernel void qw35_ssm_conv_recurrent_gate_norm_step128_par_f32(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const int pair = int(tid >> 7);
-    const int h = int(qk_group) + pair * GROUPS;
-    const bool active_head = h < num_v_heads;
+    // ── Delta-rule state update: one simdgroup per state row ────────────────
+    //
+    // The row-per-thread layout this replaced put consecutive threads 512 B
+    // apart (`row = h*128*128 + d*128`), so a simdgroup touched 32 distinct
+    // cache lines per instruction and a threadgroup's 128 KB working set
+    // evicted from L1 before the later `ki` iterations consumed it — measured
+    // at ~26 GB/s against ~91 GB/s on every other decode stage.
+    //
+    // Here each simdgroup owns a whole row and its 32 lanes cover the row's
+    // 128 state floats as consecutive float4, so one load is one coalesced
+    // 512 B line-aligned burst. This is the same decomposition the prefill
+    // kernel `qw35_ssm_recurrent_step128_batch_rows_f32` already uses.
+    // Loading `sv` once and reusing it for the write-back also drops the
+    // second full pass the row-per-thread version needed: 3 state passes -> 2.
+    //
+    // Row assignment r = simd_group*ROWS_PER_SG + i covers both heads of this
+    // qk group (r = 0..255). pair = r >> 7 is constant across a simdgroup
+    // (simdgroups 0..3 -> pair 0, 4..7 -> pair 1), which keeps `h` and the
+    // per-head gate scalars loop-invariant and preserves the partial8[4*pair +
+    // 0..3] fold the per-head RMS below already expects.
+    constexpr int ROWS_PER_SG = (2 * STATE_SIZE) / 8;  // 256 rows / 8 simdgroups
 
-    float y = 0.0f;
-    if (active_head) {
-        const int v = h * STATE_SIZE + d;
-        const int c = V_OFF + v;
-        const int v_state_base = c * 3;
-        const int v_weight_base = c * 4;
-        const float v_s0 = conv_state[v_state_base + 0];
-        const float v_s1 = conv_state[v_state_base + 1];
-        const float v_s2 = conv_state[v_state_base + 2];
-        const float v_x = qkv[c];
-        const float v_conv = qw35_silu_f32(v_s0 * conv_w[v_weight_base + 0]
-                                         + v_s1 * conv_w[v_weight_base + 1]
-                                         + v_s2 * conv_w[v_weight_base + 2]
-                                         + v_x  * conv_w[v_weight_base + 3]);
-        conv_state[v_state_base + 0] = v_s1;
-        conv_state[v_state_base + 1] = v_s2;
-        conv_state[v_state_base + 2] = v_x;
+    const int sg_pair = int(simd_group) >> 2;
+    const int sg_head = int(qk_group) + sg_pair * GROUPS;
+    const bool sg_active = sg_head < num_v_heads;
 
-        const int row = h * STATE_SIZE * head_v_dim + d * STATE_SIZE;
-        const float beta = qw35_sigmoid_f32(beta_raw[h]);
-        const float alpha = qw35_softplus_f32(alpha_raw[h] + dt[h]) * a[h];
+    float y_sq = 0.0f;
+    if (sg_active) {
+        const float beta = qw35_sigmoid_f32(beta_raw[sg_head]);
+        const float alpha = qw35_softplus_f32(alpha_raw[sg_head] + dt[sg_head]) * a[sg_head];
         const float gate = exp(alpha);
+        const float4 kc = k_cache4[lane];
+        const float4 qc = q_cache4[lane];
 
-        float k_dot = 0.0f;
-        float q_dot = 0.0f;
-        for (int ki = 0; ki < STATE_SIZE; ++ki) {
-            const float old_s = state[row + ki];
-            k_dot += old_s * k_cache[ki];
-            q_dot += old_s * q_cache[ki];
-        }
+        for (int i = 0; i < ROWS_PER_SG; ++i) {
+            const int r = int(simd_group) * ROWS_PER_SG + i;
+            const int d_r = r & 127;
 
-        const float delta = (v_conv - gate * k_dot) * beta;
-        for (int ki = 0; ki < STATE_SIZE; ++ki) {
-            const float old_s = state[row + ki];
-            state[row + ki] = old_s * gate + k_cache[ki] * delta;
+            const int c = V_OFF + sg_head * STATE_SIZE + d_r;
+            const int v_state_base = c * 3;
+            const int v_weight_base = c * 4;
+            const float v_s0 = conv_state[v_state_base + 0];
+            const float v_s1 = conv_state[v_state_base + 1];
+            const float v_s2 = conv_state[v_state_base + 2];
+            const float v_x = qkv[c];
+            const float v_conv = qw35_silu_f32(v_s0 * conv_w[v_weight_base + 0]
+                                             + v_s1 * conv_w[v_weight_base + 1]
+                                             + v_s2 * conv_w[v_weight_base + 2]
+                                             + v_x  * conv_w[v_weight_base + 3]);
+            // Every lane recomputes v_conv from the same broadcast loads; only
+            // one lane may retire the conv window shift.
+            if (lane == 0) {
+                conv_state[v_state_base + 0] = v_s1;
+                conv_state[v_state_base + 1] = v_s2;
+                conv_state[v_state_base + 2] = v_x;
+            }
+
+            device float4 *s4 = (device float4 *)(
+                state + sg_head * STATE_SIZE * head_v_dim + d_r * STATE_SIZE);
+            const float4 sv = s4[lane];
+            const float k_dot = simd_sum(dot(sv, kc));
+            const float q_dot = simd_sum(dot(sv, qc));
+
+            const float delta = (v_conv - gate * k_dot) * beta;
+            s4[lane] = sv * gate + kc * delta;
+
+            const float y = (gate * q_dot + delta * kq_dot) * scale;
+            if (lane == 0) y_cache[r] = y;
+            y_sq += y * y;
         }
-        y = (gate * q_dot + delta * kq_dot) * scale;
+    } else {
+        for (int i = 0; i < ROWS_PER_SG; ++i) {
+            if (lane == 0) y_cache[int(simd_group) * ROWS_PER_SG + i] = 0.0f;
+        }
     }
 
     // Per-head RMS of y: simdgroups 0..3 hold head `pair 0`, 4..7 hold head
-    // `pair 1`; one simd_sum per simdgroup, then each thread folds its half's
-    // four partials — no single-thread 128-element loops.
-    const float y_p = simd_sum(active_head ? y * y : 0.0f);
-    if (lane == 0) partial8[simd_group] = y_p;
+    // `pair 1`; each simdgroup already carries the sum of y^2 over its own
+    // rows, so lane 0 just parks it and each thread folds its half's four
+    // partials.
+    if (lane == 0) partial8[simd_group] = y_sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (active_head) {
+    const int pair = int(tid >> 7);
+    const int h = int(qk_group) + pair * GROUPS;
+    if (h < num_v_heads) {
         const float y_ss = partial8[4 * pair + 0] + partial8[4 * pair + 1]
                          + partial8[4 * pair + 2] + partial8[4 * pair + 3];
         const float inv_y = rsqrt(y_ss / float(STATE_SIZE) + eps);
         const int idx = h * STATE_SIZE + d;
-        gated[idx] = y * inv_y * norm_w[d] * qw35_silu_f32(z[idx]);
+        gated[idx] = y_cache[tid] * inv_y * norm_w[d] * qw35_silu_f32(z[idx]);
     }
 }
 
