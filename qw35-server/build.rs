@@ -127,14 +127,15 @@ fn compile_objc_bridge(clang_tool: &Path, out_dir: &Path) {
     assert!(status.success(), "ar failed for Metal bridge archive");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=qw35bridge");
     // The runtime is split into Objective-C categories (Qw35MetalRuntime+*.m),
     // one per forward-pass stage. A category defines no symbol the linker
-    // references directly, so without -ObjC ld would dead-strip those object
-    // files out of the static archive and the category methods would be missing
-    // at runtime (unrecognized selector). -ObjC force-loads archive members that
-    // contain Objective-C classes or categories.
-    println!("cargo:rustc-link-arg=-ObjC");
+    // references directly, so a plain static link dead-strips those object files
+    // out of the archive and the category methods are missing at runtime
+    // (unrecognized selector). `+whole-archive` links every member, like ld's
+    // -ObjC/-force_load — and unlike `cargo:rustc-link-arg=-ObjC`, a link-lib
+    // instruction propagates to dependent crates, so binaries in other packages
+    // (qw35-bench) get the categories too.
+    println!("cargo:rustc-link-lib=static:+whole-archive=qw35bridge");
 }
 
 fn compile_metal_to_metallib(
