@@ -1,4 +1,4 @@
-"""Async streaming client for the qw35-server OpenAI-compatible API.
+"""Async streaming client for an OpenAI-compatible chat-completions server.
 
 The server parses the model's ``<tool_call>`` XML into structured tool-call
 deltas for us, so this client only has to: (1) read the SSE stream, (2) classify
@@ -70,7 +70,7 @@ class ToolCallArgsDelta:
 
 @dataclass
 class ToolCallName:
-    """qw35 side-channel: the streamed call's function name became known.
+    """Server side-channel: the streamed call's function name became known.
 
     With ``stream_tool_call_xml`` the Begin delta arrives the moment the server
     sees ``<tool_call>`` (empty name, raw XML fragments follow); the name is
@@ -83,7 +83,7 @@ class ToolCallName:
 
 @dataclass
 class ToolCallFinal:
-    """qw35 side-channel: authoritative parsed arguments JSON for the call.
+    """Server side-channel: authoritative parsed arguments JSON for the call.
 
     Replaces (not appends to) whatever raw XML fragments were streamed."""
 
@@ -93,7 +93,7 @@ class ToolCallFinal:
 
 @dataclass
 class ToolCallDemoted:
-    """qw35 side-channel: the streamed block failed to parse as a tool call.
+    """Server side-channel: the streamed block failed to parse as a tool call.
 
     The call at ``index`` must be dropped; its raw text follows as ordinary
     content/reasoning deltas (and the agent's malformed-call retry sees it)."""
@@ -106,7 +106,7 @@ class PrefillProgress:
     percent: float
     processed: int
     total: int
-    # The serving session's live context ceiling (qw35 servers grow it on
+    # The serving session's live context ceiling (some servers grow it on
     # demand); None from servers that don't report it.
     session_ctx: int | None = None
 
@@ -606,7 +606,7 @@ class Qw35Client:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         # Ask the server to stream tool-call bodies incrementally (raw XML
-        # fragments + qw35_tool_call side-channel) so the TUI can show a call
+        # fragments + the tool-call side-channel) so the TUI can show a call
         # growing live. Off = the buffered OpenAI-shape stream.
         self.stream_tool_xml = stream_tool_xml
         # Optional debug observers for every stream this client opens: the
@@ -732,13 +732,37 @@ def _error_from_payload(
     return Qw35Error(code, message, http_status=http_status, kind=kind)
 
 
+def _side_channel(chunk: dict, field: str):
+    """The value of a side-channel field, whatever prefix the server uses.
+
+    Servers that extend chat.completions namespace their non-standard chunk
+    fields with a vendor prefix (`<vendor>_tool_call`, `<vendor>_prefill`),
+    and the prefix is whatever that deployment calls itself. Binding to one
+    literal name would make this client work against a single server and go
+    quietly blind against every other: a missed `*_tool_call` leaves each
+    streamed call nameless with raw XML for arguments. So match the field
+    suffix — any `<prefix>_<field>`, or a bare unprefixed `<field>`. No key in
+    the standard schema ends in one of these names, so the match cannot
+    collide with OpenAI's own fields; servers sending none of them are
+    unaffected.
+    """
+    value = chunk.get(field)
+    if value is not None:
+        return value
+    suffix = f"_{field}"
+    for key, value in chunk.items():
+        if key.endswith(suffix) and value is not None:
+            return value
+    return None
+
+
 def _classify_chunk(chunk: dict):
     """Turn one chat.completions.chunk into zero or more StreamEvents."""
     # Choice-less chunks carry our custom side-channels (prefill progress, final
     # usage). OpenAI clients ignore both the empty choices and the extra fields.
     choices = chunk.get("choices") or []
     if not choices:
-        prefill = chunk.get("qw35_prefill")
+        prefill = _side_channel(chunk, "prefill")
         if prefill is not None:
             total = prefill.get("total", 0) or 0
             processed = prefill.get("processed", 0) or 0
@@ -752,7 +776,7 @@ def _classify_chunk(chunk: dict):
                 total=total,
                 session_ctx=int(session_ctx) if session_ctx else None,
             )
-        tool_side = chunk.get("qw35_tool_call")
+        tool_side = _side_channel(chunk, "tool_call")
         if isinstance(tool_side, dict):
             kind = tool_side.get("event")
             index = tool_side.get("index", 0)
@@ -763,7 +787,7 @@ def _classify_chunk(chunk: dict):
             elif kind == "demoted":
                 yield ToolCallDemoted(index=index)
         if chunk.get("usage") is not None:
-            yield Usage(usage=chunk.get("usage") or {}, timings=chunk.get("qw35_timings") or {})
+            yield Usage(usage=chunk.get("usage") or {}, timings=_side_channel(chunk, "timings") or {})
         return
 
     choice = choices[0]
@@ -792,4 +816,4 @@ def _classify_chunk(chunk: dict):
 
     # Some servers attach usage to the same chunk as the finish.
     if chunk.get("usage") is not None:
-        yield Usage(usage=chunk.get("usage") or {}, timings=chunk.get("qw35_timings") or {})
+        yield Usage(usage=chunk.get("usage") or {}, timings=_side_channel(chunk, "timings") or {})
