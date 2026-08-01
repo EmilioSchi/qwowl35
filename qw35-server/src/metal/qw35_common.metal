@@ -24,6 +24,29 @@ static inline ushort qw35_f32_to_bf16(float x) {
     return as_type<ushort>(half(x));
 }
 
+// GPU keep-alive: a pure-ALU dependency chain with no memory traffic beyond one
+// load and one store per thread. Dispatched on its own command queue by
+// Qw35GpuKeepalive while a generation is in flight (see Qw35GpuKeepalive.m for
+// why). The chain is serial on purpose — the point is to keep the GPU out of a
+// low power state between decode command buffers, not to do useful work, so it
+// must occupy the machine for the whole dispatch without touching the memory
+// bus that decode is bound on. `b` and the addends are chosen so `a` stays
+// finite and denormal-free over any iteration count; the result is stored back
+// only so the compiler cannot eliminate the loop.
+kernel void qw35_gpu_keepalive(
+    device float *out [[buffer(0)]],
+    constant uint &iters [[buffer(1)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    float a = out[tid];
+    const float b = 1.000001f;
+    for (uint i = 0; i < iters; i++) {
+        a = fma(a, b, 0.000001f);
+        a = fma(a, b, -0.000001f);
+    }
+    out[tid] = a;
+}
+
 // Coarse page-residency warmup kernel. The Rust engine currently performs the
 // mmap page warmup on CPU; this static shader is compiled at build time so the
 // Metal warmup path has a stable function name when the graph backend is wired.

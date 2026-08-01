@@ -13,6 +13,7 @@
 // Q6_K-matvec+argmax output head and never materializes the logits vector.
 
 #import "Qw35MetalRuntime+Internal.h"
+#import "Qw35GpuKeepalive.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -213,6 +214,7 @@ static Qw35TensorStore *qw35_shared_tensor_store(const void *modelMap,
     if (![self prewarmPipelines:error]) return nil;
     if (![self reset:error]) return nil;
     [self setupResidency];
+    [Qw35GpuKeepalive startWithDevice:_device library:_library];
     return self;
 }
 
@@ -822,6 +824,14 @@ static Qw35TensorStore *qw35_shared_tensor_store(const void *modelMap,
         return NO;
     }
 
+    // Hold the GPU performance state across this step and the host gap that
+    // follows it (sampling + filters + the next token's encode). Bumped before
+    // encoding, not after commit, so the hold already covers this command
+    // buffer. The capture and stage-profile paths above return earlier: both
+    // serialise decode for diagnostics, where a parasite dispatch would skew
+    // exactly the numbers they exist to report.
+    [Qw35GpuKeepalive noteDecodeStep];
+
     const uint32_t mid = _h.transformer_layers / 2;
     const uint32_t interval = _h.full_attention_interval ? _h.full_attention_interval : 4;
 
@@ -1221,6 +1231,11 @@ static Qw35TensorStore *qw35_shared_tensor_store(const void *modelMap,
              error:(NSError **)error {
     if (!tokens || count == 0) return YES;
     if (count == 1) return [self evalToken:tokens[0] pos:pos0 logitsMode:logitsMode error:error];
+
+    // A real prefill batch keeps the GPU busy on its own, so the keep-alive has
+    // nothing to hold up and would only add heat. Drop the hold left by the
+    // previous response rather than waiting for it to expire.
+    [Qw35GpuKeepalive suspend];
 
     // Segmented KV cache: a prefill batch's writes must land in a single slab
     // (the per-token write binds one slab buffer). Split a batch that straddles
